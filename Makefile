@@ -42,7 +42,8 @@ build/steghide: src/service/steghide.c | build
 
 lint:
 	@while IFS= read -r -d '' source; do bash -n "$$source" || exit; done < <(find lib scripts tests -type f -name '*.sh' -print0)
-	@for source in lib/octovault/backend lib/octovault/run-plan lib/octovault/event-system; do bash -n "$$source" || exit; done
+	@for source in lib/octovault/backend lib/octovault/run-plan lib/octovault/event-system lib/octovault/priority-backend; do bash -n "$$source" || exit; done
+	@shellcheck --severity=warning lib/octovault/*.sh lib/octovault/backend lib/octovault/run-plan lib/octovault/event-system lib/octovault/priority-backend scripts/*.sh tests/test-*.sh
 	@desktop-file-validate data/io.vdm.OctoVault.desktop data/io.vdm.OctoVault.Session.desktop
 	@xmllint --noout data/io.vdm.OctoVault.metainfo.xml data/io.vdm.octovault.policy data/io.vdm.OctoVault1.conf
 	@bash scripts/version.sh --check
@@ -59,7 +60,7 @@ install: all
 	install -m 0755 build/octovaultd $(DESTDIR)$(PREFIX)/libexec/octovault/daemon
 	install -m 0755 build/steghide $(DESTDIR)$(PREFIX)/libexec/octovault/steghide
 	install -m 0755 lib/octovault/backend $(DESTDIR)$(PREFIX)/libexec/octovault/backend
-	install -m 0755 lib/octovault/run-plan lib/octovault/event-system $(DESTDIR)$(PREFIX)/libexec/octovault/
+	install -m 0755 lib/octovault/run-plan lib/octovault/event-system lib/octovault/priority-backend $(DESTDIR)$(PREFIX)/libexec/octovault/
 	install -m 0644 lib/octovault/*.sh $(DESTDIR)$(PREFIX)/lib/octovault/
 	install -d $(DESTDIR)$(PREFIX)/share/applications $(DESTDIR)$(PREFIX)/share/metainfo
 	install -m 0644 data/io.vdm.OctoVault.desktop $(DESTDIR)$(PREFIX)/share/applications/

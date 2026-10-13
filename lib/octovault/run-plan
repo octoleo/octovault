@@ -1,7 +1,14 @@
-#!/usr/bin/env bash
+#!/bin/bash -p
 # SPDX-License-Identifier: Apache-2.0
 set -euo pipefail
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 [[ $EUID -eq 0 && $# -eq 2 && $1 =~ ^[0-9]+$ && $2 =~ ^[a-zA-Z0-9_-]{1,64}$ ]] || exit 64
+# shellcheck source=lib/octovault/priority.sh
+source /usr/lib/octovault/priority.sh
+ov_priority_setup "$1"
+if ov_priority_blocked; then
+    ov_priority_defer "$2" priority-close
+    exit 0
+fi
 export OV_INTERNAL=1
 jq -nc --arg id "$2" '{op:"event.handle",params:{event:"timer",id:$id}}' | /usr/libexec/octovault/backend "$1"

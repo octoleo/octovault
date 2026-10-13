@@ -60,14 +60,25 @@ ov_list() {
     if ((${#files[@]})); then jq -sce 'map(select(type == "object" and .schema_version == 1)) | sort_by(.name // .id)' "${files[@]}";
     else printf '[]\n'; fi
 }
-ov_as_user() {
+ov_as_user() (
+    # Close inherited worker descriptors in this child only. In particular, a
+    # user hook must not be able to unlock the parent's flock open description
+    # or read an inherited credential FD. Stdin/stdout/stderr remain available
+    # for deliberate streaming (including GPG key input/output).
+    local descriptor path
+    [[ -r /proc/self/fd ]] || return 125
+    for path in /proc/self/fd/*; do
+        descriptor=${path##*/}
+        [[ $descriptor =~ ^[0-9]+$ && $descriptor -gt 2 ]] || continue
+        exec {descriptor}>&-
+    done
     if [[ $OV_UID == 0 ]]; then
-        env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME="$OV_HOME" USER="$OV_USER" LOGNAME="$OV_USER" LANG=C.UTF-8 "$@"
+        exec env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME="$OV_HOME" USER="$OV_USER" LOGNAME="$OV_USER" LANG=C.UTF-8 "$@"
     else
-        runuser -u "$OV_USER" -- env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME="$OV_HOME" USER="$OV_USER" LOGNAME="$OV_USER" \
+        exec runuser -u "$OV_USER" -- env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME="$OV_HOME" USER="$OV_USER" LOGNAME="$OV_USER" \
             LANG=C.UTF-8 XDG_RUNTIME_DIR="/run/user/$OV_UID" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$OV_UID/bus" "$@"
     fi
-}
+)
 ov_run() { "$@" >&2; }
 ov_credential_set() {
     ov_id "$1"

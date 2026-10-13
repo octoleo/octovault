@@ -257,7 +257,9 @@ ov_destination_save() {
                 bucket=$(jq -r '.bucket // ""' <<<"$record")
                 [[ $bucket =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]{1,62}$ ]] || ov_fail invalid_bucket 'Provide a valid S3 bucket name.'
                 value=$(jq -r '.region // "us-east-1"' <<<"$record")
+                [[ -n $value ]] || value=us-east-1
                 [[ $value =~ ^[a-zA-Z0-9_-]+$ ]] || ov_fail invalid_region 'Provide a valid S3 region identifier.'
+                record=$(jq --arg region "$value" '.region=$region' <<<"$record")
             fi
             ;;
         sftp)
@@ -514,7 +516,14 @@ ov_backup_plan_save() {
         *) ov_fail invalid_trigger 'Unsupported backup trigger.' ;;
     esac
     case $trigger in
-        vault-open|vault-close) [[ $mode != none ]] || ov_fail invalid_trigger 'Vault triggers require a linked vault.' ;;
+        vault-open|vault-close)
+            vault=$(jq -r '.vault_id // empty' <<<"$record")
+            [[ -n $vault ]] || ov_fail invalid_trigger 'Select the vault whose event should start this backup.'
+            ov_load vaults "$vault"
+            if [[ $trigger == vault-open && $mode == closed-container ]] || [[ $trigger == vault-close && $mode == open-files ]]; then
+                ov_fail invalid_trigger 'The selected trigger conflicts with the required vault state. Use vault-open for unlocked files or vault-close for the closed container.'
+            fi
+            ;;
         calendar)
             value=$(jq -r '.calendar // empty' <<<"$record")
             [[ -n $value ]] || ov_fail invalid_calendar 'A calendar schedule is required.'
@@ -536,7 +545,7 @@ ov_backup_plan_save() {
 }
 
 ov_backup_vault_guard() {
-    local plan=$1 mode vault source container attached_status=0
+    local plan=$1 mode vault source container attached_status=0 expected_device source_device
     mode=$(jq -r '.vault_mode // "none"' <<<"$plan")
     [[ $mode != none ]] || return 0
     ov_load vaults "$(jq -r .vault_id <<<"$plan")"; vault=$OV_RECORD
@@ -544,6 +553,12 @@ ov_backup_vault_guard() {
     if [[ $mode == open-files ]]; then
         declare -F ov_vault_is_open >/dev/null || ov_fail vault_verification_unavailable 'Vault mount verification is unavailable.'
         ov_vault_is_open "$vault" || ov_fail vault_closed 'The linked vault is not open at its verified mountpoint; no backup was started.'
+        expected_device=$(findmnt -rn --mountpoint "$(jq -r .mountpoint <<<"$vault")" --output MAJ:MIN) || ov_fail vault_verification_failed 'Unable to identify the mounted vault filesystem.'
+        [[ $expected_device =~ ^[0-9]+:[0-9]+$ ]] || ov_fail vault_verification_failed 'The mounted vault filesystem identity is invalid.'
+        for source in "${OV_BACKUP_SOURCES[@]}"; do
+            source_device=$(findmnt -rn --target "$source" --output MAJ:MIN) || ov_fail source_not_in_vault 'A selected source is not available on the linked vault.'
+            [[ $source_device == "$expected_device" ]] || ov_fail source_not_in_vault 'A selected source is not mounted from the linked vault. Open-files backups require protected sources; use independent mode for mixed or unrelated sources.'
+        done
     else
         declare -F ov_vault_attached >/dev/null || ov_fail vault_verification_unavailable 'Vault mount verification is unavailable.'
         ov_vault_attached "$vault" || attached_status=$?

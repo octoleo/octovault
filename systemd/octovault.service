@@ -15,6 +15,7 @@ StateDirectory=octovault
 StateDirectoryMode=0700
 RuntimeDirectory=octovault
 RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
 NoNewPrivileges=yes
 RestrictRealtime=yes
 LockPersonality=yes

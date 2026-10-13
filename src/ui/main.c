@@ -8,6 +8,8 @@
 #include <glib/gstdio.h>
 #include <math.h>
 #include <string.h>
+#include <sys/resource.h>
+#include <sys/prctl.h>
 
 #define BUS_NAME "io.vdm.OctoVault1"
 #define BUS_PATH "/io/vdm/OctoVault1"
@@ -35,6 +37,7 @@ struct App {
   char *screenshot;
   GQueue *pending_unlocks;
   gboolean automatic_prompt;
+  JsonObject *priority_lock;
   Operation *active;
   gboolean smoke;
   gboolean show_notifications;
@@ -42,7 +45,7 @@ struct App {
 };
 struct Operation {
   App *app;
-  char *op, *request, *id, *title, *record_id;
+  char *op, *request, *id, *title, *record_id, *snapshot;
   GMutex mutex;
   gint cancelled;
   gint collection;
@@ -67,8 +70,11 @@ static void open_form(App *app, const char *operation, const char *title, JsonOb
 static void start_operation(App *app, const char *op, JsonObject *params, const char *title, gint collection, gboolean acknowledge);
 static void result_window(App *app, const char *title, JsonNode *node, gboolean reveal, gboolean acknowledge);
 static void snapshots_window(App *app, const char *repository, JsonNode *node);
+static void files_window(App *app, const char *repository, const char *snapshot, JsonNode *node);
+static void migrations_window(App *app, const char *vault, JsonNode *node);
 static gboolean unlock_registered(App *app, const char *id);
 static gboolean drain_unlocks(gpointer data);
+static void wipe(char *text);
 
 static const char *str(JsonObject *o, const char *key) {
   if (!o || !json_object_has_member(o, key)) return "";
@@ -132,7 +138,8 @@ static void save_preferences(App *app){
   char *path=preferences_path(),*directory=g_path_get_dirname(path);
   if(g_mkdir_with_parents(directory,0700)==0){
     GKeyFile *settings=g_key_file_new();g_key_file_set_integer(settings,"Desktop","theme",(gint)app->preferred_theme);g_key_file_set_boolean(settings,"Desktop","notifications",app->show_notifications);
-    if(g_key_file_save_to_file(settings,path,NULL))g_chmod(path,0600);g_key_file_unref(settings);
+    if(g_key_file_save_to_file(settings,path,NULL))g_chmod(path,0600);
+    g_key_file_unref(settings);
   }
   g_free(path);g_free(directory);
 }
@@ -169,7 +176,7 @@ static void add_activity(App *app,const char *message) {
   g_free(time);g_date_time_unref(now);
 }
 static void operation_free(Operation *o) {
-  g_free(o->op);g_free(o->request);g_free(o->id);g_free(o->title);g_free(o->record_id);g_mutex_clear(&o->mutex);g_free(o);
+  g_free(o->op);wipe(o->request);g_free(o->request);g_free(o->id);g_free(o->title);g_free(o->record_id);g_free(o->snapshot);g_mutex_clear(&o->mutex);g_free(o);
 }
 typedef struct { App *app; char *message; double percent; } Progress;
 static gboolean show_progress(gpointer data) {
@@ -186,7 +193,7 @@ static JsonNode *parse_json(const char *s,GError **error) {
 }
 static GVariant *bus_call(GDBusConnection *bus,const char *method,GVariant *args,GError **error) {
   return g_dbus_connection_call_sync(bus,BUS_NAME,BUS_PATH,BUS_IFACE,method,args,NULL,
-        G_DBUS_CALL_FLAGS_NONE,120000,NULL,error);
+        G_DBUS_CALL_FLAGS_ALLOW_INTERACTIVE_AUTHORIZATION,180000,NULL,error);
 }
 static void operation_thread(GTask *task,gpointer source,gpointer data,GCancellable *cancel) {
   (void)source;(void)cancel;
@@ -260,7 +267,7 @@ static void operation_done(GObject *source,GAsyncResult *result,gpointer data) {
   if(error){
     if(o->background){
       if(o->collection==0){add_activity(app,error->message);if(!strcmp(app->page,"Dashboard")||!strcmp(app->page,"Vaults")){render_page(app);append_text(app->body,"The system service is unavailable or did not complete this request. Install OctoVault's system package, then use Refresh. See Activity for details.","error");}}
-    }else{add_activity(app,error->message);error_window(app,o->title,error->message);notify(app,"Operation needs attention",error->message);}
+    }else{add_activity(app,error->message);if(!app->priority_lock){error_window(app,o->title,error->message);notify(app,"Operation needs attention",error->message);}}
     g_clear_error(&error);
   }else if(o->background){
     if(app->collections[o->collection])json_node_free(app->collections[o->collection]);
@@ -276,17 +283,26 @@ static void operation_done(GObject *source,GAsyncResult *result,gpointer data) {
     }
     else if(o->reveal&&payload)result_window(app,"Save your recovery information",payload,TRUE,o->acknowledge);
     else if(!strcmp(o->op,"repository.snapshots")&&payload)snapshots_window(app,o->record_id,payload);
+    else if(!strcmp(o->op,"repository.files")&&payload)files_window(app,o->record_id,o->snapshot,payload);
+    else if(!strcmp(o->op,"migration.list")&&payload)migrations_window(app,o->record_id,payload);
     else if(useful_result(o->op)&&payload)result_window(app,o->title,payload,FALSE,FALSE);
     refresh_all(app);
   }
   if(response)json_node_free(response);
   operation_free(o);
+  if(app->priority_lock&&!app->active){JsonObject*params=g_steal_pointer(&app->priority_lock);start_operation(app,"vault.close",params,"Lock vault",-1,FALSE);json_object_unref(params);}
   g_idle_add(drain_unlocks,app);
 }
 static void start_operation(App *app,const char *op,JsonObject *params,const char *title,gint collection,gboolean acknowledge) {
-  if(collection<0&&app->active){error_window(app,"An operation is already running","Wait for the current operation to finish, or cancel it, before starting another.");return;}
+  if(collection<0&&app->active){
+    if(!strcmp(op,"vault.close")&&!strcmp(app->active->op,"backup.run")){
+      if(app->priority_lock)json_object_unref(app->priority_lock);
+      app->priority_lock=copy_object(params);g_atomic_int_set(&app->active->cancelled,1);gtk_label_set_text(app->job_label,"Stopping the backup before locking the vault…");return;
+    }
+    error_window(app,"An operation is already running","Wait for the current operation to finish, or cancel it, before starting another.");return;
+  }
   Operation *o=g_new0(Operation,1);o->app=app;o->op=g_strdup(op);o->title=g_strdup(title);o->collection=collection;
-  o->background=collection>=0;o->record_id=g_strdup(str(params,"id"));o->request=serialize_request(op,params);o->acknowledge=acknowledge;
+  o->background=collection>=0;o->record_id=g_strdup(str(params,"id"));o->snapshot=g_strdup(*str(params,"snapshot")?str(params,"snapshot"):"latest");o->request=serialize_request(op,params);o->acknowledge=acknowledge;
   o->reveal=!strcmp(op,"repository.recovery");g_mutex_init(&o->mutex);
   if(!o->background){app->active=o;gtk_label_set_text(app->job_label,title);gtk_progress_bar_set_fraction(app->progress,0);gtk_widget_set_visible(app->job_box,TRUE);add_activity(app,title);}
   GTask *task=g_task_new(NULL,NULL,operation_done,o);g_task_set_task_data(task,o,NULL);g_task_run_in_thread(task,operation_thread);g_object_unref(task);
@@ -323,9 +339,16 @@ static void detail_nodes(GtkBox *box,const char *name,JsonNode *node,int depth) 
     GtkWidget *w=label(text,NULL);gtk_label_set_selectable(GTK_LABEL(w),TRUE);gtk_box_append(box,w);g_free(text);g_free(h);g_free(value);
   }
 }
-typedef struct { GtkWindow *window; char *text; gboolean acknowledge; gboolean copied; GtkWidget *ack; } Recovery;
+typedef struct { GtkWindow *window; char *text; gboolean acknowledge; gboolean copied; GtkWidget *ack, *view, *copy, *toggle; guint expiry; } Recovery;
 static void wipe(char *text){if(text){gsize len=strlen(text);volatile char *p=(volatile char*)text;while(len--)*p++=0;}}
-static void recovery_free(gpointer data){Recovery *r=data;wipe(r->text);g_free(r->text);g_free(r);}
+static void recovery_free(gpointer data){Recovery *r=data;if(r->expiry)g_source_remove(r->expiry);wipe(r->text);g_free(r->text);g_free(r);}
+static gboolean expire_recovery(gpointer data){
+  Recovery*r=data;r->expiry=0;r->acknowledge=FALSE;wipe(r->text);g_clear_pointer(&r->text,g_free);
+  gtk_text_buffer_set_text(gtk_text_view_get_buffer(GTK_TEXT_VIEW(r->view)),"This recovery display has expired. Open Recovery information again to reveal the credentials.",-1);
+  gtk_widget_set_visible(r->view,TRUE);gtk_widget_set_sensitive(r->copy,FALSE);gtk_widget_set_sensitive(r->toggle,FALSE);
+  if(r->ack)gtk_widget_set_sensitive(r->ack,FALSE);
+  return G_SOURCE_REMOVE;
+}
 typedef struct { GdkClipboard *clipboard; GdkContentProvider *content; } ClipboardTimeout;
 static gboolean clear_clipboard(gpointer data){
   ClipboardTimeout *saved=data;
@@ -334,7 +357,7 @@ static gboolean clear_clipboard(gpointer data){
   g_clear_object(&saved->content);g_object_unref(saved->clipboard);g_free(saved);return G_SOURCE_REMOVE;
 }
 static void copy_recovery(GtkButton *b,gpointer data){
-  Recovery *r=data;GdkClipboard *cb=gtk_widget_get_clipboard(GTK_WIDGET(r->window));gdk_clipboard_set_text(cb,r->text);
+  Recovery *r=data;if(!r->text)return;GdkClipboard *cb=gtk_widget_get_clipboard(GTK_WIDGET(r->window));gdk_clipboard_set_text(cb,r->text);
   r->copied=TRUE;gtk_button_set_label(b,"Copied — save it outside this computer");
   if(r->ack)gtk_widget_set_sensitive(r->ack,TRUE);
   ClipboardTimeout *saved=g_new0(ClipboardTimeout,1);saved->clipboard=g_object_ref(cb);saved->content=gdk_clipboard_get_content(cb);if(saved->content)g_object_ref(saved->content);
@@ -361,11 +384,12 @@ static void result_window(App *app,const char *title,JsonNode *node,gboolean rev
     g_string_append(s,"\nUse the repository address and repository password with Restic on a replacement computer. Restore any required SSH key, verify the server host fingerprint, or configure the S3 access credentials before connecting.\n");
     r->text=g_string_free(s,FALSE);g_object_set_data_full(G_OBJECT(w),"recovery",r,recovery_free);
     append_text(content,"Save this complete recovery record in your password manager. OctoVault stores its credentials encrypted. A machine-bound credential file cannot recover your backup on another computer.",NULL);
-    GtkWidget *toggle=gtk_toggle_button_new_with_mnemonic("_Reveal recovery information");gtk_box_append(content,toggle);
+    GtkWidget *toggle=gtk_toggle_button_new_with_mnemonic("_Reveal recovery information");r->toggle=toggle;gtk_box_append(content,toggle);
     GtkWidget *text=gtk_text_view_new();gtk_text_view_set_editable(GTK_TEXT_VIEW(text),FALSE);gtk_text_view_set_monospace(GTK_TEXT_VIEW(text),TRUE);gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(text),GTK_WRAP_WORD_CHAR);
-    gtk_text_buffer_set_text(gtk_text_view_get_buffer(GTK_TEXT_VIEW(text)),r->text,-1);gtk_widget_set_visible(text,FALSE);gtk_box_append(content,text);g_signal_connect(toggle,"toggled",G_CALLBACK(reveal_toggle),text);
-    GtkWidget *copy=gtk_button_new_with_mnemonic("_Copy complete recovery record");gtk_box_append(root,copy);g_signal_connect(copy,"clicked",G_CALLBACK(copy_recovery),r);
-    append_text(root,"Clipboard clearing is attempted after one minute. Clipboard history applications may retain copied text.","dim-label");
+    r->view=text;gtk_text_buffer_set_text(gtk_text_view_get_buffer(GTK_TEXT_VIEW(text)),r->text,-1);gtk_widget_set_visible(text,FALSE);gtk_box_append(content,text);g_signal_connect(toggle,"toggled",G_CALLBACK(reveal_toggle),text);
+    GtkWidget *copy=gtk_button_new_with_mnemonic("_Copy complete recovery record");r->copy=copy;gtk_box_append(root,copy);g_signal_connect(copy,"clicked",G_CALLBACK(copy_recovery),r);
+    append_text(root,"This display expires after five minutes. Clipboard clearing is attempted after one minute. Clipboard history applications may retain copied text.","dim-label");
+    r->expiry=g_timeout_add_seconds(300,expire_recovery,r);
     if(acknowledge){r->ack=gtk_check_button_new_with_mnemonic("I have _saved the complete recovery record outside this computer");gtk_box_append(root,r->ack);}
     GtkWidget *done=gtk_button_new_with_mnemonic("_Done");gtk_widget_set_halign(done,GTK_ALIGN_END);gtk_box_append(root,done);g_signal_connect(done,"clicked",G_CALLBACK(reveal_done),r);g_signal_connect(w,"close-request",G_CALLBACK(reveal_close),r);
   }else{detail_nodes(content,NULL,node,0);GtkWidget *close=gtk_button_new_with_mnemonic("_Close");gtk_widget_set_halign(close,GTK_ALIGN_END);gtk_box_append(root,close);g_signal_connect(close,"clicked",G_CALLBACK(close_window),w);}
@@ -382,11 +406,12 @@ static const Spec vault_fields[]={
  S("password","Key _passphrase","password",NULL,"Required for a password-protected key. It is sent only to the authorized service and never saved.",FALSE),
  S("_confirm_password","_Confirm key passphrase","password",NULL,NULL,FALSE),
  S("recipient","OpenPGP _recipient","text",NULL,"Full fingerprint of an existing encryption-capable OpenPGP recipient.",FALSE),
- S("cipher_file","Text cipher _file","file",NULL,"Required when using a cloaked text key.",FALSE),
+ S("cipher_file","Text cipher _file","file",NULL,"Leave blank to use the included default cipher. For an existing text key, choose the cipher originally used.",FALSE),
  S("mountpoint","_Mount location","folder",NULL,"An empty, dedicated directory. Leave blank for the managed default.",FALSE),
  S("open_on","_Unlock automatically","choice","login|manual|drive|token",NULL,FALSE),S("drive_uuid","Key drive _UUID","text",NULL,"Used for drive-triggered unlocking.",FALSE),
  S("close_on","_Lock automatically","flags","screen-lock|logout|sleep|shutdown",NULL,FALSE),
- S("force_close","Allow force close of _busy applications","boolean",NULL,"Force closing can discard unsaved application work.",FALSE),END};
+ S("force_close","Allow force close of _busy applications","boolean",NULL,"Force closing can discard unsaved application work.",FALSE),
+ S("trust_native_hooks","Trust _scripts stored inside this vault","boolean",NULL,"Allows executable hooks from the vault to run as your account. Leave disabled for untrusted imported vaults.",FALSE),END};
 static const Spec vault_settings[]={
  S("name","_Vault name","text",NULL,NULL,TRUE),
  S("auth","_Authentication","choice","key|gpg|image|text","Select the method used by the existing key or carrier below.",TRUE),
@@ -395,6 +420,7 @@ static const Spec vault_settings[]={
  S("open_on","_Unlock automatically","choice","login|manual|drive|token",NULL,FALSE),
  S("drive_uuid","Key drive _UUID","text",NULL,NULL,FALSE),S("close_on","_Lock automatically","flags","screen-lock|logout|sleep|shutdown",NULL,FALSE),
  S("force_close","Allow force close of _busy applications","boolean",NULL,"Applications holding this vault open may be terminated.",FALSE),
+ S("trust_native_hooks","Trust _scripts stored inside this vault","boolean",NULL,"Allows the vault's own executable hooks to run as your account. Enable only for a vault whose scripts you trust.",FALSE),
  S("hooks.open","After _opening script","file",NULL,"Runs as your user. Only choose scripts you trust.",FALSE),
  S("hooks.close","Before _closing script","file",NULL,"Runs while protected files are still accessible.",FALSE),
  S("hooks.after_close","After confirmed _lock script","file",NULL,"Runs only after the vault has been verified closed.",FALSE),END};
@@ -403,7 +429,7 @@ static const Spec vault_close[]={S("force","_Force close busy applications","boo
 static const Spec vault_resize[]={S("size_gb","New size in _gigabytes","number","20","The vault must be closed. Shrinking is not supported.",TRUE),S("password","Key _passphrase","password",NULL,NULL,FALSE),END};
 static const Spec vault_passwd[]={S("old_password","_Current passphrase","password",NULL,NULL,TRUE),S("password","_New passphrase","password",NULL,NULL,TRUE),S("_confirm_password","_Confirm new passphrase","password",NULL,NULL,TRUE),END};
 static const Spec vault_setkey[]={S("new_key_file","_Replacement key file","file",NULL,NULL,TRUE),S("old_password","Current key _passphrase","password",NULL,NULL,FALSE),S("password","Replacement key p_assphrase","password",NULL,NULL,FALSE),END};
-static const Spec vault_export[]={S("format","_Export format","choice","key|image|text|qr",NULL,TRUE),S("output","_Output file","save",NULL,"For an image export, choose an existing JPEG carrier. Keep exported key material secure.",TRUE),S("cipher_file","Text cipher _file","file",NULL,"Required for a text export.",FALSE),S("password","Key _passphrase","password",NULL,NULL,FALSE),END};
+static const Spec vault_export[]={S("format","_Export format","choice","key|image|text|qr",NULL,TRUE),S("output","_Output file","save",NULL,"For an image export, choose an existing JPEG carrier. Keep exported key material secure.",TRUE),S("cipher_file","Text cipher _file","file",NULL,"Leave blank to use the included default cipher.",FALSE),S("password","Key _passphrase","password",NULL,NULL,FALSE),END};
 static const Spec vault_search[]={S("query","_Search text","text",NULL,NULL,TRUE),END};
 static const Spec migration_add[]={S("source","_File or folder to protect","path",NULL,"The original is retained temporarily until the close/reopen comparison succeeds.",TRUE),S("relative","_Location inside vault","text",NULL,"Relative destination, for example Documents or browser/profile.",TRUE),S("password","Key _passphrase to reopen","password",NULL,NULL,FALSE),END};
 static const Spec migration_recover[]={S("migration_id","_Migration identifier","text",NULL,"Find this in Migration recovery records.",TRUE),S("action","_Recovery action","choice","resume|rollback",NULL,TRUE),S("password","Key _passphrase","password",NULL,NULL,FALSE),END};
@@ -422,20 +448,20 @@ static const Spec repository_check[]={S("read_data","_Read and verify all stored
 static const Spec repository_files[]={S("snapshot","_Snapshot","text","latest","A snapshot identifier or latest.",TRUE),S("path","_Path within snapshot","text","/",NULL,FALSE),END};
 static const Spec repository_find[]={S("pattern","Filename _pattern","text",NULL,"For example *.pdf.",TRUE),END};
 static const Spec repository_diff[]={S("snapshot_a","_Earlier snapshot","text",NULL,NULL,TRUE),S("snapshot_b","_Later snapshot","text","latest",NULL,TRUE),END};
-static const Spec repository_restore[]={S("snapshot","_Snapshot","text","latest",NULL,TRUE),S("target","Restore _destination","folder",NULL,"A separate empty folder is recommended.",TRUE),S("include","_Include paths or patterns","lines",NULL,"One per line. Leave blank to restore the complete snapshot.",FALSE),S("overwrite","_Allow replacing existing files","boolean",NULL,"Existing data at the restore destination may be overwritten.",FALSE),END};
+static const Spec repository_restore[]={S("snapshot","_Snapshot","text","latest",NULL,TRUE),S("target","Restore _destination","folder",NULL,"A separate empty folder is recommended.",TRUE),S("include","_Include paths or patterns","lines",NULL,"One per line. Leave blank to restore the complete snapshot.",FALSE),S("overwrite","_Replace existing files","choice","never|if-newer|if-changed|always","Never keeps all existing files. Other choices can replace files at the restore destination.",TRUE),END};
 static const Spec repository_forget[]={S("keep_daily","Keep _daily snapshots","integer","7",NULL,FALSE),S("keep_weekly","Keep _weekly snapshots","integer","4",NULL,FALSE),S("keep_monthly","Keep _monthly snapshots","integer","12",NULL,FALSE),S("dry_run","_Preview only","boolean","true","Keep enabled to review the selection before removing snapshots.",FALSE),END};
-static const Spec repository_password[]={S("password","_New repository password","password",NULL,"Save the new password externally. The service updates its encrypted credential.",TRUE),S("_confirm_password","_Confirm new password","password",NULL,NULL,TRUE),END};
+static const Spec repository_password[]={S("password","_New repository password","password",NULL,"Leave blank to generate a strong random password. Save the new recovery record externally.",FALSE),S("_confirm_password","_Confirm new password","password",NULL,NULL,FALSE),END};
 static const Spec repository_copy[]={S("target_id","_Target repository","reference","2",NULL,TRUE),S("snapshot","_Snapshot","text","latest",NULL,TRUE),END};
 static const Spec plan_fields[]={
  S("name","Backup plan _name","text",NULL,NULL,TRUE),S("repository_id","_Repository","reference","2",NULL,TRUE),
  S("sources","_Files and folders","paths",NULL,"One absolute path per line. System-owned sources are backed up with approved administrative access.",TRUE),
  S("excludes","_Exclude patterns","lines",NULL,"One pattern per line.",FALSE),S("one_file_system","Stay on each source _filesystem","boolean",NULL,NULL,FALSE),
- S("vault_id","Linked _vault","reference","0",NULL,FALSE),S("vault_mode","Vault backup _mode","choice","none|open-files|closed-container","Open-files requires the vault to be mounted; closed-container requires verified closure.",FALSE),
+ S("vault_id","Linked _vault","reference","0",NULL,FALSE),S("vault_mode","Vault backup _mode","choice","none|open-files|closed-container","Open-files requires every source to be inside or mapped from the linked vault. For independent sources reacting to a vault event, choose None. Closed-container requires verified closure.",FALSE),
  S("trigger","_Run backup","choice","manual|calendar|boot|idle|vault-open|vault-close|drive",NULL,TRUE),
  S("calendar","Calendar _schedule","text","daily","systemd calendar expression, for example daily or Mon..Fri 20:00.",FALSE),
  S("boot_delay_sec","Seconds after _boot","integer","3600",NULL,FALSE),S("idle_sec","Idle _seconds","integer","900",NULL,FALSE),S("drive_uuid","Trigger drive _UUID","text",NULL,NULL,FALSE),
  S("on_battery","Allow running on _battery power","boolean",NULL,NULL,FALSE),S("metered","Allow _metered connections","boolean",NULL,NULL,FALSE),
- S("retention.keep_daily","Keep _daily snapshots","integer","7",NULL,FALSE),S("retention.keep_weekly","Keep _weekly snapshots","integer","4",NULL,FALSE),S("retention.keep_monthly","Keep _monthly snapshots","integer","12",NULL,FALSE),END};
+ S("retention.keep_daily","Keep _daily snapshots","integer","0","All zero keeps every snapshot. Nonzero retention removes older snapshots after successful backups.",FALSE),S("retention.keep_weekly","Keep _weekly snapshots","integer","0",NULL,FALSE),S("retention.keep_monthly","Keep _monthly snapshots","integer","0",NULL,FALSE),END};
 static const Spec empty_fields[]={END};
 #undef S
 #undef END
@@ -514,7 +540,7 @@ static void update_form_visibility(GObject *object,GParamSpec *pspec,gpointer da
       if(!strcmp(k,"boot_delay_sec"))visible=!strcmp(trigger,"boot");
       if(!strcmp(k,"idle_sec"))visible=!strcmp(trigger,"idle");
       if(!strcmp(k,"drive_uuid"))visible=!strcmp(trigger,"drive");
-      if(!strcmp(k,"vault_id"))visible=strcmp(mode,"none")!=0;
+      if(!strcmp(k,"vault_id"))visible=strcmp(mode,"none")!=0||!strcmp(trigger,"vault-open")||!strcmp(trigger,"vault-close");
       if(!strcmp(k,"sources"))visible=strcmp(mode,"closed-container")!=0;
     }
     gtk_widget_set_visible(f->row,visible);
@@ -534,10 +560,19 @@ static void file_chosen(GObject *source,GAsyncResult *result,gpointer data){
   GFile *file=p->mode==2?gtk_file_dialog_select_folder_finish(dialog,result,&select_error):p->mode==1?gtk_file_dialog_save_finish(dialog,result,&select_error):gtk_file_dialog_open_finish(dialog,result,&select_error);
   if(file){char *path=g_file_get_path(file);
     if(path){
-      if(p->secret){char *contents=NULL;gsize size=0;GError*error=NULL;if(g_file_get_contents(path,&contents,&size,&error)&&size<=262144){gtk_text_buffer_set_text(gtk_text_view_get_buffer(GTK_TEXT_VIEW(p->widget)),contents,(int)size);}else{GtkAlertDialog *message=gtk_alert_dialog_new("%s",error?error->message:"The selected key is too large.");gtk_alert_dialog_show(message,p->parent);g_object_unref(message);}g_clear_error(&error);wipe(contents);g_free(contents);}
+      if(p->secret){
+        GError*error=NULL;GFileInfo*info=g_file_query_info(file,G_FILE_ATTRIBUTE_STANDARD_TYPE,G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS,NULL,&error);
+        GFileInputStream*stream=info&&g_file_info_get_file_type(info)==G_FILE_TYPE_REGULAR?g_file_read(file,NULL,&error):NULL;
+        char*contents=g_malloc0(262146);gsize size=0;
+        gboolean read_ok=stream&&g_input_stream_read_all(G_INPUT_STREAM(stream),contents,262145,&size,NULL,&error);
+        if(read_ok&&size<=262144&&!memchr(contents,'\0',size)&&g_utf8_validate(contents,(gssize)size,NULL))gtk_text_buffer_set_text(gtk_text_view_get_buffer(GTK_TEXT_VIEW(p->widget)),contents,(int)size);
+        else{GtkAlertDialog*message=gtk_alert_dialog_new("%s",error?error->message:"Select a regular UTF-8 private-key file no larger than 256 KiB.");gtk_alert_dialog_show(message,p->parent);g_object_unref(message);}
+        volatile char*secret=(volatile char*)contents;for(gsize i=0;i<262146;i++)secret[i]=0;
+        g_free(contents);g_clear_object(&stream);g_clear_object(&info);g_clear_error(&error);
+      }
       else if(GTK_IS_TEXT_VIEW(p->widget)){GtkTextBuffer *b=gtk_text_view_get_buffer(GTK_TEXT_VIEW(p->widget));GtkTextIter end;gtk_text_buffer_get_end_iter(b,&end);if(gtk_text_buffer_get_char_count(b))gtk_text_buffer_insert(b,&end,"\n",1);gtk_text_buffer_insert(b,&end,path,-1);}
       else gtk_editable_set_text(GTK_EDITABLE(p->widget),path);
-    }g_free(path);g_object_unref(file);
+    }else{GtkAlertDialog*message=gtk_alert_dialog_new("Choose a local file or mounted drive. Remote document URLs are not supported for this operation.");gtk_alert_dialog_show(message,p->parent);g_object_unref(message);}g_free(path);g_object_unref(file);
   }
   g_clear_error(&select_error);g_object_unref(p->widget);g_object_unref(p->parent);g_free(p);
 }
@@ -640,7 +675,7 @@ static void submit_form(GtkButton*button,gpointer data){
       if(!*value&&!strcmp(s->key,"mountpoint")){g_free(value);json_node_free(n);continue;}
       if(s->required&&!*value){char*msg=g_strdup_printf("Please complete %s.",s->label);gtk_label_set_text(f->error,msg);g_free(msg);gtk_widget_grab_focus(field->widget);valid=FALSE;wipe(value);g_free(value);json_node_free(n);break;}
       if(!strcmp(s->kind,"lines")||!strcmp(s->kind,"paths")){
-        JsonArray*a=json_array_new();char**lines=g_strsplit(value,"\n",-1);for(guint j=0;lines[j];j++){g_strstrip(lines[j]);if(*lines[j])json_array_add_string_element(a,lines[j]);}g_strfreev(lines);json_node_free(n);n=json_node_new(JSON_NODE_ARRAY);json_node_take_array(n,a);
+        JsonArray*a=json_array_new();char**lines=g_strsplit(value,"\n",-1);for(guint j=0;lines[j];j++){if(*lines[j])json_array_add_string_element(a,lines[j]);}g_strfreev(lines);json_node_free(n);n=json_node_new(JSON_NODE_ARRAY);json_node_take_array(n,a);
       }else json_node_set_string(n,value);
       wipe(value);g_free(value);
     }
@@ -654,6 +689,9 @@ static void submit_form(GtkButton*button,gpointer data){
         if(strcmp(confirmation,str(params,"password"))){gtk_label_set_text(f->error,"The password confirmation does not match.");gtk_widget_grab_focus(field->widget);valid=FALSE;}
         wipe(confirmation);g_free(confirmation);
       }
+    }
+    if(!strcmp(f->operation,"backup.save")&&(!strcmp(str(params,"trigger"),"vault-open")||!strcmp(str(params,"trigger"),"vault-close")||(*str(params,"vault_mode")&&strcmp(str(params,"vault_mode"),"none")))&&!*str(params,"vault_id")){
+      gtk_label_set_text(f->error,"Select the vault used by this backup's event or source mode.");valid=FALSE;
     }
     if(!strcmp(f->operation,"backup.save")&&!strcmp(str(params,"vault_mode"),"closed-container")){
       const char*id=str(params,"vault_id");JsonArray*sources=json_array_new();JsonNode*collection=f->app->collections[0];
@@ -670,7 +708,7 @@ static void submit_form(GtkButton*button,gpointer data){
   json_object_unref(params);
 }
 static void open_form(App*app,const char*operation,const char*title,JsonObject*record){
-  if(app->active){error_window(app,"An operation is already running","Wait for the current operation to complete or cancel it first.");return;}
+  if(app->active&&!( !strcmp(operation,"vault.close")&&!strcmp(app->active->op,"backup.run"))){error_window(app,"An operation is already running","Wait for the current operation to complete or cancel it first.");return;}
   Form*f=g_new0(Form,1);f->app=app;f->operation=g_strdup(operation);f->base=json_object_new();f->fields=g_ptr_array_new_with_free_func(field_free);f->acknowledge=!strcmp(operation,"repository.create");f->automatic=app->automatic_prompt&&!strcmp(operation,"vault.open");
   if(record&&*str(record,"id"))json_object_set_string_member(f->base,"id",str(record,"id"));
   GtkWindow*w=dialog_window(app,title,650,760);f->window=w;g_object_set_data_full(G_OBJECT(w),"form",f,form_free);
@@ -729,6 +767,50 @@ static void snapshots_window(App*app,const char*repository,JsonNode*node){
   }
   GtkWidget*close=gtk_button_new_with_mnemonic("_Close");gtk_widget_set_halign(close,GTK_ALIGN_END);gtk_box_append(root,close);g_signal_connect(close,"clicked",G_CALLBACK(close_window),w);gtk_window_set_child(w,GTK_WIDGET(root));gtk_window_present(w);
 }
+static gboolean file_filter(GtkListBoxRow*row,gpointer data){
+  const char*query=gtk_editable_get_text(GTK_EDITABLE(data));const char*path=g_object_get_data(G_OBJECT(row),"path");
+  if(!*query)return TRUE;
+  char*folded_query=g_utf8_casefold(query,-1),*folded_path=g_utf8_casefold(path?path:"",-1);gboolean match=strstr(folded_path,folded_query)!=NULL;g_free(folded_query);g_free(folded_path);return match;
+}
+static void filter_changed(GtkSearchEntry*entry,gpointer data){(void)entry;gtk_list_box_invalidate_filter(GTK_LIST_BOX(data));}
+static void files_window(App*app,const char*repository,const char*snapshot,JsonNode*node){
+  if(!JSON_NODE_HOLDS_ARRAY(node)){result_window(app,"Snapshot files",node,FALSE,FALSE);return;}
+  GtkWindow*w=dialog_window(app,"Browse snapshot files",820,680);GtkBox*root=GTK_BOX(gtk_box_new(GTK_ORIENTATION_VERTICAL,14));margin(GTK_WIDGET(root),24);append_text(root,"Snapshot files","title-2");
+  append_text(root,"Restore any listed file or folder to a destination you choose.","dim-label");
+  GtkWidget*search=gtk_search_entry_new();gtk_widget_set_tooltip_text(search,"Filter paths in this snapshot listing");gtk_accessible_update_property(GTK_ACCESSIBLE(search),GTK_ACCESSIBLE_PROPERTY_LABEL,"Filter snapshot paths",-1);gtk_box_append(root,search);
+  GtkWidget*scroll=gtk_scrolled_window_new();gtk_widget_set_vexpand(scroll,TRUE);gtk_box_append(root,scroll);GtkWidget*list=gtk_list_box_new();gtk_list_box_set_selection_mode(GTK_LIST_BOX(list),GTK_SELECTION_NONE);gtk_widget_add_css_class(list,"boxed-list");gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroll),list);
+  gtk_list_box_set_filter_func(GTK_LIST_BOX(list),file_filter,g_object_ref(search),g_object_unref);g_signal_connect_object(search,"search-changed",G_CALLBACK(filter_changed),list,0);
+  JsonArray*a=json_node_get_array(node);guint count=0;
+  for(guint i=0;i<json_array_get_length(a);i++){
+    JsonNode*n=json_array_get_element(a,i);if(!JSON_NODE_HOLDS_OBJECT(n))continue;JsonObject*file=json_node_get_object(n);const char*path=str(file,"path");if(!*path)continue;
+    GtkWidget*row=gtk_list_box_row_new();g_object_set_data_full(G_OBJECT(row),"path",g_strdup(path),g_free);GtkBox*body=GTK_BOX(gtk_box_new(GTK_ORIENTATION_HORIZONTAL,10));margin(GTK_WIDGET(body),12);gtk_list_box_row_set_child(GTK_LIST_BOX_ROW(row),GTK_WIDGET(body));gtk_list_box_append(GTK_LIST_BOX(list),row);
+    gboolean directory=!strcmp(str(file,"type"),"dir");GtkWidget*icon=gtk_image_new_from_icon_name(directory?"folder-symbolic":"text-x-generic-symbolic");gtk_box_append(body,icon);
+    GtkBox*text=GTK_BOX(gtk_box_new(GTK_ORIENTATION_VERTICAL,4));gtk_widget_set_hexpand(GTK_WIDGET(text),TRUE);gtk_box_append(body,GTK_WIDGET(text));append_text(text,path,"heading");
+    char*size=json_object_has_member(file,"size")?g_format_size((guint64)json_object_get_int_member(file,"size")):g_strdup(directory?"Folder":"File");append_text(text,size,"dim-label");g_free(size);
+    JsonObject*p=json_object_new();json_object_set_string_member(p,"id",repository);json_object_set_string_member(p,"snapshot",snapshot);json_object_set_string_member(p,"path",path);JsonArray*include=json_array_new();json_array_add_string_element(include,path);json_object_set_array_member(p,"include",include);
+    if(directory)gtk_box_append(body,action_button(app,"Browse…","repository.files",p,NULL));
+    gtk_box_append(body,action_button(app,"Restore…","repository.restore",p,NULL));json_object_unref(p);count++;
+  }
+  if(!count)append_text(root,"No files were returned for this snapshot path.","dim-label");
+  GtkWidget*close=gtk_button_new_with_mnemonic("_Close");gtk_widget_set_halign(close,GTK_ALIGN_END);gtk_box_append(root,close);g_signal_connect(close,"clicked",G_CALLBACK(close_window),w);gtk_window_set_child(w,GTK_WIDGET(root));gtk_window_present(w);
+}
+static void migrations_window(App*app,const char*vault,JsonNode*node){
+  if(!JSON_NODE_HOLDS_ARRAY(node)){result_window(app,"Migration recovery",node,FALSE,FALSE);return;}
+  GtkWindow*w=dialog_window(app,"Migration recovery",720,600);GtkBox*root=GTK_BOX(gtk_box_new(GTK_ORIENTATION_VERTICAL,14));margin(GTK_WIDGET(root),24);append_text(root,"Migration recovery","title-2");
+  GtkWidget*scroll=gtk_scrolled_window_new();gtk_widget_set_vexpand(scroll,TRUE);gtk_box_append(root,scroll);GtkBox*list=GTK_BOX(gtk_box_new(GTK_ORIENTATION_VERTICAL,12));gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroll),GTK_WIDGET(list));
+  JsonArray*a=json_node_get_array(node);if(!json_array_get_length(a))append_text(list,"No migrations have been recorded for this vault.","dim-label");
+  for(guint i=0;i<json_array_get_length(a);i++){
+    JsonNode*n=json_array_get_element(a,i);if(!JSON_NODE_HOLDS_OBJECT(n))continue;JsonObject*migration=json_node_get_object(n);
+    GtkBox*box=GTK_BOX(gtk_box_new(GTK_ORIENTATION_VERTICAL,8));margin(GTK_WIDGET(box),12);gtk_widget_add_css_class(GTK_WIDGET(box),"card");gtk_box_append(list,GTK_WIDGET(box));
+    append_text(box,str(migration,"source"),"heading");char*stage=humanize(str(migration,"stage"));append_text(box,stage,"dim-label");g_free(stage);
+    const char*state=str(migration,"stage");
+    if(strcmp(state,"complete")&&strcmp(state,"rolled_back")){
+      if(*str(migration,"staging")){char*staging=g_strdup_printf("Retained original: %s",str(migration,"staging"));append_text(box,staging,NULL);g_free(staging);}
+      JsonObject*p=json_object_new();json_object_set_string_member(p,"id",vault);json_object_set_string_member(p,"migration_id",str(migration,"id"));json_object_set_string_member(p,"action","resume");gtk_box_append(box,action_button(app,"Recover this migration…","migration.recover",p,"suggested-action"));json_object_unref(p);
+    }
+  }
+  GtkWidget*close=gtk_button_new_with_mnemonic("_Close");gtk_widget_set_halign(close,GTK_ALIGN_END);gtk_box_append(root,close);g_signal_connect(close,"clicked",G_CALLBACK(close_window),w);gtk_window_set_child(w,GTK_WIDGET(root));gtk_window_present(w);
+}
 static void add_menu_action(GtkBox*menu,App*app,const char*title,const char*operation,JsonObject*record){gtk_box_append(menu,action_button(app,title,operation,record,"flat"));}
 static void show_record(App*app,JsonObject*record,gint collection){
   GtkBox*card=GTK_BOX(gtk_box_new(GTK_ORIENTATION_VERTICAL,10));gtk_widget_add_css_class(GTK_WIDGET(card),"card");
@@ -755,7 +837,7 @@ static void show_record(App*app,JsonObject*record,gint collection){
     }
   }else if(collection==2){
     if(json_object_has_member(record,"last_check")&&JSON_NODE_HOLDS_OBJECT(json_object_get_member(record,"last_check"))){
-      JsonObject*check=json_object_get_object_member(record,"last_check");char*state=g_strdup_printf("Last %s check: %s",boolean(check,"read_data")?"full data":"repository",str(check,"at"));append_text(inside,state,"dim-label");g_free(state);
+      JsonObject*check=json_object_get_object_member(record,"last_check");char*state=g_strdup_printf("Last %s check: %s · %s",boolean(check,"read_data")?"full data":"repository",boolean(check,"successful")?"Passed":"Failed",str(check,"at"));append_text(inside,state,boolean(check,"successful")?"dim-label":"error");g_free(state);
     }else append_text(inside,"Repository has not yet been checked by OctoVault.","dim-label");
   }else if(collection==3&&json_object_has_member(record,"last_run")&&JSON_NODE_HOLDS_OBJECT(json_object_get_member(record,"last_run"))){
     JsonObject*last=json_object_get_object_member(record,"last_run");char*state=g_strdup_printf("Last run: %s · %s",str(last,"status"),str(last,"finished_at"));append_text(inside,state,"dim-label");g_free(state);
@@ -831,6 +913,12 @@ static void navigation_changed(GtkToggleButton*button,gpointer data){App*app=dat
 static void activate(GApplication*application,gpointer data){
   App*app=data;
   if(app->window){gtk_window_present(app->window);return;}
+  if(!app->smoke&&g_file_test("/usr/bin/octovault-session",G_FILE_TEST_IS_REGULAR)&&g_file_test("/usr/bin/octovault-session",G_FILE_TEST_IS_EXECUTABLE)){
+    char*arguments[]={"/usr/bin/octovault-session",NULL};
+    /* The observer owns a unique session-bus name, so an existing autostart
+     * process causes this launch to exit without creating a duplicate. */
+    (void)g_spawn_async(NULL,arguments,NULL,G_SPAWN_STDOUT_TO_DEV_NULL|G_SPAWN_STDERR_TO_DEV_NULL,NULL,NULL,NULL,NULL);
+  }
   adw_style_manager_set_color_scheme(adw_style_manager_get_default(),app->preferred_theme==1?ADW_COLOR_SCHEME_FORCE_LIGHT:app->preferred_theme==2?ADW_COLOR_SCHEME_FORCE_DARK:ADW_COLOR_SCHEME_DEFAULT);
   app->window=GTK_WINDOW(adw_application_window_new(GTK_APPLICATION(application)));gtk_window_set_title(app->window,"OctoVault");gtk_window_set_default_size(app->window,1100,780);
   GtkBox*root=GTK_BOX(gtk_box_new(GTK_ORIENTATION_VERTICAL,0));adw_application_window_set_content(ADW_APPLICATION_WINDOW(app->window),GTK_WIDGET(root));
@@ -899,6 +987,7 @@ static int command_line(GApplication*application,GApplicationCommandLine*command
   return 0;
 }
 int main(int argc,char**argv){
+  const struct rlimit core_limit={0,0};(void)setrlimit(RLIMIT_CORE,&core_limit);(void)prctl(PR_SET_DUMPABLE,0,0,0,0);
   App*app=g_new0(App,1);app->page=g_strdup("Dashboard");app->activity=g_ptr_array_new_with_free_func(g_free);app->pending_unlocks=g_queue_new();app->show_notifications=TRUE;
   load_preferences(app);
   app->application=adw_application_new("io.vdm.OctoVault",G_APPLICATION_HANDLES_COMMAND_LINE);

@@ -9,5 +9,6 @@ Type=oneshot
 ExecStart=/usr/libexec/octovault/event-system sleep
 User=root
 UMask=0077
+LimitCORE=0
 TimeoutStartSec=120s
 NoNewPrivileges=yes

@@ -6,11 +6,20 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/resource.h>
+#include <sys/prctl.h>
 #include <unistd.h>
 #include <glib-unix.h>
 
 #ifndef OV_BACKEND_PATH
 #define OV_BACKEND_PATH "/usr/libexec/octovault/backend"
+#endif
+#ifndef OV_PRIORITY_BACKEND_PATH
+#ifdef OCTOVAULT_TEST
+#define OV_PRIORITY_BACKEND_PATH OV_BACKEND_PATH
+#else
+#define OV_PRIORITY_BACKEND_PATH "/usr/libexec/octovault/priority-backend"
+#endif
 #endif
 #define RESULT_TTL 300
 #define MAX_JOBS 64
@@ -21,11 +30,11 @@ typedef struct {
     gchar *id, *op, *request, *state, *stage, *message;
     guint32 uid;
     gint percent;
-    gint64 created, created_at, finished;
+    gint64 created, created_at, finished, expires;
     GSubprocess *process;
     GString *output, *errors;
     JsonNode *result;
-    gboolean stdout_done, stderr_done, process_done, success, cancelled, overflow, priority;
+    gboolean stdin_done, stdout_done, stderr_done, process_done, success, cancelled, overflow, priority;
     guint kill_timer;
     GPid pid;
 } Job;
@@ -103,7 +112,9 @@ static void start_next(guint32 uid);
 
 static void complete(Job *j)
 {
-    if (!j->process_done || !j->stdout_done || !j->stderr_done || terminal(j)) return;
+    if (!j->stdin_done || !j->process_done || !j->stdout_done || !j->stderr_done || terminal(j)) return;
+    /* Queued cancellation or a spawn failure has no stdin callback to scrub it. */
+    wipe(j->request); g_clear_pointer(&j->request, g_free);
     if (j->kill_timer) { g_source_remove(j->kill_timer); j->kill_timer = 0; }
     if (j->cancelled) j->result = failure("CANCELLED", "Operation cancelled. Check its state before retrying.");
     else if (j->overflow) j->result = failure("OUTPUT_LIMIT", "The operation exceeded the safe output limit. Narrow the request.");
@@ -128,6 +139,7 @@ static void complete(Job *j)
     gboolean ok = json_object_get_boolean_member(json_node_get_object(j->result), "ok");
     g_free(j->state); j->state = g_strdup(j->cancelled ? "cancelled" : ok ? "succeeded" : "failed");
     j->finished = g_get_real_time() / G_USEC_PER_SEC;
+    j->expires = g_get_monotonic_time() + RESULT_TTL * G_USEC_PER_SEC;
     if (ok) j->percent = 100;
     wipe(j->output->str); g_string_truncate(j->output, 0);
     wipe(j->errors->str); g_string_truncate(j->errors, 0);
@@ -217,6 +229,7 @@ static void stdin_written(GObject *stream, GAsyncResult *result, gpointer data)
     g_output_stream_write_all_finish(G_OUTPUT_STREAM(stream), result, NULL, NULL);
     g_output_stream_close(G_OUTPUT_STREAM(stream), NULL, NULL);
     wipe(j->request); g_clear_pointer(&j->request, g_free);
+    j->stdin_done = TRUE; complete(j);
 }
 
 static void child_setup(gpointer data)
@@ -236,10 +249,11 @@ static void start_job(Job *j)
     g_subprocess_launcher_set_environ(launcher, (gchar **)env);
     g_subprocess_launcher_set_cwd(launcher, "/");
     g_subprocess_launcher_set_child_setup(launcher, child_setup, NULL, NULL);
-    j->process = g_subprocess_launcher_spawn(launcher, NULL, OV_BACKEND_PATH, uid, NULL);
+    j->process = g_subprocess_launcher_spawn(launcher, NULL,
+        j->priority ? OV_PRIORITY_BACKEND_PATH : OV_BACKEND_PATH, uid, NULL);
     g_object_unref(launcher);
     if (!j->process) {
-        j->process_done = j->stdout_done = j->stderr_done = TRUE;
+        j->stdin_done = j->process_done = j->stdout_done = j->stderr_done = TRUE;
         complete(j); return;
     }
     j->pid = (GPid) g_ascii_strtoll(g_subprocess_get_identifier(j->process), NULL, 10);
@@ -463,6 +477,9 @@ static void uid_done(GObject *bus, GAsyncResult *result, gpointer data)
     g_variant_get(reply, "(u)", &p->uid); g_variant_unref(reply);
     if (g_str_equal(p->method, "Submit")) { authorize(p); return; }
     Job *j = g_hash_table_lookup(jobs, p->id);
+    if (j && terminal(j) && g_get_monotonic_time() >= j->expires) {
+        g_hash_table_remove(jobs, p->id); j = NULL;
+    }
     if (!j || j->uid != p->uid) { dbus_error(p, "NotFound", "This job is not available or has expired."); return; }
     if (g_str_equal(p->method, "GetJob")) {
         gchar *json = serialize_job(j);
@@ -473,7 +490,7 @@ static void uid_done(GObject *bus, GAsyncResult *result, gpointer data)
         if (cancelled) {
             j->cancelled = TRUE;
             if (j->process) stop_process(j);
-            else { j->process_done = j->stdout_done = j->stderr_done = TRUE; complete(j); }
+            else { j->stdin_done = j->process_done = j->stdout_done = j->stderr_done = TRUE; complete(j); }
         }
         g_dbus_method_invocation_return_value(p->invocation, g_variant_new("(b)", cancelled));
     }
@@ -529,12 +546,12 @@ static void method_call(GDBusConnection *bus, const gchar *sender, const gchar *
 static gboolean reap(gpointer data)
 {
     (void) data;
-    gint64 now = g_get_real_time() / G_USEC_PER_SEC;
+    gint64 now = g_get_monotonic_time();
     GHashTableIter iter; gpointer value;
     g_hash_table_iter_init(&iter, jobs);
     while (g_hash_table_iter_next(&iter, NULL, &value)) {
         Job *j = value;
-        if (terminal(j) && now - j->finished >= RESULT_TTL) g_hash_table_iter_remove(&iter);
+        if (terminal(j) && now >= j->expires) g_hash_table_iter_remove(&iter);
     }
     return G_SOURCE_CONTINUE;
 }
@@ -574,6 +591,11 @@ static gboolean shutdown_service(gpointer data)
 
 int main(void)
 {
+    const struct rlimit no_core = { 0, 0 };
+    (void)setrlimit(RLIMIT_CORE, &no_core);
+    (void)prctl(PR_SET_DUMPABLE, 0);
+    /* An early worker exit must fail its job, not terminate the D-Bus service. */
+    signal(SIGPIPE, SIG_IGN);
 #ifndef OCTOVAULT_TEST
     if (geteuid() != 0) { g_printerr("octovaultd must be started by the system service.\n"); return 1; }
 #endif
