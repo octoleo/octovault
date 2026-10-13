@@ -47,7 +47,7 @@ jobs:
         run: |
           useradd --create-home octovault-test
           chmod -R a+rX "$GITHUB_WORKSPACE"
-          runuser -u octovault-test -- dbus-run-session -- xvfb-run -a env GTK_A11Y=none GSK_RENDERER=cairo XDG_DATA_DIRS="$GITHUB_WORKSPACE/debian/octovault/usr/share:/usr/share" build/octovault-gtk --screenshot /tmp/octovault.png
+          runuser -u octovault-test -- dbus-run-session -- xvfb-run -a env GTK_A11Y=none G_DEBUG=fatal-criticals GSK_RENDERER=cairo XDG_DATA_DIRS="$GITHUB_WORKSPACE/debian/octovault/usr/share:/usr/share" build/octovault-gtk --screenshot /tmp/octovault.png
           mkdir -p build/screenshots
           cp /tmp/octovault.png build/screenshots/OctoVault.png
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -81,38 +81,24 @@ jobs:
   vault-integration:
     name: Real Tomb encryption and mounts
     runs-on: ubuntu-24.04
-    container:
-      image: ubuntu:26.04
-      options: --privileged --volume /lib/modules:/lib/modules:ro
     timeout-minutes: 20
     steps:
-      - name: Install actual Ubuntu vault dependencies
-        run: |
-          apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends ca-certificates git build-essential tomb cryptsetup-bin jq rsync pinentry-curses gnupg steghide qrencode lsof systemd util-linux procps kmod
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
-      - name: Compile credential helpers
-        run: |
-          mkdir -p build
-          cc -std=c11 -O2 -Wall -Wextra src/service/pinentry.c -o build/pinentry-octovault
-          cc -std=c11 -O2 -Wall -Wextra src/service/steghide.c -o build/steghide -lutil
-          install -d /usr/libexec/octovault
-          install -m 0755 build/pinentry-octovault /usr/bin/pinentry-octovault
-          install -m 0755 build/steghide /usr/libexec/octovault/steghide
-          install -d /usr/share/octovault/cloak-ciphers
-          install -m 0644 data/cloak-ciphers/words /usr/share/octovault/cloak-ciphers/words
       - name: Exercise vault creation, actual mounts, migration, and closure
         run: |
           # Hosted runners have swap enabled; remove it only in this disposable
-          # privileged test VM. The application retains Tomb's swap safeguard.
-          swapoff -a
-          modprobe dm_mod
-          modprobe loop
-          install -d /dev/mapper
-          test -c /dev/mapper/control || mknod /dev/mapper/control c 10 236
-          bash tests/test-vault.sh --integration
+          # host VM, where the swapfile is accessible. The app retains Tomb's
+          # swap safeguard. The actual dependency and tests run on Ubuntu 26.04.
+          sudo swapoff -a
+          sudo modprobe dm_mod
+          sudo modprobe loop
+          docker run --rm --privileged \
+            --volume /lib/modules:/lib/modules:ro \
+            --volume "$GITHUB_WORKSPACE:/workspace" --workdir /workspace \
+            --env CI=true --env OCTOVAULT_DISPOSABLE_TEST=1 \
+            ubuntu:26.04 bash scripts/test-vault-container.sh
 
   release:
     name: Publish reviewed version

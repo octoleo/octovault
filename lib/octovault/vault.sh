@@ -176,7 +176,7 @@ ov_vault_plain_key() {
             ov_as_user cat -- "$key" > "$OV_VAULT_TEMP_DIR/cloaked.txt" || ov_fail key_failed "The text carrier cannot be read."
             ov_as_user cat -- "$(ov_vault_field "$record" cipher_file)" > "$OV_VAULT_TEMP_DIR/cloak-cipher" || ov_fail key_failed "The cipher file cannot be read."
             /usr/libexec/tomb/decloakify -i "$OV_VAULT_TEMP_DIR/cloaked.txt" -c "$OV_VAULT_TEMP_DIR/cloak-cipher" -o "$OV_VAULT_MATERIALIZED_KEY" >&2 ||
-                ov_fail key_failed "The text key could not be decoded; verify the cipher file and installed Tomb extras."
+                ov_fail key_failed "The text key could not be decoded; verify the cipher file and installed encryption extras."
             ;;
         *) ov_as_user cat -- "$key" > "$OV_VAULT_MATERIALIZED_KEY" ;;
     esac
@@ -218,7 +218,7 @@ ov_vault_relative() {
     [[ ${parts[0]} != bind-hooks && ${parts[0]} != exec-hooks && ${parts[0]} != .octovault ]] ||
         ov_fail reserved_path "This name is reserved for vault metadata."
     [[ $value != *'__ESC_SPACE__'* && $value != *'\ '* ]] ||
-        ov_fail invalid_path "This path cannot be represented faithfully by Tomb's native bind-hook format."
+        ov_fail invalid_path "This path cannot be represented faithfully by the native folder-mapping format."
     printf '%s\n' "$value"
 }
 
@@ -226,7 +226,7 @@ ov_vault_mib() {
     local size=$1
     [[ $size =~ ^[0-9]+([.][0-9]{1,6})?$ ]] || ov_fail invalid_size "Size must be a positive decimal number of GB."
     awk -v gb="$size" 'BEGIN {m=gb*1000000000/1048576; n=int(m); if(n<m)n++; if(n<10||n>2147483647)exit 1; printf "%.0f\n",n}' ||
-        ov_fail invalid_size "The requested size is outside Tomb's supported range."
+        ov_fail invalid_size "The requested size is outside the supported range."
 }
 
 # A loop association is intentionally conservative: even a partially mounted
@@ -531,7 +531,7 @@ ov_vault_open_record() {
     install -d -m 0700 /run/octovault/mounts "/run/octovault/mounts/$OV_UID" "$engine"
     ov_progress unlock "Unlocking the vault" 20
     ov_vault_tomb_keyed "$record" open "$(ov_vault_field "$record" file)" "$engine" -n -p ||
-        ov_fail unlock_failed "Tomb could not unlock the vault. Check the key and passphrase."
+        ov_fail unlock_failed "The vault could not be unlocked. Check the key and passphrase."
     ov_vault_is_open "$record" || ov_fail verification_failed "The unlocked device could not be verified."
     if [[ $(ov_vault_field "$record" created_by_octovault) == true && -z $(ov_vault_field "$record" last_opened_at) ]]; then
         # Newly formatted ext4 starts root-owned. Preserve all content ownership
@@ -627,12 +627,12 @@ ov_vault_create() {
     [[ $auth == gpg || -n $OV_VAULT_PASSWORD ]] || ov_fail password_required "Provide a passphrase for the new key."
     if [[ $auth == text ]]; then
         if [[ ! -x /usr/libexec/tomb/cloakify || ! -x /usr/libexec/tomb/decloakify ]]; then
-            ov_fail missing_dependency "Install Tomb's supported text-cloaking extras first."
+            ov_fail missing_dependency "The encryption engine text-cloaking helpers are missing. Reinstall the required dependency."
         fi
         ov_as_user test -r "$(ov_vault_field "$record" cipher_file)" || ov_fail not_found "The cloak cipher file is unavailable."
     fi
     ov_progress create "Allocating the encrypted container" 5
-    ov_as_user tomb --no-color dig -s "$size" "$file" >&2 || ov_fail create_failed "Tomb could not allocate the container."
+    ov_as_user tomb --no-color dig -s "$size" "$file" >&2 || ov_fail create_failed "The vault container could not be allocated."
     tempkey=$key
     if [[ $auth == image || $auth == text ]]; then
         tempkey="$file.octovault-key-$(ov_new_id)"
@@ -640,7 +640,7 @@ ov_vault_create() {
     ov_progress key "Creating the encryption key" 40
     if [[ $auth == gpg ]]; then
         ov_as_user tomb --no-color forge -g -r "$(ov_vault_field "$record" recipient)" -k "$tempkey" >&2 ||
-            ov_fail key_failed "Tomb could not create the OpenPGP-protected key. The uninitialized container was retained."
+            ov_fail key_failed "The OpenPGP-protected key could not be created. The uninitialized container was retained."
     else
         ov_vault_temporary; rootkey="$OV_VAULT_TEMP_DIR/created.key"
         ov_vault_tomb forge -k "$rootkey" || ov_fail key_failed "Key generation failed. The uninitialized container was retained."
@@ -649,7 +649,7 @@ ov_vault_create() {
     local locking_record
     locking_record=$(jq --arg key "$tempkey" '.key_file=$key | if .auth=="image" or .auth=="text" then .auth="key" else . end' <<< "$record")
     ov_progress initialize "Initializing the vault filesystem" 65
-    ov_vault_tomb_keyed "$locking_record" lock "$file" || ov_fail initialize_failed "Tomb could not initialize the vault; its container and key were retained."
+    ov_vault_tomb_keyed "$locking_record" lock "$file" || ov_fail initialize_failed "The vault could not be initialized; its container and key were retained."
     ov_vault_unpin "$record" || ov_fail cleanup_failed "The new vault was initialized but its temporary container reference remains attached."
     if [[ $auth == image ]]; then
         [[ -f $key ]] || ov_fail invalid_image "Select an existing JPEG carrier image. The ordinary key was retained beside the container."
@@ -715,7 +715,7 @@ ov_vault_change_password() {
     ov_vault_plain_key "$record"
     OV_VAULT_PASSWORD=$new_password
     OV_OLD_KEY_PATH=$OV_VAULT_MATERIALIZED_KEY; export OV_OLD_KEY_PATH
-    ov_vault_tomb passwd -k "$OV_VAULT_MATERIALIZED_KEY" || ov_fail password_failed "Tomb could not update the passphrase; the original key is unchanged."
+    ov_vault_tomb passwd -k "$OV_VAULT_MATERIALIZED_KEY" || ov_fail password_failed "The passphrase could not be updated; the original key is unchanged."
     case $auth in
         image)
             ov_vault_image_embed "$OV_VAULT_MATERIALIZED_KEY" "$key" "$OV_VAULT_TEMP_DIR/rewrapped.jpg" || ov_fail key_failed "Could not update the image; the original remains unchanged."
@@ -753,7 +753,7 @@ ov_vault_replace_key() {
         OV_OLD_KEY_PATH=$OV_VAULT_MATERIALIZED_KEY; export OV_OLD_KEY_PATH
         ov_vault_tomb setkey "$OV_VAULT_MATERIALIZED_KEY" "$OV_VAULT_CONTAINER_ALIAS" -k "$new_material" || rc=$?
     fi
-    ((rc==0)) || ov_fail key_failed "Tomb could not replace the key. The saved configuration has not changed."
+    ((rc==0)) || ov_fail key_failed "The key could not be replaced. The saved configuration has not changed."
     ov_vault_unpin "$record" || ov_fail cleanup_failed "The key changed but its temporary container reference remains attached."
     record=$(jq --arg key "$new_key" --arg time "$(ov_now)" '.key_file=$key | .auth="key" | .recipient="" | .cipher_file="" | .updated_at=$time' <<< "$record")
     ov_save vaults "$(ov_vault_field "$record" id)" "$record"
@@ -774,8 +774,11 @@ ov_vault_export_key() {
             ov_vault_publish "$OV_VAULT_TEMP_DIR/export.jpg" "$output" true || ov_fail export_failed "Could not save the carrier image."
             ;;
         text)
-            cipher=$(ov_vault_user_path "$(ov_require cipher_file)")
-            ov_vault_text_embed "$key" "$cipher" "$OV_VAULT_TEMP_DIR/export.txt" || ov_fail export_failed "Could not cloak the key; check installed Tomb extras."
+            cipher=$(ov_param cipher_file '')
+            [[ -n $cipher ]] || cipher=$(ov_vault_field "$record" cipher_file)
+            [[ -n $cipher ]] || cipher=/usr/share/octovault/cloak-ciphers/words
+            cipher=$(ov_vault_user_path "$cipher")
+            ov_vault_text_embed "$key" "$cipher" "$OV_VAULT_TEMP_DIR/export.txt" || ov_fail export_failed "Could not cloak the key; check the installed encryption extras."
             ov_vault_publish "$OV_VAULT_TEMP_DIR/export.txt" "$output" || ov_fail export_failed "Could not save the cloaked key."
             ;;
         qr)
@@ -1015,7 +1018,7 @@ ov_vault_dispatch() {
                 vault.resize)
                     ov_vault_require_closed "$record"
                     size=$(ov_vault_mib "$(ov_require size_gb)"); ov_vault_password
-                    ov_vault_tomb_keyed "$record" resize "$(ov_vault_field "$record" file)" -s "$size" || ov_fail resize_failed "Tomb could not resize the vault."
+                    ov_vault_tomb_keyed "$record" resize "$(ov_vault_field "$record" file)" -s "$size" || ov_fail resize_failed "The vault could not be resized."
                     ov_vault_unpin "$record" || ov_fail cleanup_failed "The vault was resized but its temporary container reference remains attached."
                     record=$(jq --arg size "$(ov_param size_gb)" --arg time "$(ov_now)" '.size_gb=$size | .updated_at=$time' <<< "$record")
                     ov_save vaults "$id" "$record"; ov_ok "$(ov_vault_status "$record")" ;;
@@ -1024,11 +1027,11 @@ ov_vault_dispatch() {
                 vault.key-export) ov_vault_export_key "$record" ;;
                 vault.index)
                     ov_vault_is_open "$record" || ov_fail locked "Open the vault before indexing."
-                    ov_vault_index_or_search "$record" index >&2 || ov_fail index_failed "Tomb indexing failed."
+                    ov_vault_index_or_search "$record" index >&2 || ov_fail index_failed "Vault indexing failed."
                     ov_ok '{"indexed":true}' ;;
                 vault.search)
                     ov_vault_is_open "$record" || ov_fail locked "Open the vault before searching."
-                    result=$(ov_vault_index_or_search "$record" search "$(ov_require query)" 2>/dev/null) || ov_fail search_failed "Tomb could not search its indexes."
+                    result=$(ov_vault_index_or_search "$record" search "$(ov_require query)" 2>/dev/null) || ov_fail search_failed "The vault indexes could not be searched."
                     ov_ok "$(jq -n --arg results "$result" '{results:$results}')" ;;
                 migration.list) ov_ok "$(ov_migration_list "$id")" ;;
                 *) ov_fail unknown_operation "Unknown vault operation." ;;
