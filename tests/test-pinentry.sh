@@ -19,6 +19,8 @@ result=$(printf 'SETDESC Insert password to: original.key\nGETPIN\nSETDESC Type 
 [[ $result == *'D new%25password%0Asecond'* ]]
 result2=$(printf 'GETPIN\nBYE\n' | "$task_tmp/pinentry")
 [[ $result2 == *'D new%25password%0Asecond'* ]]
+result3=$(printf 'GETPIN\nBYE\n' | OV_PINENTRY_RAW=1 "$task_tmp/pinentry")
+[[ $result3 == *'D new%password%0Asecond'* ]]
 exec {OV_SECRET_FD}<&-
 exec {OV_OLD_SECRET_FD}<&-
 echo 'pinentry: private anonymous descriptors, reusable reads, escaping and old/new passwords passed'

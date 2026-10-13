@@ -41,6 +41,7 @@ int main(void)
     char *old_secret = read_secret("OV_OLD_SECRET_FD", &old_length);
     if (!secret) { puts("ERR 83886179 No secure password input"); return 1; }
     const char *old_path = getenv("OV_OLD_KEY_PATH");
+    int raw = getenv("OV_PINENTRY_RAW") && !strcmp(getenv("OV_PINENTRY_RAW"), "1");
     const char *old_name = old_path ? strrchr(old_path, '/') : NULL;
     old_name = old_name ? old_name + 1 : old_path;
     int use_old = 0;
@@ -56,7 +57,7 @@ int main(void)
             fputs("D ", stdout);
             for (size_t i = 0; i < chosen_length; i++) {
                 unsigned char c = (unsigned char)chosen[i];
-                if (c == '%' || c < 32 || c == 127) printf("%%%02X", c);
+                if ((!raw && c == '%') || c < 32 || c == 127) printf("%%%02X", c);
                 else putchar(c);
             }
             fputs("\nOK\n", stdout);

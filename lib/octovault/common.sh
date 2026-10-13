@@ -30,6 +30,7 @@ ov_load() {
     ov_collection "$1"; ov_id "$2"
     local file="$OV_ROOT/$1/$2.json"
     [[ -f $file && ! -L $file ]] || ov_fail not_found 'The requested record does not exist.'
+    # shellcheck disable=SC2034 # Shared result consumed by sourced adapters.
     OV_RECORD=$(jq -ce 'select(type == "object" and .schema_version == 1)' "$file") || ov_fail invalid_state 'The saved record is damaged or has an unsupported version.'
 }
 ov_save() {
@@ -111,6 +112,22 @@ ov_old_secret_fd() {
 }
 ov_validate_path() {
     [[ $1 == /* && $1 != *$'\n'* && $1 != *$'\r'* ]] || ov_fail invalid_path 'Use an absolute path without line breaks.'
+}
+ov_resource_lock() {
+    local identity
+    [[ -z ${OV_RESOURCE_FD-} ]] || return 0
+    install -d -m 0700 /run/octovault/locks
+    if [[ -e $1 ]]; then
+        identity=$(stat -Lc '%d_%i' -- "$1") || ov_fail unavailable 'Cannot identify the vault container.'
+    else
+        identity=$(realpath -m -- "$1" | sha256sum | cut -d' ' -f1)
+    fi
+    exec {OV_RESOURCE_FD}>"/run/octovault/locks/$identity.lock"
+    flock -n "$OV_RESOURCE_FD" || ov_fail busy 'Another OctoVault operation is using this container. Retry after it completes.'
+}
+ov_resource_unlock() {
+    if [[ ${OV_RESOURCE_FD-} =~ ^[0-9]+$ ]]; then exec {OV_RESOURCE_FD}>&-; fi
+    unset OV_RESOURCE_FD
 }
 ov_init() {
     [[ $EUID == 0 ]] || ov_fail permission_denied 'The OctoVault worker must run through the system service.'
