@@ -1,4 +1,4 @@
-# OctoVault 1.0.0 implementation contract
+# OctoVault implementation contract
 
 OctoVault is a native GNOME vault and independent backup manager by Vast Development Method, part of the OctoLeo Suite.
 
@@ -25,6 +25,8 @@ Shared Bash `lib/octovault/common.sh`: worker variables `OV_UID`, `OV_USER`, `OV
 ## Objects and operations
 
 Vault fields: name,file,key_file,auth (`key`,`gpg`,`image`,`text`),recipient,cipher_file,mountpoint,size_gb,open_on (`manual`,`login`,`drive`,`token`),drive_uuid,close_on (array of `screen-lock`,`logout`,`sleep`,`shutdown`),force_close boolean,trust_native_hooks boolean,hooks object. Native bind-hooks remain in vault. Imported native executable hooks require explicit trust and always execute as the vault owner. Configured hooks support open, close, and after_close.
+
+Creation accepts `directory` plus `name`, generating the container filename, or the existing explicit `file` parameter; these location choices are mutually exclusive. `use_existing_key` is a boolean defaulting to false. With a new key and no explicit `key_file`, the adapter creates a private managed directory under `~/.local/share/octovault/keys/ID`, writes only encrypted key material or its image/text carrier, and saves the resulting path. `image_source` selects an existing cover image for a separate generated carrier. With `use_existing_key:true`, `key_file` is the existing input and is never regenerated. `recipient` is required for a new OpenPGP key, while decryption of an existing OpenPGP key determines its recipient from the encrypted key. Creation requests never persist `password`; the stored `mountpoint` is chosen automatically unless an advanced caller supplies it. The create form and existing-vault import form use different location and key-selection controls.
 `vault.list`, `vault.get {id}`, `vault.create` (fields above), `vault.import` (same fields without size), `vault.open {id}`, `vault.close {id,force}`, `vault.update {id,...fields}`, `vault.remove {id}` (unregister only), `vault.resize {id,size_gb}`, `vault.passwd {id}`, `vault.setkey {id,new_key_file}`, `vault.key-export {id,format,output}`, `vault.index {id}`, `vault.search {id,query}`, `migration.add {id,source,relative}`, `migration.list {id}`, `migration.recover {id,migration_id,action}`.
 
 Destination fields: name,type (`s3`,`sftp`,`local`,`rest`),endpoint,region,bucket,host,port,user,path,host_fingerprint. Secrets supplied only in params: access_key,secret_key,ssh_private_key,ssh_passphrase,rest_username,rest_password. Encrypted credential references persisted, never plaintext secrets.
@@ -36,4 +38,8 @@ Plan fields: name,repository_id,sources (array),excludes (array),one_file_system
 
 Restore `overwrite` is the string enum `never`, `if-newer`, `if-changed`, or `always`. Retention defaults preserve all snapshots until a user selects a policy. An open-files plan verifies that every selected source still belongs to its linked vault filesystem. An independent plan may instead use a vault transition as its trigger without requiring its sources to live inside that vault.
 
-GUI offers native forms for all public operations, readable JSON-free lists/details, cancellable jobs and recovery reveal/copy. CLI maps `GROUP ACTION --hyphenated-key VALUE` to underscore keys in params; supports arrays through repeated source/include/exclude/close-on options and explicit JSON request input. `--json` emits machine output; errors preserve nonzero exit. Passwords/secrets prompt securely or come from stdin JSON, not secret CLI values.
+GUI offers native forms for all public operations, readable JSON-free lists/details, cancellable jobs and recovery reveal/copy. Guided backup setup connects destination selection or creation, encrypted repository creation and recovery display, source selection and scheduling, and an optional first run. Existing destinations and repositories remain reusable. Each operation still uses the same service contract; the guide does not introduce a separate backup engine. New guided plans default to a daily schedule. Source pickers accept multiple files and folders with additive selection.
+
+Setup forms place optional tuning behind an Advanced options checkbox. Required fields remain visible for the selected authentication, destination and schedule type. For new records, hidden advanced fields use safe defaults; when editing, hiding advanced fields preserves the stored settings. Irrelevant conditional fields must not add stale overrides to requests. Recovery secrets are revealed only in the protected recovery view, never copied into the guide's state.
+
+CLI maps `GROUP ACTION --hyphenated-key VALUE` to underscore keys in params; supports arrays through repeated source/include/exclude/close-on options and explicit JSON request input. `--json` emits machine output; errors preserve nonzero exit. Passwords/secrets prompt securely or come from stdin JSON, not secret CLI values.

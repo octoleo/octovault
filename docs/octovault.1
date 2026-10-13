@@ -1,4 +1,4 @@
-.TH OCTOVAULT 1 "October 2026" "OctoVault 1.0.0" "User Commands"
+.TH OCTOVAULT 1 "October 2026" "OctoVault 1.1.0" "User Commands"
 .SH NAME
 octovault \- manage encrypted local vaults and independent backups
 .SH SYNOPSIS
@@ -48,6 +48,16 @@ Use --id to select an existing record. Option names use hyphens. Repeat
 --source, --exclude, --include, or --close-on to supply multiple array entries.
 Boolean options accept true or false, a bare flag, or a --no-flag form.
 --size-gb is capacity in decimal gigabytes.
+.PP
+For vault create, --directory selects the folder holding the new container;
+--name determines its filename. Advanced callers may supply --file instead.
+A new encrypted key is generated and kept in the account's private managed key
+directory unless --use-existing-key selects an existing --key-file.
+For a new image key, --image-source supplies a cover image whose original is
+preserved. Text keys are generated automatically. --auth gpg supports software
+OpenPGP keys and compatible tokens; a new key requires --recipient.
+The unlock folder is managed automatically. Key paths are remembered;
+vault passphrases are never saved.
 .PP
 Secret options such as --password, --old-password, --secret-key,
 --ssh-private-key, and --ssh-passphrase take no argument and prompt on the

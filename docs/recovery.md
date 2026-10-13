@@ -6,6 +6,8 @@ Save each repository's recovery information outside this computer. Preserve the 
 
 Keep an independently stored copy of a vault's key or supported key carrier and its passphrase. For hardware-token authentication, keep your own tested OpenPGP recovery arrangement. OctoVault cannot recreate a lost private key, hardware token, or passphrase. Do not put the only vault key inside the vault that it opens.
 
+Keys generated during creation are stored under your private `~/.local/share/octovault/keys/` directory; the vault record remembers the exact path. Use **Export key** to save a recovery copy independently of this computer. For an image key, preserve the generated carrier, not just the original cover image. For a text key, preserve the generated text and its word map. The application never saves your vault-key passphrase. Remembering that passphrase is sufficient for everyday unlocking while the key remains available, but cannot replace a lost key during recovery. A software OpenPGP private key is supported as well as a compatible hardware token.
+
 Text key carriers also require the exact word map used to create them. OctoVault includes its original 66-word map at `/usr/share/octovault/cloak-ciphers/words`; preserve a copy with your recovery materials, especially when using a custom map. This stable data file only translates the already encrypted key into words. The distribution's Tomb helpers perform the conversion, and the key still requires its passphrase.
 
 ## Restore on another computer

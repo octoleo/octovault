@@ -239,6 +239,7 @@ test_guided_creation() (
     }
     ov_vault_tomb() {
         [[ $1 == forge && $2 == -k ]] || return 1
+        [[ ! -e $3 ]] || return 1
         printf 'forge\n' >> "$WORK/guided-forges"
         printf 'encrypted-key-fixture\n' > "$3"
     }
@@ -247,7 +248,7 @@ test_guided_creation() (
         printf '%s\n' "$1" > "$WORK/guided-lock-record"
     }
     ov_vault_image_embed() {
-        [[ $1 == "$OV_VAULT_TEMP_DIR/created.key" ]] || return 1
+        [[ $1 == "$OV_VAULT_TEMP_DIR/created-"*.key ]] || return 1
         cat -- "$2" > "$3"
         printf 'encrypted-embedded-key\n' >> "$3"
     }
