@@ -18,7 +18,7 @@
   <provides><binary>octovault</binary><binary>octovault-gtk</binary></provides>
   <content_rating type="oars-1.1"/>
   <releases>
-    <release version="1.0.1" date="2026-10-13"><description><p>Simpler vault creation with folder selection, automatic key generation, existing-key reuse, and clearer guidance for image, text, and OpenPGP protection.</p></description></release>
+    <release version="1.1.0" date="2026-10-13"><description><p>Guided vault and backup setup with sensible defaults, multiple file and folder selection, automatic key management, and optional advanced controls.</p></description></release>
     <release version="1.0.0" date="2026-10-13"><description><p>Initial release of vault management, independent encrypted backups, native GNOME controls, and command-line access.</p></description></release>
   </releases>
 </component>

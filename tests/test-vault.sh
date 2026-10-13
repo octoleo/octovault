@@ -11,7 +11,7 @@ source "$PROJECT/lib/octovault/common.sh"
 source "$PROJECT/lib/octovault/vault.sh"
 WORK=$(mktemp -d)
 cleanup() {
-    local status=$? mountpoint loop mapper device
+    local status=$? mountpoint loop mapper device container
     set +e
     if [[ ${INTEGRATION_RUNNING:-false} == true ]]; then
         # Only tear down mounts/devices backed by this test's temporary file.
@@ -30,10 +30,15 @@ cleanup() {
                 cryptsetup close "$mapper"
             done
             losetup --detach "$loop"
-        done < <(losetup --noheadings --output NAME --associated "$OV_HOME/ci.tomb" 2>/dev/null)
+        done < <(for container in "$OV_HOME/"*.tomb; do
+            [[ ! -f $container ]] || losetup --noheadings --output NAME --associated "$container" 2>/dev/null
+        done)
     fi
     ov_secret_close; ov_resource_unlock; ov_vault_cleanup
-    if [[ -n ${INTEGRATION_USER:-} ]]; then userdel "$INTEGRATION_USER" 2>/dev/null || true; fi
+    if [[ -n ${INTEGRATION_USER:-} ]]; then
+        ov_as_user gpgconf --kill all 2>/dev/null || true
+        userdel "$INTEGRATION_USER" 2>/dev/null || true
+    fi
     if ! findmnt -rn -o TARGET | awk -v root="$WORK/" 'index($0,root)==1 {found=1} END {exit !found}'; then
         rm -rf -- "$WORK"
     fi
@@ -162,6 +167,9 @@ test_unknown_state() (
     assert_fails ov_vault_close_record "$record"
     losetup() { return 0; }
     ov_vault_require_closed "$record"
+    touch "$OV_HOME/incomplete.tomb"
+    record=$(jq -n --arg file "$OV_HOME/incomplete.tomb" '{file:$file,mountpoint:"/mount",creation_state:"initializing"}')
+    assert_equal "$(ov_vault_status "$record" | jq -r .status)" incomplete
     printf 'ok - unknown kernel state fails closed\n'
 )
 
@@ -214,6 +222,126 @@ test_container_pin() (
     printf 'ok - container access pins validated regular inodes and rejects pathname swaps\n'
 )
 
+test_guided_creation() (
+    OV_HOME="$WORK/guided-home"; OV_ROOT="$WORK/guided-state"; OV_OP=vault.create
+    mkdir -p "$OV_HOME" "$OV_ROOT" "$WORK/guided-temp"
+    OV_VAULT_TEMP_DIR="$WORK/guided-temp"
+    ov_resource_lock() { printf '%s\n' "$1" > "$WORK/guided-locked-path"; }
+    ov_vault_status() { printf '%s\n' "$1"; }
+    ov_vault_temporary() { :; }
+    ov_vault_unpin() { :; }
+    tomb() {
+        [[ $1 == --no-color && $2 == dig ]] || { printf 'Unexpected tomb call\n' >&2; return 1; }
+        printf 'allocation\n' >> "$WORK/guided-allocations"
+        local target
+        for target; do :; done
+        : > "$target"
+    }
+    ov_vault_tomb() {
+        [[ $1 == forge && $2 == -k ]] || return 1
+        printf 'forge\n' >> "$WORK/guided-forges"
+        printf 'encrypted-key-fixture\n' > "$3"
+    }
+    ov_vault_tomb_keyed() {
+        [[ $2 == lock ]] || return 1
+        printf '%s\n' "$1" > "$WORK/guided-lock-record"
+    }
+    ov_vault_image_embed() {
+        [[ $1 == "$OV_VAULT_TEMP_DIR/created.key" ]] || return 1
+        cat -- "$2" > "$3"
+        printf 'encrypted-embedded-key\n' >> "$3"
+    }
+    OV_PARAMS=$(jq -n --arg directory "$OV_HOME" \
+        '{name:"Personal files",directory:$directory,size_gb:"0.05",password:"guided-test-not-for-storage"}')
+    ov_vault_dispatch > "$WORK/guided-response"
+    local record key id original_key count cover="$OV_HOME/cover.bmp" image_hash
+    record=$(jq .data "$WORK/guided-response"); key=$(jq -r .key_file <<< "$record"); id=$(jq -r .id <<< "$record")
+    original_key=$key
+    assert_equal "$(jq -r .file <<< "$record")" "$OV_HOME/Personal files.tomb"
+    assert_equal "$(cat "$WORK/guided-locked-path")" "$OV_HOME/Personal files.tomb"
+    assert_equal "$key" "$OV_HOME/.local/share/octovault/keys/$id/vault.key"
+    assert_equal "$(jq -r '.key_managed,.key_reused,.creation_state' <<< "$record")" $'true\nfalse\nready'
+    assert_equal "$(stat -c %a -- "$key")" 600
+    assert_equal "$(stat -c %a -- "$(dirname "$key")")" 700
+    assert_equal "$(stat -c %a -- "$OV_HOME/.local/share/octovault/keys")" 700
+    [[ $(cat "$OV_ROOT/vaults/$id.json") != *guided-test-not-for-storage* ]]
+    [[ $(cat "$key") != *guided-test-not-for-storage* ]]
+    count=$(wc -l < "$WORK/guided-forges")
+    OV_PARAMS=$(jq -n --arg directory "$OV_HOME" --arg key "$key" \
+        '{name:"Second.tomb",directory:$directory,size_gb:"0.05",password:"guided-test-not-for-storage",use_existing_key:true,key_file:$key}')
+    ov_vault_dispatch > "$WORK/guided-response"
+    record=$(jq .data "$WORK/guided-response")
+    assert_equal "$(jq -r .file <<< "$record")" "$OV_HOME/Second.tomb"
+    assert_equal "$(jq -r '.key_managed,.key_reused,.key_file' <<< "$record")" "$(printf 'false\ntrue\n%s' "$key")"
+    assert_equal "$(wc -l < "$WORK/guided-forges")" "$count"
+    assert_equal "$(cat "$key")" encrypted-key-fixture
+
+    printf 'BMcover-image-original\n' > "$cover"; image_hash=$(sha256sum "$cover")
+    OV_PARAMS=$(jq -n --arg directory "$OV_HOME" --arg image "$cover" \
+        '{name:"Picture",directory:$directory,size_gb:"0.05",auth:"image",image_source:$image,password:"guided-test-not-for-storage"}')
+    ov_vault_dispatch > "$WORK/guided-response"
+    record=$(jq .data "$WORK/guided-response"); key=$(jq -r .key_file <<< "$record")
+    [[ $key == "$OV_HOME/.local/share/octovault/keys/"*/carrier.bmp && $key != "$cover" ]]
+    assert_equal "$(sha256sum "$cover")" "$image_hash"
+    assert_equal "$(stat -c %a "$key")" 600
+    [[ ! -e $(dirname "$key")/recovery.key ]]
+
+    # Older command lines used key_file for a cover. They now create a separate
+    # managed carrier instead of overwriting the original photograph.
+    OV_PARAMS=$(jq -n --arg directory "$OV_HOME" --arg image "$cover" \
+        '{name:"Legacy picture",directory:$directory,size_gb:"0.05",auth:"image",key_file:$image,password:"guided-test-not-for-storage"}')
+    ov_vault_dispatch > "$WORK/guided-response"
+    assert_equal "$(sha256sum "$cover")" "$image_hash"
+    [[ $(jq -r .data.key_file "$WORK/guided-response") != "$cover" ]]
+
+    # A reused carrier reaches the engine as a carrier, never a newly forged key.
+    count=$(wc -l < "$WORK/guided-forges")
+    OV_PARAMS=$(jq -n --arg directory "$OV_HOME" --arg key "$key" \
+        '{name:"Reused picture",directory:$directory,size_gb:"0.05",auth:"image",key_file:$key,use_existing_key:true,password:"guided-test-not-for-storage"}')
+    ov_vault_dispatch > "$WORK/guided-response"
+    assert_equal "$(jq -r .auth "$WORK/guided-lock-record")" image
+    assert_equal "$(wc -l < "$WORK/guided-forges")" "$count"
+
+    # GnuPG identifies the recipient from an existing protected key itself.
+    OV_PARAMS=$(jq -n --arg directory "$OV_HOME" --arg key "$original_key" \
+        '{name:"Existing OpenPGP",directory:$directory,size_gb:"0.05",auth:"gpg",key_file:$key,use_existing_key:true}')
+    ov_vault_dispatch > "$WORK/guided-response"
+    assert_equal "$(jq -r .auth "$WORK/guided-lock-record")" gpg
+    assert_equal "$(wc -l < "$WORK/guided-forges")" "$count"
+
+    # Carrier failure keeps a usable ordinary encrypted key and a manual record.
+    ov_vault_image_embed() { return 1; }
+    OV_PARAMS=$(jq -n --arg directory "$OV_HOME" --arg image "$cover" \
+        '{name:"Carrier failure",directory:$directory,size_gb:"0.05",auth:"image",image_source:$image,password:"guided-test-not-for-storage"}')
+    assert_fails ov_vault_dispatch
+    record=$(ov_list vaults | jq -c '.[]|select(.name=="Carrier failure")')
+    key=$(jq -r .key_file <<< "$record")
+    assert_equal "$(jq -r '.auth,.open_on,.creation_state,.key_managed' <<< "$record")" $'key\nmanual\nready\ntrue'
+    [[ -f $key && $key == */recovery.key ]]
+    assert_equal "$(cat "$key")" encrypted-key-fixture
+    assert_equal "$(sha256sum "$cover")" "$image_hash"
+
+    # Invalid choices fail before allocating a container.
+    count=$(wc -l < "$WORK/guided-allocations")
+    local params
+    for params in \
+        '{"name":"../escape"}' '{"name":"."}' '{"name":".."}' \
+        '{"name":"bad\nname"}' '{"name":"Conflicting paths","file":"/another.tomb"}' \
+        '{"name":"Missing key","use_existing_key":true}' \
+        '{"name":"Not a boolean","use_existing_key":"true"}' \
+        '{"name":"Missing picture","auth":"image"}' \
+        '{"name":"Missing recipient","auth":"gpg"}'; do
+        OV_PARAMS=$(jq --arg directory "$OV_HOME" \
+            '.+{directory:$directory,size_gb:"0.05",password:"guided-test-not-for-storage"}' <<< "$params")
+        assert_fails ov_vault_dispatch
+    done
+    OV_PARAMS=$(jq -n --arg directory "$OV_HOME" --arg key "$original_key" \
+        '{name:"Existing without checkbox",directory:$directory,size_gb:"0.05",key_file:$key,password:"guided-test-not-for-storage"}')
+    assert_fails ov_vault_dispatch
+    assert_equal "$(wc -l < "$WORK/guided-allocations")" "$count"
+    printf 'ok - guided folder creation, managed permissions, existing keys, cover preservation, recoverable carrier failures and pre-allocation validation\n'
+)
+
 integration() {
     [[ $EUID == 0 ]] || { printf 'Integration requires root.\n' >&2; exit 1; }
     for program in tomb cryptsetup losetup pinentry-octovault rsync; do command -v "$program" >/dev/null; done
@@ -225,14 +353,18 @@ integration() {
     OV_USER=$INTEGRATION_USER; OV_UID=$(id -u "$OV_USER")
     chown "$OV_UID:$(id -g "$OV_USER")" "$OV_HOME"
     chmod 0700 "$OV_HOME"
-    local response id file="$OV_HOME/ci.tomb" key="$OV_HOME/ci.key" source="$OV_HOME/Documents"
-    OV_PARAMS=$(jq -n --arg file "$file" --arg key "$key" '{name:"CI vault",file:$file,key_file:$key,size_gb:"0.05",auth:"key",password:"OctoVault-CI-only-passphrase",open_on:"manual"}')
+    local response id file="$OV_HOME/ci.tomb" key source="$OV_HOME/Documents"
+    OV_PARAMS=$(jq -n --arg directory "$OV_HOME" '{name:"ci",directory:$directory,size_gb:"0.05",auth:"key",password:"OctoVault-CI-only-passphrase",open_on:"manual"}')
     OV_OP=vault.create
     ov_vault_dispatch > "$WORK/response.json" || { cat "$WORK/response.json" >&2; return 1; }
     response=$(cat "$WORK/response.json"); id=$(jq -er .data.id <<< "$response")
     ov_load vaults "$id"
+    key=$(ov_vault_field "$OV_RECORD" key_file)
+    assert_equal "$key" "$OV_HOME/.local/share/octovault/keys/$id/vault.key"
     assert_equal "$(stat -c %u "$file")" "$OV_UID"
     assert_equal "$(stat -c %u "$key")" "$OV_UID"
+    assert_equal "$(stat -c %a "$key")" 600
+    assert_equal "$(stat -c %a "$(dirname "$key")")" 700
     OV_PARAMS=$(jq -n --arg id "$id" '{id:$id,password:"OctoVault-CI-only-passphrase"}')
     OV_OP=vault.open; ov_vault_dispatch >/dev/null
     ov_as_user mkdir "$source"
@@ -304,8 +436,77 @@ integration() {
     OV_OP=vault.open; ov_vault_dispatch >/dev/null
     OV_OP=vault.close; ov_vault_dispatch >/dev/null
     printf 'ok - real LUKS key replacement from image authentication and reopen\n' 
+
+    # New containers can reuse a user's existing protected key without forging
+    # or modifying it. The passphrase is only supplied for this operation.
+    local reused_id existing_hash
+    existing_hash=$(sha256sum "$replacement")
+    ov_resource_unlock
+    OV_PARAMS=$(jq -n --arg directory "$OV_HOME" --arg key "$replacement" \
+        '{name:"reuse.tomb",directory:$directory,key_file:$key,use_existing_key:true,size_gb:"0.05",password:"OctoVault-replacement-75%-pass",open_on:"manual"}')
+    OV_OP=vault.create; ov_vault_dispatch > "$WORK/response.json"
+    reused_id=$(jq -er .data.id "$WORK/response.json")
+    assert_equal "$(jq -r .data.file "$WORK/response.json")" "$OV_HOME/reuse.tomb"
+    assert_equal "$(sha256sum "$replacement")" "$existing_hash"
+    OV_PARAMS=$(jq -n --arg id "$reused_id" '{id:$id,password:"OctoVault-replacement-75%-pass"}')
+    OV_OP=vault.open; ov_vault_dispatch >/dev/null
+    OV_OP=vault.close; ov_vault_dispatch >/dev/null
+    printf 'ok - real existing-key reuse creates another container without modifying the key\n'
+
+    local auth carrier_id carrier_key cover="$OV_HOME/guided-cover.bmp" cover_hash
+    ov_as_user "$WORK/cover-generator" --make-cover "$cover"; cover_hash=$(sha256sum "$cover")
+    for auth in text image; do
+        ov_resource_unlock
+        OV_PARAMS=$(jq -n --arg directory "$OV_HOME" --arg auth "$auth" --arg cover "$cover" \
+            '{name:("guided-"+$auth),directory:$directory,auth:$auth,size_gb:"0.05",password:"OctoVault-carrier-create-50%-pass",open_on:"manual"} |
+             if $auth=="image" then .image_source=$cover else . end')
+        OV_OP=vault.create; ov_vault_dispatch > "$WORK/response.json"
+        carrier_id=$(jq -er .data.id "$WORK/response.json"); carrier_key=$(jq -er .data.key_file "$WORK/response.json")
+        [[ $carrier_key == "$OV_HOME/.local/share/octovault/keys/$carrier_id/"* && $carrier_key != "$cover" ]]
+        assert_equal "$(stat -c %u "$carrier_key")" "$OV_UID"
+        assert_equal "$(stat -c %a "$carrier_key")" 600
+        assert_equal "$(stat -c %a "$(dirname "$carrier_key")")" 700
+        [[ ! -e $(dirname "$carrier_key")/recovery.key ]]
+        OV_PARAMS=$(jq -n --arg id "$carrier_id" '{id:$id,password:"OctoVault-carrier-create-50%-pass"}')
+        OV_OP=vault.open; ov_vault_dispatch >/dev/null
+        OV_OP=vault.close; ov_vault_dispatch >/dev/null
+        assert_equal "$(sha256sum "$cover")" "$cover_hash"
+    done
+    printf 'ok - real managed image/text creation and unlock, private carrier permissions and original cover preservation\n'
+
+    # The disposable user's software OpenPGP key exercises the same public-key
+    # mode as a compatible hardware token without requiring physical hardware.
+    local recipient pgp_id pgp_key
+    ov_as_user gpg --batch --pinentry-mode loopback --passphrase '' --quick-generate-key \
+        'OctoVault disposable CI <octovault-ci@example.invalid>' default default 1d >&2
+    recipient=$(ov_as_user gpg --batch --with-colons --list-keys 'octovault-ci@example.invalid' |
+        awk -F: '$1=="fpr"{print $10;exit}')
+    [[ -n $recipient ]]
+    ov_resource_unlock
+    OV_PARAMS=$(jq -n --arg directory "$OV_HOME" --arg recipient "$recipient" \
+        '{name:"software-openpgp",directory:$directory,auth:"gpg",recipient:$recipient,size_gb:"0.05",open_on:"manual"}')
+    OV_OP=vault.create; ov_vault_dispatch > "$WORK/response.json"
+    pgp_id=$(jq -er .data.id "$WORK/response.json"); pgp_key=$(jq -er .data.key_file "$WORK/response.json")
+    assert_equal "$(stat -c %a "$pgp_key")" 600
+    OV_PARAMS=$(jq -n --arg id "$pgp_id" '{id:$id}')
+    OV_OP=vault.open; ov_vault_dispatch >/dev/null
+    OV_OP=vault.close; ov_vault_dispatch >/dev/null
+    existing_hash=$(sha256sum "$pgp_key")
+    ov_resource_unlock
+    OV_PARAMS=$(jq -n --arg directory "$OV_HOME" --arg key "$pgp_key" \
+        '{name:"reuse-openpgp",directory:$directory,auth:"gpg",key_file:$key,use_existing_key:true,size_gb:"0.05",open_on:"manual"}')
+    OV_OP=vault.create; ov_vault_dispatch > "$WORK/response.json"
+    pgp_id=$(jq -er .data.id "$WORK/response.json")
+    OV_PARAMS=$(jq -n --arg id "$pgp_id" '{id:$id}')
+    OV_OP=vault.open; ov_vault_dispatch >/dev/null
+    OV_OP=vault.close; ov_vault_dispatch >/dev/null
+    assert_equal "$(sha256sum "$pgp_key")" "$existing_hash"
+    if grep -Rq -E 'OctoVault-(CI-only|rotated|replacement|carrier-create)' "$OV_ROOT"; then
+        printf 'A fixture passphrase was persisted in vault state.\n' >&2; return 1
+    fi
+    printf 'ok - real software OpenPGP generation and existing-key reuse without a supplied recipient; no stored passphrases\n'
 }
 
 if [[ ${1:-} == --integration ]]; then integration
-else test_validation; test_native_binds; test_compare; test_migration; test_interrupted_migration; test_device_identity; test_unknown_state; test_secret_arguments; test_container_pin
+else test_validation; test_native_binds; test_compare; test_migration; test_interrupted_migration; test_device_identity; test_unknown_state; test_secret_arguments; test_container_pin; test_guided_creation
 fi
