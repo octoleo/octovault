@@ -32,7 +32,7 @@ jobs:
       - name: Install build and integration-test dependencies
         run: |
           apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends ca-certificates git build-essential debhelper pkg-config libgtk-4-dev libadwaita-1-dev libjson-glib-dev libglib2.0-dev desktop-file-utils libxml2-utils appstream jq rsync restic tomb cryptsetup-bin systemd systemd-sysv curl openssh-client gnupg pinentry-gnome3 steghide qrencode lsof polkitd dbus dbus-daemon xvfb xauth adwaita-icon-theme shellcheck
+          DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends ca-certificates git build-essential debhelper pkg-config libgtk-4-dev libadwaita-1-dev libjson-glib-dev libglib2.0-dev desktop-file-utils libxml2-utils appstream apt-utils jq rsync restic tomb cryptsetup-bin systemd systemd-sysv curl openssh-client gnupg pinentry-gnome3 steghide qrencode lsof polkitd dbus dbus-daemon xvfb xauth adwaita-icon-theme shellcheck
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
@@ -100,9 +100,41 @@ jobs:
             --env CI=true --env OCTOVAULT_DISPOSABLE_TEST=1 \
             ubuntu:26.04 bash scripts/test-vault-container.sh
 
+  distribution:
+    name: Verify GitHub release and APT repository
+    needs: package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Install publication and repository tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends jq libxml2-utils apt-utils gnupg appstream
+      - name: Exercise release retries and signing without production credentials
+        run: |
+          bash tests/test-release.sh
+          bash tests/test-publication-config.sh
+          bash tests/test-apt-repository.sh
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: octovault-ubuntu-*-amd64
+          path: packages
+          merge-multiple: true
+      - name: Build inspectable APT repository from the real Debian package
+        run: bash scripts/apt-repository.sh --input packages --output apt-test
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: octovault-apt-repository-test
+          path: apt-test/
+          if-no-files-found: error
+          retention-days: 30
+
   release:
-    name: Publish reviewed version
-    needs: [package, vault-integration]
+    name: Publish versioned Debian packages on GitHub
+    needs: [package, vault-integration, distribution]
     if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish))
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -111,6 +143,9 @@ jobs:
     concurrency:
       group: octovault-release
       cancel-in-progress: false
+    outputs:
+      tag: ${{ steps.publish.outputs.tag }}
+      available: ${{ steps.publish.outputs.available }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -125,7 +160,119 @@ jobs:
           path: release
           merge-multiple: true
       - name: Publish complete verified assets
+        id: publish
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: bash scripts/publish-release.sh "$GITHUB_SHA" release
+
+  apt-configuration:
+    name: Check optional APT publication configuration
+    needs: release
+    if: needs.release.outputs.available == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      configured: ${{ steps.configuration.outputs.configured }}
+    steps:
+      # Evaluate presence without exposing values or entering the Pages
+      # deployment environment when optional credentials are absent.
+      - name: Check signing credentials and repository settings
+        id: configuration
+        env:
+          APT_SIGNING_KEY: ${{ secrets.APT_SIGNING_KEY }}
+          APT_SIGNING_KEY_FINGERPRINT: ${{ vars.APT_SIGNING_KEY_FINGERPRINT }}
+          APT_REPOSITORY_URL: ${{ vars.APT_REPOSITORY_URL }}
+        run: |
+          if test -n "$APT_SIGNING_KEY" && test -n "$APT_SIGNING_KEY_FINGERPRINT" && test -n "$APT_REPOSITORY_URL"; then
+            echo 'configured=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'configured=false' >> "$GITHUB_OUTPUT"
+            echo 'Signed APT rollout skipped: configure APT_SIGNING_KEY, APT_SIGNING_KEY_FINGERPRINT and APT_REPOSITORY_URL to enable it.' >> "$GITHUB_STEP_SUMMARY"
+            echo 'The versioned GitHub packages are already published and remain available.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  apt-publish:
+    name: Publish signed APT updates (optional)
+    needs: [release, apt-configuration]
+    if: needs.release.outputs.available == 'true' && needs.apt-configuration.outputs.configured == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    concurrency:
+      group: octovault-apt-publication
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Check that this is still the current main release
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.release.outputs.tag }}
+        run: |
+          main_sha=$(gh api "repos/$GH_REPO/git/ref/heads/main" --jq '.object.sha')
+          if test "$GITHUB_SHA" != "$main_sha"; then
+            echo 'APT rollout skipped: a newer main commit is available.'
+            echo 'current=false' >> "$GITHUB_OUTPUT"
+          else
+            test "$RELEASE_TAG" = "v$(cat VERSION)"
+            echo 'current=true' >> "$GITHUB_OUTPUT"
+          fi
+      - name: Install signing and catalogue tools
+        if: steps.gate.outputs.current == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends apt-utils gnupg appstream jq libxml2-utils
+      - name: Download published packages and verify checksums
+        if: steps.gate.outputs.current == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.release.outputs.tag }}
+        run: |
+          mkdir packages
+          gh release download "$RELEASE_TAG" --dir packages --pattern '*.deb' --pattern 'SHA256SUMS-ubuntu*'
+          (cd packages && sha256sum --check SHA256SUMS-ubuntu*)
+      - name: Build and verify signed update repository
+        if: steps.gate.outputs.current == 'true'
+        env:
+          APT_SIGNING_KEY: ${{ secrets.APT_SIGNING_KEY }}
+          APT_SIGNING_PASSPHRASE: ${{ secrets.APT_SIGNING_PASSPHRASE }}
+          APT_SIGNING_KEY_FINGERPRINT: ${{ vars.APT_SIGNING_KEY_FINGERPRINT }}
+          APT_REPOSITORY_URL: ${{ vars.APT_REPOSITORY_URL }}
+        run: |
+          bash scripts/apt-repository.sh --input packages --output apt-public
+          test -f apt-public/dists/resolute/InRelease
+          test -f apt-public/dists/resolute/Release.gpg
+          test ! -e apt-public/UNSIGNED-TEST-ONLY
+      - uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b # v4
+        if: steps.gate.outputs.current == 'true'
+        with:
+          path: apt-public
+      - name: Recheck current release before deployment
+        id: deploy-gate
+        if: steps.gate.outputs.current == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          main_sha=$(gh api "repos/$GH_REPO/git/ref/heads/main" --jq '.object.sha')
+          if test "$GITHUB_SHA" = "$main_sha"; then
+            echo 'current=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'APT rollout skipped: main changed while the repository was being built.'
+            echo 'current=false' >> "$GITHUB_OUTPUT"
+          fi
+      - name: Publish authenticated APT repository
+        id: deployment
+        if: steps.deploy-gate.outputs.current == 'true'
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4
