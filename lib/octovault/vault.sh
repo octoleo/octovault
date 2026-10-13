@@ -229,6 +229,41 @@ ov_vault_mib() {
         ov_fail invalid_size "The requested size is outside the supported range."
 }
 
+# The desktop selects a directory, while scripts may still supply the complete
+# container filename. Normalize once before acquiring the container lock.
+ov_vault_create_path() {
+    local name directory file
+    name=$(ov_require name)
+    [[ ${#name} -le 200 && $name != . && $name != .. && $name != */* && ! $name =~ [[:cntrl:]] ]] ||
+        ov_fail invalid_name "Use a vault name without slashes or control characters."
+    directory=$(ov_param directory); file=$(ov_param file)
+    [[ -z $directory || -z $file ]] || ov_fail invalid_path "Choose a storage folder or a complete container filename, not both."
+    if [[ -n $directory ]]; then
+        directory=$(ov_vault_user_path "$directory")
+        [[ -d $directory ]] || ov_fail invalid_path "Select an existing folder in which to store the vault."
+        ov_as_user test -w "$directory" || ov_fail permission_denied "The storage folder is not writable by your account."
+        if [[ $name == *.tomb ]]; then file="$directory/$name"; else file="$directory/$name.tomb"; fi
+    else
+        [[ -n $file ]] || ov_fail invalid_request "Choose the folder in which to store the vault."
+    fi
+    file=$(ov_vault_user_path "$file")
+    OV_PARAMS=$(jq --arg file "$file" '.file=$file' <<< "$OV_PARAMS")
+}
+
+ov_vault_managed_key_directory() {
+    local id=$1 directory="$OV_HOME/.local/share/octovault/keys" path
+    ov_id "$id"
+    # Everything is created and permissioned under the user's identity. No
+    # privileged writer follows a user-controlled key-directory symlink.
+    for path in "$directory" "$directory/$id"; do
+        [[ ! -L $path ]] || ov_fail unsafe_path "The managed key folder cannot be a symbolic link."
+        ov_as_user mkdir -p -m 0700 -- "$path" || ov_fail permission_denied "Could not create the private key folder."
+        [[ -d $path && $(stat -c %u -- "$path") == "$OV_UID" ]] || ov_fail unsafe_path "The private key folder must belong to your account."
+        ov_as_user chmod 0700 -- "$path" || ov_fail permission_denied "Could not secure the private key folder."
+    done
+    printf '%s\n' "$directory/$id"
+}
+
 # A loop association is intentionally conservative: even a partially mounted
 # container must not be backed up as a stable closed file.
 ov_vault_attached() {
@@ -311,7 +346,11 @@ ov_vault_status() {
         ov_vault_attached "$record" || state=$?
         case $state in
             0) status=attention ;;
-            1) [[ -f $(ov_vault_field "$record" file) ]] || status=missing ;;
+            1)
+                if [[ ! -f $(ov_vault_field "$record" file) ]]; then status=missing
+                elif [[ $(ov_vault_field "$record" creation_state) == initializing ]]; then status=incomplete
+                fi
+                ;;
             *) status=unknown ;;
         esac
     fi
@@ -325,10 +364,9 @@ ov_vault_validate_record() {
       (.auth|IN("key","gpg","image","text")) and
       (.open_on|IN("manual","login","drive","token")) and
       (.close_on|type=="array" and all(.[];IN("screen-lock","logout","sleep","shutdown"))) and
-      (.force_close|type=="boolean") and ((.trust_native_hooks//false)|type=="boolean") and (.hooks|type=="object")' <<< "$record" >/dev/null ||
+      (.force_close|type=="boolean") and ((.trust_native_hooks//false)|type=="boolean") and
+      ((.recipient//"")|type=="string") and (.hooks|type=="object")' <<< "$record" >/dev/null ||
         ov_fail invalid_vault "The vault configuration is invalid."
-    [[ $(ov_vault_field "$record" auth) != gpg || -n $(ov_vault_field "$record" recipient) ]] ||
-        ov_fail invalid_auth "An OpenPGP recipient is required."
     [[ $(ov_vault_field "$record" auth) != text || -n $(ov_vault_field "$record" cipher_file) ]] ||
         ov_fail invalid_auth "A text-cloaking cipher file is required."
     [[ $(ov_vault_field "$record" open_on) != drive || -n $(ov_vault_field "$record" drive_uuid) ]] ||
@@ -595,15 +633,12 @@ ov_vault_new_record() {
     local id=$1 file key mountpoint auth name
     name=$(ov_require name)
     file=$(ov_vault_user_path "$(ov_require file)")
-    key=$(ov_vault_user_path "$(ov_require key_file)")
+    key=$(ov_vault_user_path "${2:-$(ov_require key_file)}")
     auth=$(ov_param auth key)
     mountpoint=$(ov_param mountpoint "$OV_HOME/.local/share/octovault/mounts/$id")
     ov_vault_clean_path "$mountpoint" >/dev/null
-    ov_as_user mkdir -p -m 0700 -- "$mountpoint" || ov_fail permission_denied "Could not create the vault mountpoint."
-    mountpoint=$(ov_vault_user_path "$mountpoint")
     [[ $mountpoint != *' '* && $mountpoint != *';'* && $mountpoint != *'['* && $mountpoint != *']'* ]] ||
         ov_fail invalid_mount "Choose a mountpoint without spaces, semicolons or brackets; mapped user locations may contain spaces."
-    [[ -d $mountpoint && $(stat -c %u -- "$mountpoint") == "$OV_UID" ]] || ov_fail invalid_mount "The mountpoint must be a directory owned by your account."
     [[ $file != "$key" && $file != "$mountpoint" && $key != "$mountpoint" ]] || ov_fail invalid_path "Container, key and mountpoint must be separate paths."
     OV_RECORD=$(jq --arg id "$id" --arg name "$name" --arg file "$file" --arg key "$key" --arg mount "$mountpoint" \
         --arg auth "$auth" --arg time "$(ov_now)" \
@@ -612,57 +647,111 @@ ov_vault_new_record() {
         open_on:($p.open_on//"login"),drive_uuid:($p.drive_uuid//""),close_on:($p.close_on//["shutdown"]),
         force_close:($p.force_close//false),trust_native_hooks:($p.trust_native_hooks//false),hooks:($p.hooks//{}),created_at:$time,updated_at:$time}' <<< "$OV_PARAMS")
     ov_vault_validate_record "$OV_RECORD"
+    ov_as_user mkdir -p -m 0700 -- "$mountpoint" || ov_fail permission_denied "Could not create the vault mountpoint."
+    mountpoint=$(ov_vault_user_path "$mountpoint")
+    [[ -d $mountpoint && $(stat -c %u -- "$mountpoint") == "$OV_UID" ]] || ov_fail invalid_mount "The mountpoint must be a directory owned by your account."
+    [[ $file != "$mountpoint" && $key != "$mountpoint" ]] || ov_fail invalid_path "Container, key and mountpoint must be separate paths."
+    OV_RECORD=$(jq --arg mount "$mountpoint" '.mountpoint=$mount' <<< "$OV_RECORD")
 }
 
 ov_vault_create() {
-    local id record file key auth size tempkey rootkey
+    local id record file key auth size tempkey rootkey reuse image_source managed=false key_directory='' image_kind=''
+    local locking_record recovery_record cipher
     id=$(ov_new_id)
-    ov_vault_new_record "$id"
-    record=$(jq '.created_by_octovault=true' <<< "$OV_RECORD")
-    file=$(ov_vault_field "$record" file); key=$(ov_vault_field "$record" key_file)
-    auth=$(ov_vault_field "$record" auth); size=$(ov_vault_mib "$(ov_require size_gb)")
+    file=$(ov_require file); key=$(ov_param key_file); auth=$(ov_param auth key)
+    reuse=$(ov_param use_existing_key false); image_source=$(ov_param image_source)
+    jq -e '(.use_existing_key//false)|type=="boolean"' <<< "$OV_PARAMS" >/dev/null ||
+        ov_fail invalid_auth "The existing-key option must be true or false."
+    [[ $auth == key || $auth == gpg || $auth == image || $auth == text ]] || ov_fail invalid_auth "Choose a supported protection method."
+    size=$(ov_vault_mib "$(ov_require size_gb)")
     [[ ! -e $file && ! -L $file ]] || ov_fail exists "A file already exists at the selected container path."
-    [[ $auth == image || ! -e $key ]] || ov_fail exists "A key already exists at the selected path. Import it or choose a new key path."
     ov_vault_password
-    [[ $auth == gpg || -n $OV_VAULT_PASSWORD ]] || ov_fail password_required "Provide a passphrase for the new key."
+    [[ $auth == gpg || -n $OV_VAULT_PASSWORD ]] || ov_fail password_required "Enter the passphrase that protects this vault's key."
+    if [[ $reuse == true ]]; then
+        [[ -n $key ]] || ov_fail invalid_auth "Choose your existing encrypted key or carrier."
+        key=$(ov_vault_user_path "$key")
+        [[ -f $key ]] || ov_fail invalid_auth "The existing key or carrier must be a readable regular file."
+    else
+        [[ $auth != gpg || -n $(ov_param recipient) ]] || ov_fail invalid_auth "Choose the OpenPGP public key that will protect this vault."
+        if [[ $auth == image ]]; then
+            # Compatibility with the initial CLI: its key_file named the cover
+            # image. Keep accepting that input, but always preserve the cover.
+            if [[ -z $image_source && -n $key && -f $key ]]; then image_source=$key; key=''; fi
+            [[ -n $image_source ]] || ov_fail invalid_image "Choose a JPEG or BMP cover image for the new key carrier."
+            image_source=$(ov_vault_user_path "$image_source")
+            [[ -f $image_source ]] || ov_fail invalid_image "The cover image must be a readable regular file."
+            image_kind=$(ov_as_user od -An -tx1 -N2 -- "$image_source" | tr -d ' \n')
+            [[ $image_kind == ffd8 || $image_kind == 424d ]] || ov_fail invalid_image "Choose a JPEG or BMP image; other image formats are not supported."
+        fi
+        if [[ -n $key ]]; then
+            key=$(ov_vault_user_path "$key")
+            [[ ! -e $key && ! -L $key ]] || ov_fail exists "The key destination already exists. Select the existing-key option to reuse a key."
+        fi
+    fi
     if [[ $auth == text ]]; then
         if [[ ! -x /usr/libexec/tomb/cloakify || ! -x /usr/libexec/tomb/decloakify ]]; then
             ov_fail missing_dependency "The encryption engine text-cloaking helpers are missing. Reinstall the required dependency."
         fi
-        ov_as_user test -r "$(ov_vault_field "$record" cipher_file)" || ov_fail not_found "The cloak cipher file is unavailable."
+        cipher=$(ov_param cipher_file)
+        ov_as_user test -r "${cipher:-/usr/share/octovault/cloak-ciphers/words}" || ov_fail not_found "The cloak cipher file is unavailable."
     fi
+    if [[ -z $key ]]; then
+        key_directory=$(ov_vault_managed_key_directory "$id"); managed=true
+        case $auth in
+            image) if [[ $image_kind == 424d ]]; then key="$key_directory/carrier.bmp"; else key="$key_directory/carrier.jpg"; fi ;;
+            text) key="$key_directory/vault.txt" ;;
+            *) key="$key_directory/vault.key" ;;
+        esac
+    fi
+    ov_vault_new_record "$id" "$key"
+    record=$(jq --argjson managed "$managed" --argjson reused "$reuse" \
+        '.created_by_octovault=true | .key_managed=$managed | .key_reused=$reused | .creation_state="ready"' <<< "$OV_RECORD")
+    tempkey=$key
+    if [[ $reuse != true && ( $auth == image || $auth == text ) ]]; then
+        [[ -n $key_directory ]] || key_directory=$(ov_vault_managed_key_directory "$id")
+        tempkey="$key_directory/recovery.key"
+    fi
+
     ov_progress create "Allocating the encrypted container" 5
     ov_as_user tomb --no-color dig -s "$size" "$file" >&2 || ov_fail create_failed "The vault container could not be allocated."
-    tempkey=$key
-    if [[ $auth == image || $auth == text ]]; then
-        tempkey="$file.octovault-key-$(ov_new_id)"
-    fi
-    ov_progress key "Creating the encryption key" 40
-    if [[ $auth == gpg ]]; then
+    ov_progress key "Preparing the protected encryption key" 40
+    if [[ $reuse == true ]]; then
+        locking_record=$record
+    elif [[ $auth == gpg ]]; then
         ov_as_user tomb --no-color forge -g -r "$(ov_vault_field "$record" recipient)" -k "$tempkey" >&2 ||
             ov_fail key_failed "The OpenPGP-protected key could not be created. The uninitialized container was retained."
+        ov_as_user chmod 0600 -- "$tempkey" || ov_fail permission_denied "Could not secure the encrypted key."
     else
         ov_vault_temporary; rootkey="$OV_VAULT_TEMP_DIR/created.key"
         ov_vault_tomb forge -k "$rootkey" || ov_fail key_failed "Key generation failed. The uninitialized container was retained."
         ov_vault_publish "$rootkey" "$tempkey" || ov_fail key_failed "The encrypted recovery key could not be saved."
     fi
-    local locking_record
-    locking_record=$(jq --arg key "$tempkey" '.key_file=$key | if .auth=="image" or .auth=="text" then .auth="key" else . end' <<< "$record")
+    if [[ $reuse != true ]]; then
+        locking_record=$(jq --arg key "$tempkey" '.key_file=$key | if .auth=="image" or .auth=="text" then .auth="key" else . end' <<< "$record")
+    fi
+    # Once a persistent encrypted key exists, remember it even if initialization
+    # is interrupted. Incomplete records never trigger an automatic unlock.
+    recovery_record=$(jq '.creation_state="initializing" | .open_on="manual"' <<< "$locking_record")
+    if [[ $tempkey != "$key" ]]; then recovery_record=$(jq '.key_managed=true' <<< "$recovery_record"); fi
+    ov_save vaults "$id" "$recovery_record"
     ov_progress initialize "Initializing the vault filesystem" 65
-    ov_vault_tomb_keyed "$locking_record" lock "$file" || ov_fail initialize_failed "The vault could not be initialized; its container and key were retained."
+    ov_vault_tomb_keyed "$locking_record" lock "$file" || ov_fail initialize_failed "The vault could not be initialized; its container, encrypted key and recovery record were retained."
     ov_vault_unpin "$record" || ov_fail cleanup_failed "The new vault was initialized but its temporary container reference remains attached."
-    if [[ $auth == image ]]; then
-        [[ -f $key ]] || ov_fail invalid_image "Select an existing JPEG carrier image. The ordinary key was retained beside the container."
-        ov_vault_image_embed "$tempkey" "$key" "$OV_VAULT_TEMP_DIR/export.jpg" || ov_fail key_failed "Image key export failed; the ordinary encrypted key was retained."
-        ov_vault_publish "$OV_VAULT_TEMP_DIR/export.jpg" "$key" true || ov_fail key_failed "The image could not be saved; the ordinary encrypted key was retained."
-        ov_as_user rm -f -- "$tempkey"
-    elif [[ $auth == text ]]; then
+    recovery_record=$(jq '.creation_state="ready"' <<< "$recovery_record")
+    ov_save vaults "$id" "$recovery_record"
+    if [[ $reuse != true && $auth == image ]]; then
+        ov_vault_image_embed "$rootkey" "$image_source" "$OV_VAULT_TEMP_DIR/export.jpg" ||
+            ov_fail key_failed "Image key export failed. The vault was saved with its ordinary encrypted recovery key; it can still be opened with your passphrase."
+        ov_vault_publish "$OV_VAULT_TEMP_DIR/export.jpg" "$key" ||
+            ov_fail key_failed "The image carrier could not be saved. The vault still uses its retained encrypted recovery key."
+    elif [[ $reuse != true && $auth == text ]]; then
         ov_vault_text_embed "$rootkey" "$(ov_vault_field "$record" cipher_file)" "$OV_VAULT_TEMP_DIR/export.txt" ||
-            ov_fail key_failed "Text key export failed; the ordinary encrypted key was retained."
-        ov_vault_publish "$OV_VAULT_TEMP_DIR/export.txt" "$key" || ov_fail key_failed "The text key could not be saved; the ordinary encrypted key was retained."
-        ov_as_user rm -f -- "$tempkey"
+            ov_fail key_failed "Text key export failed. The vault was saved with its ordinary encrypted recovery key; it can still be opened with your passphrase."
+        ov_vault_publish "$OV_VAULT_TEMP_DIR/export.txt" "$key" ||
+            ov_fail key_failed "The text carrier could not be saved. The vault still uses its retained encrypted recovery key."
     fi
     ov_save vaults "$id" "$record"
+    if [[ $tempkey != "$key" ]]; then ov_as_user rm -f -- "$tempkey"; fi
     ov_progress complete "Vault created" 100
     ov_ok "$(ov_vault_status "$record")"
 }
@@ -989,7 +1078,8 @@ ov_vault_dispatch() {
     local id record items result size
     case $OV_OP in
         vault.list|vault.get|migration.list|vault.search) ;;
-        vault.create|vault.import) ov_resource_lock "$(ov_require file)" ;;
+        vault.create) ov_vault_create_path; ov_resource_lock "$(ov_require file)" ;;
+        vault.import) ov_resource_lock "$(ov_require file)" ;;
         *)
             id=$(ov_require id); ov_load vaults "$id"
             ov_resource_lock "$(ov_vault_field "$OV_RECORD" file)"

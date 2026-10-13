@@ -57,6 +57,31 @@ static void numeric_rejection(void)
     g_assert_no_error(error); g_assert_nonnull(strstr(encoded, "1.25")); g_free(encoded);
 }
 
+static void guided_vault_options(void)
+{
+    gchar *args[] = { "vault", "create", "--name", "Personal files", "--directory", "/home/person/Vaults",
+        "--size-gb", "2.5", "--use-existing-key", "--key-file", "/home/person/existing.key" };
+    GError *error = NULL;
+    gchar *encoded = make_request(G_N_ELEMENTS(args), args, &error);
+    g_assert_no_error(error);
+    JsonParser *parser = json_parser_new();
+    g_assert_true(json_parser_load_from_data(parser, encoded, -1, &error));
+    JsonObject *params = json_object_get_object_member(json_node_get_object(json_parser_get_root(parser)), "params");
+    g_assert_true(json_object_get_boolean_member(params, "use_existing_key"));
+    g_assert_cmpstr(json_object_get_string_member(params, "directory"), ==, "/home/person/Vaults");
+    g_assert_cmpstr(json_object_get_string_member(params, "key_file"), ==, "/home/person/existing.key");
+    g_assert_false(json_object_has_member(params, "password"));
+    g_free(encoded);
+    args[8] = "--no-use-existing-key";
+    encoded = make_request(G_N_ELEMENTS(args), args, &error);
+    g_assert_no_error(error);
+    g_assert_true(json_parser_load_from_data(parser, encoded, -1, &error));
+    params = json_object_get_object_member(json_node_get_object(json_parser_get_root(parser)), "params");
+    g_assert_false(json_object_get_boolean_member(params, "use_existing_key"));
+    g_object_unref(parser);
+    g_free(encoded);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -64,5 +89,6 @@ int main(int argc, char **argv)
     g_test_add_func("/cli/restore-policy", restore_policy);
     g_test_add_func("/cli/secret-argv-rejection", invalid_secret_argument);
     g_test_add_func("/cli/numeric-validation", numeric_rejection);
+    g_test_add_func("/cli/guided-vault-options", guided_vault_options);
     return g_test_run();
 }

@@ -29,6 +29,9 @@ static void usage(void)
          "       octovault [--json] job get|cancel ID\n\n"
          "Groups: vault, migration, destination, repository, backup, schedule, event, system\n"
          "Use --id ID to select a registered item. Use --size-gb 10 for vault capacity.\n"
+         "Create with --directory FOLDER and --name NAME; a new encrypted key is managed automatically.\n"
+         "Use --use-existing-key --key-file FILE to reuse a key or protected carrier.\n"
+         "For --auth image, --image-source FILE selects a cover image; its original is preserved.\n"
          "Repeat --source, --exclude, --include or --close-on for array values.\n"
          "Boolean options accept true/false, a bare --flag, or --no-flag.\n"
          "Secrets (for example --password or --secret-key) take NO value: they prompt\n"
@@ -37,6 +40,7 @@ static void usage(void)
          "Run as your regular user; privileged actions use Polkit authorization.\n"
          "Examples:\n"
          "  octovault vault list\n"
+         "  octovault vault create --name Personal --directory /home/me --size-gb 10 --password\n"
          "  octovault vault open --id ID --password\n"
          "  octovault backup save --name Documents --repository-id ID --source /home/me/Documents\n"
          "  octovault repository recovery --id ID\n"
@@ -119,7 +123,7 @@ static gchar *make_request(int argc, char **argv, GError **error)
     const gchar *groups[] = { "vault", "migration", "destination", "repository", "backup", "schedule", "event", "system", NULL };
     if (!in_list(argv[0], groups)) { g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT, "Unknown operation group."); return NULL; }
     JsonObject *params = json_object_new();
-    const gchar *boolean_keys[] = { "force", "force_close", "read_data", "dry_run", "one_file_system", "on_battery", "metered", NULL };
+    const gchar *boolean_keys[] = { "force", "force_close", "read_data", "dry_run", "one_file_system", "on_battery", "metered", "use_existing_key", NULL };
     const gchar *number_keys[] = { "size_gb", "port", "keep_daily", "keep_weekly", "keep_monthly", "keep_yearly", "keep_last", "boot_delay_sec", "idle_sec", "idle_seconds", "upload_limit", "download_limit", NULL };
     const gchar *array_keys[] = { "sources", "excludes", "include", "close_on", NULL };
     for (int i = 2; i < argc; i++) {
