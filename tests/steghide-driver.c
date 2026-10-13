@@ -18,17 +18,11 @@ static int invoke(char *helper, char *action, char *a, char *b, char *c)
     return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
 }
 
-int main(int argc, char **argv)
+static int make_cover(const char *path)
 {
-    if (argc != 3) return 2;
-    char cover[4096], input[4096], output[4096], restored[4096];
-    snprintf(cover, sizeof(cover), "%s/cover.bmp", argv[2]);
-    snprintf(input, sizeof(input), "%s/key", argv[2]);
-    snprintf(output, sizeof(output), "%s/hidden.bmp", argv[2]);
-    snprintf(restored, sizeof(restored), "%s/restored", argv[2]);
     /* 128x128, 24-bit uncompressed BMP, padded row length 384. */
     unsigned char header[54] = {0x42,0x4d,0x36,0xc0,0,0,0,0,0,0,54,0,0,0,40,0,0,0,128,0,0,0,128,0,0,0,1,0,24,0};
-    FILE *image = fopen(cover, "wb");
+    FILE *image = fopen(path, "wb");
     if (!image) return 1;
     fwrite(header, 1, sizeof(header), image);
     FILE *random = fopen("/dev/urandom", "rb");
@@ -36,6 +30,19 @@ int main(int argc, char **argv)
     unsigned char pixels[49152];
     if (fread(pixels, 1, sizeof(pixels), random) != sizeof(pixels)) return 1;
     fwrite(pixels, 1, sizeof(pixels), image); fclose(image); fclose(random);
+    return 0;
+}
+
+int main(int argc, char **argv)
+{
+    if (argc != 3) return 2;
+    if (!strcmp(argv[1], "--make-cover")) return make_cover(argv[2]);
+    char cover[4096], input[4096], output[4096], restored[4096];
+    snprintf(cover, sizeof(cover), "%s/cover.bmp", argv[2]);
+    snprintf(input, sizeof(input), "%s/key", argv[2]);
+    snprintf(output, sizeof(output), "%s/hidden.bmp", argv[2]);
+    snprintf(restored, sizeof(restored), "%s/restored", argv[2]);
+    if (make_cover(cover)) return 1;
     const char *payload = "synthetic encrypted key payload for image round trip";
     FILE *key = fopen(input, "w"); if (!key) return 1; fputs(payload, key); fclose(key);
     int fd = memfd_create("octovault-test-secret", 0); if (fd < 3) return 1;

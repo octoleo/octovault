@@ -267,6 +267,43 @@ integration() {
     OV_OP=vault.close; ov_vault_dispatch >/dev/null
     assert_equal "$(cat "$guard")" 'must stay unchanged'
     printf 'ok - real nonroot-owner lifecycle, migration, independent closed locations, metadata symlinks and untrusted hooks\n'
+    # Exercise the released engine's passphrase descriptions and carrier/key
+    # interfaces, not mocks: percent signs must survive unchanged.
+    OV_PARAMS=$(jq -n --arg id "$id" '{id:$id,old_password:"OctoVault-CI-only-passphrase",password:"OctoVault-rotated-50%-pass"}')
+    OV_OP=vault.passwd; ov_vault_dispatch >/dev/null
+    OV_PARAMS=$(jq -n --arg id "$id" '{id:$id,password:"OctoVault-rotated-50%-pass"}')
+    OV_OP=vault.open; ov_vault_dispatch >/dev/null
+    OV_OP=vault.close; ov_vault_dispatch >/dev/null
+    printf 'ok - real key passphrase rotation and percent-sign unlock\n'
+    local text_key="$OV_HOME/ci-key.txt" image_key="$OV_HOME/ci-key.bmp" replacement="$OV_HOME/replacement.key"
+    OV_PARAMS=$(jq -n --arg id "$id" --arg output "$text_key" '{id:$id,format:"text",output:$output}')
+    OV_OP=vault.key-export; ov_vault_dispatch >/dev/null
+    OV_PARAMS=$(jq -n --arg id "$id" --arg key "$text_key" '{id:$id,auth:"text",key_file:$key}')
+    OV_OP=vault.update; ov_vault_dispatch >/dev/null
+    OV_PARAMS=$(jq -n --arg id "$id" '{id:$id,password:"OctoVault-rotated-50%-pass"}')
+    OV_OP=vault.open; ov_vault_dispatch >/dev/null
+    OV_OP=vault.close; ov_vault_dispatch >/dev/null
+    printf 'ok - real text-carrier export and unlock with included cipher\n'
+    cc -std=c11 -O2 -Wall -Wextra -Werror "$PROJECT/tests/steghide-driver.c" -o "$WORK/cover-generator"
+    ov_as_user "$WORK/cover-generator" --make-cover "$image_key"
+    OV_PARAMS=$(jq -n --arg id "$id" --arg output "$image_key" '{id:$id,format:"image",output:$output,password:"OctoVault-rotated-50%-pass"}')
+    OV_OP=vault.key-export; ov_vault_dispatch >/dev/null
+    OV_PARAMS=$(jq -n --arg id "$id" --arg key "$image_key" '{id:$id,auth:"image",key_file:$key}')
+    OV_OP=vault.update; ov_vault_dispatch >/dev/null
+    OV_PARAMS=$(jq -n --arg id "$id" '{id:$id,password:"OctoVault-rotated-50%-pass"}')
+    OV_OP=vault.open; ov_vault_dispatch >/dev/null
+    OV_OP=vault.close; ov_vault_dispatch >/dev/null
+    printf 'ok - real image-carrier export and unlock through descriptor-only helper\n'
+    OV_VAULT_PASSWORD='OctoVault-replacement-75%-pass'
+    ov_vault_temporary
+    ov_vault_tomb forge -k "$OV_VAULT_TEMP_DIR/replacement-forged.key"
+    ov_vault_publish "$OV_VAULT_TEMP_DIR/replacement-forged.key" "$replacement"
+    OV_PARAMS=$(jq -n --arg id "$id" --arg key "$replacement" '{id:$id,new_key_file:$key,old_password:"OctoVault-rotated-50%-pass",password:"OctoVault-replacement-75%-pass"}')
+    OV_OP=vault.setkey; ov_vault_dispatch >/dev/null
+    OV_PARAMS=$(jq -n --arg id "$id" '{id:$id,password:"OctoVault-replacement-75%-pass"}')
+    OV_OP=vault.open; ov_vault_dispatch >/dev/null
+    OV_OP=vault.close; ov_vault_dispatch >/dev/null
+    printf 'ok - real LUKS key replacement from image authentication and reopen\n' 
 }
 
 if [[ ${1:-} == --integration ]]; then integration
