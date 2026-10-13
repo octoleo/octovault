@@ -1,0 +1,19 @@
+#!/bin/bash -p
+# SPDX-License-Identifier: Apache-2.0
+# Selected only by the root daemon for an authorized priority close, or the
+# root pre-sleep/shutdown guard after matching a saved owner policy.
+set -euo pipefail
+umask 077
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+[[ $EUID -eq 0 && $# -eq 1 ]] || exit 64
+# shellcheck source=lib/octovault/priority.sh
+source /usr/lib/octovault/priority.sh
+ov_priority_setup "$1"
+ov_priority_enter
+trap 'ov_priority_leave' EXIT
+# Preserve the caller's stdin unchanged for the regular validated backend.
+if ! ov_priority_cancel_plans; then
+    printf '%s\n' '{"ok":false,"error":{"code":"backup_busy","message":"Scheduled backup cancellation did not finish; the vault has not been assumed closed."}}'
+    exit 1
+fi
+/usr/libexec/octovault/backend "$1"

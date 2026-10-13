@@ -33,7 +33,7 @@ ov_vault_dispatch() {
     ov_ok '{"locked":true}'
 }
 ov_backup_dispatch() { printf 'backup %s\n' "$(ov_require id)" >> "$log"; ov_ok '{"complete":true}'; }
-assert_contains() { rg -q -F -- "$2" "$1" || { printf 'Missing %s in %s\n' "$2" "$1" >&2; exit 1; }; }
+assert_contains() { grep -q -F -- "$2" "$1" || { printf 'Missing %s in %s\n' "$2" "$1" >&2; exit 1; }; }
 assert_json() { jq -e "$2" <<<"$1" >/dev/null; }
 ov_save plans daily '{"name":"Daily","trigger":"calendar","calendar":"daily"}'
 ov_save plans boot '{"name":"Boot","trigger":"boot","boot_delay_sec":3600}'

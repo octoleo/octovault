@@ -62,6 +62,17 @@ Built from $commit after the Ubuntu 26.04 package and real encryption integratio
 EOF
     gh release create "$tag" --repo "$GH_REPO" --draft --target "$commit" --title "OctoVault $version" --notes-file "$temp/notes.md"
 fi
+# GitHub can acknowledge a draft before its read endpoint is consistent.
+visible=false
+for ((attempt=0; attempt<5; attempt++)); do
+    if gh release view "$tag" --repo "$GH_REPO" --json isDraft,targetCommitish >"$temp/draft.json" 2>"$temp/read-error"; then
+        visible=true
+        break
+    fi
+    sleep 1
+done
+[[ $visible == true ]] || { printf 'Draft is not readable yet; retry this workflow to resume it.\n' >&2; exit 1; }
+jq -e --arg commit "$commit" '.isDraft == true and .targetCommitish == $commit' "$temp/draft.json" >/dev/null || { printf 'Release state changed; refusing to overwrite it.\n' >&2; exit 1; }
 gh release upload "$tag" "${files[@]}" --repo "$GH_REPO" --clobber
 mkdir "$temp/download"
 gh release download "$tag" --repo "$GH_REPO" --dir "$temp/download"

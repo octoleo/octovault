@@ -150,6 +150,67 @@ test_device_identity() (
     printf 'ok - an unrelated mount is never reported as this vault\n'
 )
 
+test_unknown_state() (
+    local record='{"file":"/correct.tomb","mountpoint":"/mount"}'
+    ov_vault_is_open() { return 1; }
+    losetup() { return 1; }
+    assert_equal "$(ov_vault_status "$record" | jq -r .status)" unknown
+    assert_fails ov_vault_require_closed "$record"
+    assert_fails ov_vault_close_record "$record"
+    losetup() { return 0; }
+    ov_vault_require_closed "$record"
+    printf 'ok - unknown kernel state fails closed\n'
+)
+
+test_secret_arguments() (
+    local id=secrettest
+    jq() {
+        local arg
+        for arg in "$@"; do
+            [[ $arg != *'do-not-pass-this-secret-in-argv'* ]] || {
+                printf 'Secret leaked into jq arguments\n' >&2; exit 99;
+            }
+        done
+        command jq "$@"
+    }
+    OV_PARAMS=$(printf '{"name":"secret test","file":"%s/new.tomb","key_file":"%s/new.key","password":"do-not-pass-this-secret-in-argv","open_on":"manual"}' "$OV_HOME" "$OV_HOME")
+    ov_vault_new_record "$id"
+    [[ $OV_RECORD != *do-not-pass-this-secret-in-argv* ]]
+    ov_save vaults "$id" "$OV_RECORD"
+    OV_PARAMS='{"id":"secrettest","name":"updated","password":"do-not-pass-this-secret-in-argv"}'
+    ov_vault_status() { printf '%s\n' "$1"; }
+    ov_vault_update >/dev/null
+    printf 'ok - request passphrases never appear in jq argv or saved vault records\n'
+)
+
+test_container_pin() (
+    local record file="$OV_HOME/pin.tomb" alias="$WORK/pin-root/vault.tomb"
+    mkdir -p "$(dirname "$alias")"; printf 'container' > "$file"
+    record=$(jq -n --arg file "$file" '{id:"pintest",file:$file}')
+    ov_vault_alias() { printf '%s/pin-root/vault.tomb\n' "$WORK"; }
+    findmnt() { return 1; }
+    mount() {
+        assert_equal "$1" --no-canonicalize
+        assert_equal "$2" --bind
+        [[ $3 == /proc/*/fd/* ]]
+        assert_equal "$(cat -- "$3")" container
+        printf 'pinned\n' > "$WORK/pin-result"
+    }
+    ov_vault_pin "$record"
+    assert_equal "$(cat "$WORK/pin-result")" pinned
+    rm "$file"; ln -s /etc/passwd "$file"
+    assert_fails ov_vault_pin "$record"
+    rm "$file"; mkdir "$file"
+    assert_fails ov_vault_pin "$record"
+    # A path changed after validation cannot redirect the root bind mount.
+    rmdir "$file"; printf 'container' > "$file"
+    ov_vault_user_path() { printf '%s\n' "$1"; }
+    readlink() { printf '/etc/passwd\n'; }
+    assert_fails ov_vault_pin "$record"
+    unset OV_VAULT_PIN_RECORD
+    printf 'ok - container access pins validated regular inodes and rejects pathname swaps\n'
+)
+
 integration() {
     [[ $EUID == 0 ]] || { printf 'Integration requires root.\n' >&2; exit 1; }
     for program in tomb cryptsetup losetup pinentry-octovault rsync; do command -v "$program" >/dev/null; done
@@ -157,7 +218,7 @@ integration() {
     INTEGRATION_RUNNING=true
     local response id file="$OV_HOME/ci.tomb" key="$OV_HOME/ci.key" source="$OV_HOME/Documents"
     OV_PARAMS=$(jq -n --arg file "$file" --arg key "$key" '{name:"CI vault",file:$file,key_file:$key,size_gb:"0.05",auth:"key",password:"OctoVault-CI-only-passphrase",open_on:"manual"}')
-    OV_OP=vault.create; response=$(ov_vault_dispatch); id=$(jq -er .data.id <<< "$response")
+    OV_OP=vault.create; response=$(ov_vault_dispatch) || { printf '%s\n' "$response" >&2; return 1; }; id=$(jq -er .data.id <<< "$response")
     OV_PARAMS=$(jq -n --arg id "$id" '{id:$id,password:"OctoVault-CI-only-passphrase"}')
     OV_OP=vault.open; ov_vault_dispatch >/dev/null
     mkdir "$source"; printf 'important\n' > "$source/data"
@@ -175,5 +236,5 @@ integration() {
 }
 
 if [[ ${1:-} == --integration ]]; then integration
-else test_validation; test_native_binds; test_compare; test_migration; test_interrupted_migration; test_device_identity
+else test_validation; test_native_binds; test_compare; test_migration; test_interrupted_migration; test_device_identity; test_unknown_state; test_secret_arguments; test_container_pin
 fi

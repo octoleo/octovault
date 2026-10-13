@@ -79,6 +79,7 @@ TimeoutStartSec=infinity
 TimeoutStopSec=20s
 KillMode=control-group
 UMask=0077
+LimitCORE=0
 Nice=10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=7

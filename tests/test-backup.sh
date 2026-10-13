@@ -127,9 +127,15 @@ printf 'Testing partial failures, missing sources and fail-closed vault interloc
 vault_id=test-vault
 printf 'encrypted-container-placeholder\n' >"$TEST_ROOT/container.tomb"
 ov_save vaults "$vault_id" "$(jq -n --arg file "$TEST_ROOT/container.tomb" --arg mountpoint "$TEST_ROOT/mount" '{name:"Test vault",file:$file,mountpoint:$mountpoint}')"
+assert_json "$(request backup.save "$(jq -n --arg rid "$repository_id" --arg source "$TEST_ROOT/source dir" '{name:"Independent files on vault event",repository_id:$rid,sources:[$source],vault_id:"test-vault",vault_mode:"none",trigger:"vault-open"}')")" '.ok and .data.vault_mode == "none" and .data.trigger == "vault-open"'
+expect_error invalid_trigger backup.save "$(jq -n --arg rid "$repository_id" --arg source "$TEST_ROOT/source dir" '{name:"Conflicting trigger",repository_id:$rid,sources:[$source],vault_id:"test-vault",vault_mode:"closed-container",trigger:"vault-open"}')"
 linked=$(request backup.save "$(jq -n --arg rid "$repository_id" --arg source "$TEST_ROOT/source dir" '{name:"Vault plan",repository_id:$rid,sources:[$source],vault_id:"test-vault",vault_mode:"open-files"}')")
 linked_id=$(jq -r .data.id <<<"$linked")
 expect_error vault_closed backup.run "{\"id\":\"$linked_id\"}"
+TEST_VAULT_STATE=open
+findmnt() { if [[ " $* " == *' --mountpoint '* ]]; then printf '253:1\n'; else printf '8:1\n'; fi; }
+expect_error source_not_in_vault backup.run "{\"id\":\"$linked_id\"}"
+unset -f findmnt
 assert_json "$(request backup.save "{\"id\":\"$linked_id\",\"vault_mode\":\"closed-container\"}")" '.ok'
 TEST_VAULT_STATE=open
 expect_error vault_open backup.run "{\"id\":\"$linked_id\"}"
@@ -145,8 +151,8 @@ assert_json "$(request backup.history "{\"id\":\"$plan_id\"}")" '.ok and .data[-
 unset -f restic
 assert_json "$(request backup.remove "{\"id\":\"$missing_id\"}")" '.ok and .data.data_preserved'
 printf 'Testing S3 credential separation and verified SSH host keys without a network...\n'
-s3=$(request destination.save '{"name":"S3 credentials","type":"s3","endpoint":"https://s3.example.test","bucket":"backup-test","region":"us-east-1","access_key":"FAKE_TEST_ACCESS","secret_key":"FAKE_TEST_SECRET"}')
-assert_json "$s3" '.ok and (.data.credentials.access_key | type == "string")'
+s3=$(request destination.save '{"name":"S3 credentials","type":"s3","endpoint":"https://s3.example.test","bucket":"backup-test","region":"","access_key":"FAKE_TEST_ACCESS","secret_key":"FAKE_TEST_SECRET"}')
+assert_json "$s3" '.ok and .data.region == "us-east-1" and (.data.credentials.access_key | type == "string")'
 s3_id=$(jq -r .data.id <<<"$s3")
 if grep -E 'FAKE_TEST_(ACCESS|SECRET)' "$OV_ROOT/destinations/$s3_id.json" >/dev/null; then printf 'S3 credentials leaked into a public record.\n' >&2; exit 1; fi
 assert_json "$(request destination.save "{\"id\":\"$s3_id\",\"name\":\"Renamed\",\"access_key\":\"\",\"secret_key\":\"\"}")" '.ok and .data.name == "Renamed"'

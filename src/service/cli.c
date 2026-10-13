@@ -10,6 +10,8 @@
 #include <termios.h>
 #include <unistd.h>
 #include <sys/wait.h>
+#include <sys/resource.h>
+#include <sys/prctl.h>
 #include <poll.h>
 
 #ifndef OCTOVAULT_VERSION
@@ -251,6 +253,9 @@ static void print_response(JsonNode *node, gboolean json)
 
 int main(int argc, char **argv)
 {
+    const struct rlimit no_core = { 0, 0 };
+    (void)setrlimit(RLIMIT_CORE, &no_core);
+    (void)prctl(PR_SET_DUMPABLE, 0);
     gboolean json = FALSE;
     GPtrArray *args = g_ptr_array_new();
     for (int i = 1; i < argc; i++) {

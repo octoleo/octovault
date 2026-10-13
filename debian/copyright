@@ -17,3 +17,12 @@ License: Apache-2.0
  Tomb and Restic are separately installed dependencies, not incorporated
  copies of their source. Their licenses remain available in
  /usr/share/doc/tomb/copyright and /usr/share/doc/restic/copyright.
+
+Files: data/io.vdm.OctoVault.metainfo.xml
+Copyright: 2026 Vast Development Method
+License: CC0-1.0
+ To the extent possible under law, Vast Development Method has waived all
+ copyright and related or neighboring rights to the application metadata.
+ .
+ On Debian systems, the complete license is available in
+ /usr/share/common-licenses/CC0-1.0.

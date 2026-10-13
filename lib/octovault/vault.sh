@@ -13,8 +13,72 @@ ov_vault_temporary() {
 }
 
 ov_vault_cleanup() {
+    if [[ -n ${OV_VAULT_PIN_RECORD:-} ]]; then ov_vault_unpin "$OV_VAULT_PIN_RECORD" || true; fi
     [[ -z ${OV_VAULT_TEMP_DIR:-} ]] || rm -rf -- "$OV_VAULT_TEMP_DIR"
     unset OV_VAULT_TEMP_DIR OV_VAULT_PASSWORD OV_VAULT_OLD_PASSWORD
+}
+
+ov_vault_alias() {
+    local id
+    id=$(ov_vault_field "$1" id); ov_id "$id"
+    printf '/run/octovault/containers/%s/%s/vault.tomb\n' "$OV_UID" "$id"
+}
+
+ov_vault_backing() {
+    local alias
+    # Tests and legacy imported objects without an id use their original file.
+    if [[ -n $(ov_vault_field "$1" id) ]]; then
+        alias=$(ov_vault_alias "$1")
+        if [[ -f $alias ]] && findmnt -rn --mountpoint "$alias" >/dev/null 2>&1; then
+            printf '%s\n' "$alias"; return
+        fi
+    fi
+    ov_vault_field "$1" file
+}
+
+ov_vault_pin() {
+    local record=$1 file alias descriptor resolved identity alias_identity
+    file=$(ov_vault_field "$record" file)
+    ov_vault_user_path "$file" >/dev/null
+    ov_as_user test -w "$file" || ov_fail permission_denied "The container must be writable by your account."
+    # Opening read-only cannot create or truncate an attacker-swapped target.
+    exec {descriptor}< "$file" || ov_fail unavailable "The container could not be opened."
+    resolved=$(readlink -f -- "/proc/self/fd/$descriptor")
+    if [[ ! -f /proc/self/fd/$descriptor || $resolved != "$file" ||
+          $(stat -Lc %u -- "/proc/self/fd/$descriptor") != "$OV_UID" ]]; then
+        exec {descriptor}<&-
+        ov_fail unsafe_container "The container must be a regular file owned by your account at its registered path."
+    fi
+    identity=$(stat -Lc '%d:%i' -- "/proc/self/fd/$descriptor")
+    alias=$(ov_vault_alias "$record")
+    install -d -m 0700 /run/octovault/containers "/run/octovault/containers/$OV_UID" "$(dirname -- "$alias")"
+    if findmnt -rn --mountpoint "$alias" >/dev/null 2>&1; then
+        alias_identity=$(stat -Lc '%d:%i' -- "$alias")
+        exec {descriptor}<&-
+        [[ $identity == "$alias_identity" ]] || ov_fail busy "Another inode is still pinned for this vault. Close it before replacing its container file."
+    else
+        : > "$alias"; chmod 0600 "$alias"
+        if ! mount --no-canonicalize --bind "/proc/self/fd/$descriptor" "$alias" >&2; then
+            exec {descriptor}<&-; rm -f -- "$alias"
+            ov_fail mount_failed "Could not pin the container securely for the privileged operation."
+        fi
+        exec {descriptor}<&-
+    fi
+    OV_VAULT_CONTAINER_ALIAS=$alias
+    OV_VAULT_PIN_RECORD=$record
+}
+
+ov_vault_unpin() {
+    local alias loops
+    alias=$(ov_vault_alias "$1")
+    [[ -f $alias ]] || return 0
+    loops=$(losetup --noheadings --output NAME --associated "$alias" 2>/dev/null) || return 1
+    [[ -z $loops ]] || return 0
+    if findmnt -rn --mountpoint "$alias" >/dev/null 2>&1; then
+        umount -- "$alias" >&2 || return 1
+    fi
+    rm -f -- "$alias"
+    rmdir -- "$(dirname -- "$alias")" 2>/dev/null || true
 }
 
 # Write keys/images through the user's identity. Privileged operations never
@@ -65,7 +129,9 @@ ov_vault_plain_key() {
     case $auth in
         image) ov_vault_image_extract "$key" "$OV_VAULT_MATERIALIZED_KEY" || ov_fail key_failed "The image could not be unlocked." ;;
         text)
-            ov_as_user tomb --no-color uncloak "$key" "$(ov_vault_field "$record" cipher_file)" > "$OV_VAULT_MATERIALIZED_KEY" ||
+            ov_as_user cat -- "$key" > "$OV_VAULT_TEMP_DIR/cloaked.txt" || ov_fail key_failed "The text carrier cannot be read."
+            ov_as_user cat -- "$(ov_vault_field "$record" cipher_file)" > "$OV_VAULT_TEMP_DIR/cloak-cipher" || ov_fail key_failed "The cipher file cannot be read."
+            /usr/libexec/tomb/decloakify -i "$OV_VAULT_TEMP_DIR/cloaked.txt" -c "$OV_VAULT_TEMP_DIR/cloak-cipher" -o "$OV_VAULT_MATERIALIZED_KEY" >&2 ||
                 ov_fail key_failed "The text key could not be decoded; verify the cipher file and installed Tomb extras."
             ;;
         *) ov_as_user cat -- "$key" > "$OV_VAULT_MATERIALIZED_KEY" ;;
@@ -123,14 +189,25 @@ ov_vault_mib() {
 # container must not be backed up as a stable closed file.
 ov_vault_attached() {
     local file loops
-    file=$(ov_vault_field "$1" file)
+    file=$(ov_vault_backing "$1")
     loops=$(losetup --noheadings --output NAME --associated "$file" 2>/dev/null) || return 2
     [[ -n $loops ]]
 }
 
+# Unknown kernel state is never equivalent to a safely closed container.
+ov_vault_require_closed() {
+    local state=0
+    ov_vault_attached "$1" || state=$?
+    case $state in
+        0) ov_fail busy "The container is still attached; close it before continuing." ;;
+        1) return 0 ;;
+        *) ov_fail state_unknown "The encrypted device state could not be verified." ;;
+    esac
+}
+
 ov_vault_is_open() {
     local record=$1 file mountpoint source device loops loop
-    file=$(ov_vault_field "$record" file)
+    file=$(ov_vault_backing "$record")
     mountpoint=$(ov_vault_field "$record" mountpoint)
     [[ -n $mountpoint && -n $file ]] || return 1
     source=$(findmnt -rn --mountpoint "$mountpoint" --output SOURCE 2>/dev/null) || return 1
@@ -177,10 +254,14 @@ ov_vault_status() {
         usage=$(df -B1 --output=size,used,avail,pcent -- "$mountpoint" 2>/dev/null | tail -n 1 |
             awk '{gsub(/%/,"",$4);printf "{\"total\":%s,\"used\":%s,\"available\":%s,\"percent\":%s}",$1,$2,$3,$4}')
         [[ -n $usage ]] || usage=null
-    elif ov_vault_attached "$record"; then
-        status=attention
-    elif [[ ! -f $(ov_vault_field "$record" file) ]]; then
-        status=missing
+    else
+        local state=0
+        ov_vault_attached "$record" || state=$?
+        case $state in
+            0) status=attention ;;
+            1) [[ -f $(ov_vault_field "$record" file) ]] || status=missing ;;
+            *) status=unknown ;;
+        esac
     fi
     jq --arg status "$status" --argjson usage "$usage" '. + {status:$status,usage:$usage}' <<< "$record"
 }
@@ -192,7 +273,7 @@ ov_vault_validate_record() {
       (.auth|IN("key","gpg","image","text")) and
       (.open_on|IN("manual","login","drive","token")) and
       (.close_on|type=="array" and all(.[];IN("screen-lock","logout","sleep","shutdown"))) and
-      (.force_close|type=="boolean") and (.hooks|type=="object")' <<< "$record" >/dev/null ||
+      (.force_close|type=="boolean") and ((.trust_native_hooks//false)|type=="boolean") and (.hooks|type=="object")' <<< "$record" >/dev/null ||
         ov_fail invalid_vault "The vault configuration is invalid."
     [[ $(ov_vault_field "$record" auth) != gpg || -n $(ov_vault_field "$record" recipient) ]] ||
         ov_fail invalid_auth "An OpenPGP recipient is required."
@@ -210,15 +291,29 @@ ov_vault_validate_record() {
 # Always disable it; hooks are explicitly run as the requesting user below.
 # The immutable pinentry adapter reads a seekable inherited FD, never argv.
 ov_vault_tomb() {
-    local password=${OV_VAULT_PASSWORD:-} rc=0
-    local -a command=(tomb --no-color)
+    local password=${OV_VAULT_PASSWORD:-} rc=0 backend
+    local -a command=(/usr/bin/tomb --no-color)
+    # Released Tomb exposes `source` but does not accept -n for close/slam.
+    # Use its own close implementation with its existing no-hooks option set.
+    # Only these fixed function names execute; caller data remains arguments.
+    if [[ ${1:-} == close || ${1:-} == slam ]]; then
+        local action=$1 selector=${2:-}
+        SUDO_USER="$OV_USER" SUDO_UID="$OV_UID" SUDO_GID="$(id -g "$OV_USER")" HOME="$OV_HOME" \
+            /usr/bin/zsh -f -c 'source /usr/bin/tomb source || exit; OPTS[--no-color]=1; OPTS[-n]=1; [[ $1 == slam ]] && SLAM=1; umount_tomb "$2"' octovault "$action" "$selector" >&2
+        return
+    fi
     if [[ -n $password ]]; then
-        tomb --pinentry octovault --help >/dev/null 2>&1 ||
-            ov_fail unsupported_tomb "The installed Tomb lacks secure pinentry selection. Install the supported Ubuntu 26 Tomb package."
+        [[ -x /usr/bin/pinentry-octovault ]] || ov_fail missing_dependency "OctoVault's secure passphrase adapter is missing."
+        ov_vault_temporary
+        install -d -m 0700 "$OV_VAULT_TEMP_DIR/pinentry"
+        # Tomb 2.13 finds backends with which and checks them with ldd. This
+        # root-only scoped PATH selects our ELF helper without replacing Tomb.
+        for backend in pinentry pinentry-curses pinentry-tty; do
+            ln -sf /usr/bin/pinentry-octovault "$OV_VAULT_TEMP_DIR/pinentry/$backend"
+        done
         ov_secret_fd "$password"
         if [[ -n ${OV_VAULT_OLD_PASSWORD:-} ]]; then ov_old_secret_fd "$OV_VAULT_OLD_PASSWORD"; fi
-        command+=(--pinentry octovault)
-        OV_PINENTRY_RAW=1 SUDO_USER="$OV_USER" SUDO_UID="$OV_UID" SUDO_GID="$(id -g "$OV_USER")" \
+        PATH="$OV_VAULT_TEMP_DIR/pinentry:/usr/sbin:/usr/bin:/sbin:/bin" DISPLAY='' WAYLAND_DISPLAY='' OV_PINENTRY_RAW=1 SUDO_USER="$OV_USER" SUDO_UID="$OV_UID" SUDO_GID="$(id -g "$OV_USER")" \
             HOME="$OV_HOME" "${command[@]}" "$@" >&2 || rc=$?
         ov_secret_close
         return "$rc"
@@ -253,6 +348,8 @@ ov_vault_tomb_keyed() {
     key=$(ov_vault_field "$record" key_file)
     [[ $auth == gpg || -n ${OV_VAULT_PASSWORD:-} ]] ||
         ov_fail password_required "Enter this vault's passphrase to continue."
+    ov_vault_pin "$record"
+    file=$OV_VAULT_CONTAINER_ALIAS
     ov_vault_auth_args "$record"
     if [[ $auth == gpg ]]; then
         # Keep the user's GPG configuration, agent and smartcard interaction
@@ -260,12 +357,10 @@ ov_vault_tomb_keyed() {
         # avoids ever writing the decrypted key to disk.
         ov_as_user gpg --no-options --decrypt -- "$key" |
             ov_vault_tomb --unsafe "$action" "$file" -k cleartext "$@" || rc=$?
-    elif [[ $auth == text || $auth == image ]]; then
+    else
         ov_vault_plain_key "$record"
         ov_vault_tomb "$action" "$file" -k "$OV_VAULT_MATERIALIZED_KEY" "$@" || rc=$?
         rm -f -- "$OV_VAULT_MATERIALIZED_KEY"
-    else
-        ov_vault_tomb "$action" "$file" "${OV_VAULT_AUTH_ARGS[@]}" "$@" || rc=$?
     fi
     return "$rc"
 }
@@ -276,7 +371,7 @@ ov_vault_hooks() {
     mapper=$(findmnt -rn --mountpoint "$mountpoint" --output SOURCE 2>/dev/null || true)
     mapper=${mapper%%\[*}
     device=$(cryptsetup status "$mapper" 2>/dev/null | awk '$1=="device:" {print $2}' || true)
-    if [[ $event != after_close && -x $mountpoint/exec-hooks ]]; then
+    if [[ $event != after_close && $(ov_vault_field "$record" trust_native_hooks) == true && -x $mountpoint/exec-hooks ]]; then
         ov_as_user timeout --signal=TERM --kill-after=5 60 "$mountpoint/exec-hooks" "$event" "$mountpoint" \
             "$(basename -- "$(ov_vault_field "$record" file)" .tomb)" "$device" "$mapper" >&2 ||
             return 1
@@ -332,11 +427,11 @@ ov_vault_bind_hooks() {
         # swap from redirecting a bind operation outside the validated trees.
         exec {src_fd}< "$src_path" || { rm -f "$parsed"; return 1; }
         exec {dst_fd}< "$dst_path" || { exec {src_fd}<&-; rm -f "$parsed"; return 1; }
-        if [[ $(readlink -f "/proc/$$/fd/$src_fd") != "$src_path" ||
-              $(readlink -f "/proc/$$/fd/$dst_fd") != "$dst_path" ]]; then
+        if [[ $(readlink -f "/proc/self/fd/$src_fd") != "$src_path" ||
+              $(readlink -f "/proc/self/fd/$dst_fd") != "$dst_path" ]]; then
             exec {src_fd}<&-; exec {dst_fd}<&-; rm -f "$parsed"; return 1
         fi
-        mount --no-canonicalize --bind "/proc/$$/fd/$src_fd" "/proc/$$/fd/$dst_fd" >&2 || {
+        mount --no-canonicalize --bind "/proc/self/fd/$src_fd" "/proc/self/fd/$dst_fd" >&2 || {
             exec {src_fd}<&-; exec {dst_fd}<&-; rm -f "$parsed"; return 1;
         }
         exec {src_fd}<&-; exec {dst_fd}<&-
@@ -349,7 +444,7 @@ ov_vault_open_record() {
     id=$(ov_vault_field "$record" id)
     mountpoint=$(ov_vault_field "$record" mountpoint)
     ov_vault_is_open "$record" && return 0
-    ov_vault_attached "$record" && ov_fail attached "The container is already attached elsewhere; inspect its mount before opening."
+    ov_vault_require_closed "$record"
     [[ -d $mountpoint && ! -L $mountpoint ]] || ov_fail invalid_mount "The registered mountpoint is missing."
     findmnt -rn --mountpoint "$mountpoint" >/dev/null 2>&1 && ov_fail occupied "The vault mountpoint is already in use."
     [[ -z $(find "$mountpoint" -mindepth 1 -maxdepth 1 -print -quit) ]] ||
@@ -376,7 +471,7 @@ ov_vault_close_record() {
     local record=$1 force=${2:-false} id name
     id=$(ov_vault_field "$record" id)
     if ! ov_vault_is_open "$record"; then
-        ov_vault_attached "$record" && ov_fail verification_failed "The container is attached at an unexpected location; manual inspection is required."
+        ov_vault_require_closed "$record"
         return 0
     fi
     ov_vault_hooks "$record" close || ov_fail hook_failed "The close hook failed; the vault remains open."
@@ -393,9 +488,8 @@ ov_vault_close_record() {
     if ov_vault_is_open "$record"; then
         ov_vault_tomb close "$name" -n || ov_fail busy "The vault could not close. Close applications using it, or explicitly request force close."
     fi
-    if ov_vault_is_open "$record" || ov_vault_attached "$record"; then
-        ov_fail verification_failed "Tomb returned, but the encrypted container is still attached."
-    fi
+    ov_vault_require_closed "$record"
+    ov_vault_unpin "$record" || ov_fail cleanup_failed "The vault is closed, but its temporary container reference could not be detached."
     record=$(jq --arg time "$(ov_now)" '.last_closed_at=$time | .updated_at=$time' <<< "$record")
     ov_save vaults "$id" "$record"
     OV_RECORD=$record
@@ -418,12 +512,12 @@ ov_vault_new_record() {
     [[ $mountpoint != *' '* ]] || ov_fail invalid_mount "Choose a mountpoint without spaces; mapped user locations may contain spaces."
     [[ -d $mountpoint && $(stat -c %u -- "$mountpoint") == "$OV_UID" ]] || ov_fail invalid_mount "The mountpoint must be a directory owned by your account."
     [[ $file != "$key" && $file != "$mountpoint" && $key != "$mountpoint" ]] || ov_fail invalid_path "Container, key and mountpoint must be separate paths."
-    OV_RECORD=$(jq -n --arg id "$id" --arg name "$name" --arg file "$file" --arg key "$key" --arg mount "$mountpoint" \
-        --arg auth "$auth" --arg time "$(ov_now)" --argjson p "$OV_PARAMS" \
-        '{schema_version:1,id:$id,name:$name,file:$file,key_file:$key,mountpoint:$mount,auth:$auth,
-        recipient:($p.recipient//""),cipher_file:($p.cipher_file//""),size_gb:($p.size_gb//null),
+    OV_RECORD=$(jq --arg id "$id" --arg name "$name" --arg file "$file" --arg key "$key" --arg mount "$mountpoint" \
+        --arg auth "$auth" --arg time "$(ov_now)" \
+        '. as $p | {schema_version:1,id:$id,name:$name,file:$file,key_file:$key,mountpoint:$mount,auth:$auth,
+        recipient:($p.recipient//""),cipher_file:(if ($p.cipher_file//"")=="" then "/usr/share/doc/tomb/examples/cloak-ciphers/amphibians" else $p.cipher_file end),size_gb:($p.size_gb//null),
         open_on:($p.open_on//"login"),drive_uuid:($p.drive_uuid//""),close_on:($p.close_on//["shutdown"]),
-        force_close:($p.force_close//false),hooks:($p.hooks//{}),created_at:$time,updated_at:$time}')
+        force_close:($p.force_close//false),trust_native_hooks:($p.trust_native_hooks//false),hooks:($p.hooks//{}),created_at:$time,updated_at:$time}' <<< "$OV_PARAMS")
     ov_vault_validate_record "$OV_RECORD"
 }
 
@@ -439,7 +533,7 @@ ov_vault_create() {
     ov_vault_password
     [[ $auth == gpg || -n $OV_VAULT_PASSWORD ]] || ov_fail password_required "Provide a passphrase for the new key."
     if [[ $auth == text ]]; then
-        if ! command -v cloakify >/dev/null || ! command -v decloakify >/dev/null; then
+        if [[ ! -x /usr/libexec/tomb/cloakify || ! -x /usr/libexec/tomb/decloakify ]]; then
             ov_fail missing_dependency "Install Tomb's supported text-cloaking extras first."
         fi
         ov_as_user test -r "$(ov_vault_field "$record" cipher_file)" || ov_fail not_found "The cloak cipher file is unavailable."
@@ -463,6 +557,7 @@ ov_vault_create() {
     locking_record=$(jq --arg key "$tempkey" '.key_file=$key | if .auth=="image" or .auth=="text" then .auth="key" else . end' <<< "$record")
     ov_progress initialize "Initializing the vault filesystem" 65
     ov_vault_tomb_keyed "$locking_record" lock "$file" || ov_fail initialize_failed "Tomb could not initialize the vault; its container and key were retained."
+    ov_vault_unpin "$record" || ov_fail cleanup_failed "The new vault was initialized but its temporary container reference remains attached."
     if [[ $auth == image ]]; then
         [[ -f $key ]] || ov_fail invalid_image "Select an existing JPEG carrier image. The ordinary key was retained beside the container."
         ov_vault_image_embed "$tempkey" "$key" "$OV_VAULT_TEMP_DIR/export.jpg" || ov_fail key_failed "Image key export failed; the ordinary encrypted key was retained."
@@ -485,7 +580,9 @@ ov_vault_import() {
     file=$(ov_vault_field "$record" file); key=$(ov_vault_field "$record" key_file)
     [[ -f $file && -f $key ]] || ov_fail invalid_path "The existing container and key must both be regular files."
     ov_as_user test -w "$file" || ov_fail permission_denied "Your account must own or be able to write the container."
-    cryptsetup isLuks "$file" || ov_fail invalid_container "This file does not contain a LUKS encrypted container."
+    ov_vault_pin "$record"
+    cryptsetup isLuks "$OV_VAULT_CONTAINER_ALIAS" || ov_fail invalid_container "This file does not contain a LUKS encrypted container."
+    ov_vault_unpin "$record" || ov_fail cleanup_failed "The temporary container reference could not be detached."
     existing=$(ov_list vaults | jq -r --arg file "$file" '.[]|select(.file==$file)|.id')
     [[ -z $existing ]] || ov_fail exists "This container is already registered."
     ov_save vaults "$id" "$record"
@@ -497,8 +594,8 @@ ov_vault_update() {
     id=$(ov_require id); ov_load vaults "$id"; record=$OV_RECORD
     jq -e 'has("file") or has("mountpoint")' <<< "$OV_PARAMS" >/dev/null &&
         ov_fail immutable "Container and mountpoint paths cannot be changed on a registered vault."
-    record=$(jq --argjson p "$OV_PARAMS" --arg time "$(ov_now)" '
-       . + ($p | with_entries(select(.key|IN("name","key_file","auth","recipient","cipher_file","open_on","drive_uuid","close_on","force_close","hooks")))) | .updated_at=$time' <<< "$record")
+    record=$(jq --argjson record "$record" --arg time "$(ov_now)" '
+       . as $p | $record + ($p | with_entries(select(.key|IN("name","key_file","auth","recipient","cipher_file","open_on","drive_uuid","close_on","force_close","hooks","trust_native_hooks")))) | .updated_at=$time' <<< "$OV_PARAMS")
     ov_vault_validate_record "$record"
     ov_vault_user_path "$(ov_vault_field "$record" key_file)" >/dev/null
     ov_save vaults "$id" "$record"
@@ -543,23 +640,28 @@ ov_vault_change_password() {
 
 ov_vault_replace_key() {
     local record=$1 new_key auth key new_password rc=0
-    ! ov_vault_attached "$record" || ov_fail busy "Close this vault before replacing its key."
+    ov_vault_require_closed "$record"
     new_key=$(ov_vault_user_path "$(ov_require new_key_file)")
     [[ -f $new_key ]] || ov_fail not_found "The replacement key file was not found."
     ov_vault_password
     [[ -n $OV_VAULT_PASSWORD ]] || ov_fail password_required "Provide the replacement key passphrase."
     auth=$(ov_vault_field "$record" auth); key=$(ov_vault_field "$record" key_file)
+    ov_vault_pin "$record"
+    ov_vault_temporary
+    local new_material="$OV_VAULT_TEMP_DIR/replacement.key"
+    ov_as_user cat -- "$new_key" > "$new_material" || ov_fail key_failed "The replacement key cannot be read."
     if [[ $auth == gpg ]]; then
         ov_as_user gpg --no-options --decrypt -- "$key" |
-            ov_vault_tomb --unsafe setkey cleartext "$(ov_vault_field "$record" file)" -k "$new_key" || rc=$?
+            ov_vault_tomb --unsafe setkey cleartext "$OV_VAULT_CONTAINER_ALIAS" -k "$new_material" || rc=$?
     else
         [[ -n $OV_VAULT_OLD_PASSWORD ]] || ov_fail password_required "Provide the current key passphrase."
         new_password=$OV_VAULT_PASSWORD; OV_VAULT_PASSWORD=$OV_VAULT_OLD_PASSWORD
         ov_vault_plain_key "$record"; OV_VAULT_PASSWORD=$new_password
         OV_OLD_KEY_PATH=$OV_VAULT_MATERIALIZED_KEY; export OV_OLD_KEY_PATH
-        ov_vault_tomb setkey "$OV_VAULT_MATERIALIZED_KEY" "$(ov_vault_field "$record" file)" -k "$new_key" || rc=$?
+        ov_vault_tomb setkey "$OV_VAULT_MATERIALIZED_KEY" "$OV_VAULT_CONTAINER_ALIAS" -k "$new_material" || rc=$?
     fi
     ((rc==0)) || ov_fail key_failed "Tomb could not replace the key. The saved configuration has not changed."
+    ov_vault_unpin "$record" || ov_fail cleanup_failed "The key changed but its temporary container reference remains attached."
     record=$(jq --arg key "$new_key" --arg time "$(ov_now)" '.key_file=$key | .auth="key" | .recipient="" | .cipher_file="" | .updated_at=$time' <<< "$record")
     ov_save vaults "$(ov_vault_field "$record" id)" "$record"
     ov_ok "$record"
@@ -791,13 +893,14 @@ ov_vault_dispatch() {
                 vault.open) ov_vault_password; ov_vault_open_record "$record"; ov_ok "$(ov_vault_status "$OV_RECORD")" ;;
                 vault.close) ov_vault_close_record "$record" "$(ov_param force false)"; ov_ok "$(ov_vault_status "$OV_RECORD")" ;;
                 vault.remove)
-                    ! ov_vault_attached "$record" || ov_fail busy "Close this vault before unregistering it."
+                    ov_vault_require_closed "$record"
                     [[ $(ov_migration_list "$id" | jq '[.[]|select(.stage!="complete" and .stage!="rolled_back")]|length') == 0 ]] || ov_fail recovery_needed "Complete or recover pending migrations first."
                     rm -f -- "$OV_ROOT/vaults/$id.json"; ov_ok '{"removed":true,"files_preserved":true}' ;;
                 vault.resize)
-                    ! ov_vault_attached "$record" || ov_fail busy "Close this vault before resizing it."
+                    ov_vault_require_closed "$record"
                     size=$(ov_vault_mib "$(ov_require size_gb)"); ov_vault_password
                     ov_vault_tomb_keyed "$record" resize "$(ov_vault_field "$record" file)" -s "$size" || ov_fail resize_failed "Tomb could not resize the vault."
+                    ov_vault_unpin "$record" || ov_fail cleanup_failed "The vault was resized but its temporary container reference remains attached."
                     record=$(jq --arg size "$(ov_param size_gb)" --arg time "$(ov_now)" '.size_gb=$size | .updated_at=$time' <<< "$record")
                     ov_save vaults "$id" "$record"; ov_ok "$(ov_vault_status "$record")" ;;
                 vault.passwd) ov_vault_change_password "$record" ;;
