@@ -1,0 +1,29 @@
+#!/bin/bash -p
+# SPDX-License-Identifier: Apache-2.0
+set -Eeuo pipefail
+umask 077
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C.UTF-8
+unset BASH_ENV ENV CDPATH GLOBIGNORE OV_SECRET_FD
+cd /
+readonly OV_LIB=/usr/lib/octovault
+source "$OV_LIB/common.sh"
+trap 'ov_secret_close' EXIT
+trap 'ov_fail operation_failed "The operation could not complete. Existing recovery material has been retained."' ERR
+ov_init "${1-}"
+request=$(head -c 1048577)
+((${#request} <= 1048576)) || ov_fail request_too_large 'Request exceeds the supported size.'
+jq -e 'type=="object" and (.op|type=="string") and ((.params // {})|type=="object")' <<<"$request" >/dev/null || ov_fail invalid_request 'Invalid operation request.'
+OV_OP=$(jq -r .op <<<"$request")
+OV_PARAMS=$(jq -c '.params // {}' <<<"$request")
+unset request
+source "$OV_LIB/vault.sh"
+source "$OV_LIB/backup.sh"
+source "$OV_LIB/events.sh"
+case "$OV_OP" in
+    vault.*|migration.*) ov_vault_dispatch ;;
+    destination.*|repository.*|backup.*) ov_backup_dispatch ;;
+    event.*|schedule.*) ov_event_dispatch ;;
+    system.info)
+        ov_ok "$(jq -cn --arg version '1.0.0' --arg owner "$OV_USER" --arg tomb "$(tomb --version 2>/dev/null | head -n1 || true)" --arg restic "$(restic version 2>/dev/null || true)" '{version:$version,owner:$owner,tomb:$tomb,restic:$restic}')" ;;
+    *) ov_fail unsupported_operation 'This operation is not supported.' ;;
+esac
