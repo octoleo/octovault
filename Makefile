@@ -62,6 +62,8 @@ install: all
 	install -m 0755 lib/octovault/backend $(DESTDIR)$(PREFIX)/libexec/octovault/backend
 	install -m 0755 lib/octovault/run-plan lib/octovault/event-system lib/octovault/priority-backend $(DESTDIR)$(PREFIX)/libexec/octovault/
 	install -m 0644 lib/octovault/*.sh $(DESTDIR)$(PREFIX)/lib/octovault/
+	install -d $(DESTDIR)$(PREFIX)/share/octovault/cloak-ciphers
+	install -m 0644 data/cloak-ciphers/words $(DESTDIR)$(PREFIX)/share/octovault/cloak-ciphers/
 	install -d $(DESTDIR)$(PREFIX)/share/applications $(DESTDIR)$(PREFIX)/share/metainfo
 	install -m 0644 data/io.vdm.OctoVault.desktop $(DESTDIR)$(PREFIX)/share/applications/
 	install -m 0644 data/io.vdm.OctoVault.metainfo.xml $(DESTDIR)$(PREFIX)/share/metainfo/

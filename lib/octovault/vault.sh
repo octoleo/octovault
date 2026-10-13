@@ -24,6 +24,43 @@ ov_vault_alias() {
     printf '/run/octovault/containers/%s/%s/vault.tomb\n' "$OV_UID" "$id"
 }
 
+# The kernel filesystem is mounted only beneath a root-owned directory. User
+# paths receive a bind exposure after their directory inode has been pinned.
+ov_vault_engine_mount() {
+    local id
+    id=$(ov_vault_field "$1" id); ov_id "$id"
+    printf '/run/octovault/mounts/%s/%s\n' "$OV_UID" "$id"
+}
+
+ov_vault_active_mount() {
+    local engine
+    if [[ -n $(ov_vault_field "$1" id) ]]; then
+        engine=$(ov_vault_engine_mount "$1")
+        if findmnt -rn --mountpoint "$engine" >/dev/null 2>&1; then printf '%s\n' "$engine"; return; fi
+    fi
+    ov_vault_field "$1" mountpoint
+}
+
+ov_vault_expose() {
+    local record=$1 mountpoint engine descriptor resolved rc=0
+    mountpoint=$(ov_vault_field "$record" mountpoint); engine=$(ov_vault_engine_mount "$record")
+    exec {descriptor}< "$mountpoint" || return 1
+    resolved=$(readlink -f -- "/proc/self/fd/$descriptor") || { exec {descriptor}<&-; return 1; }
+    if [[ ! -d /proc/self/fd/$descriptor || $resolved != "$mountpoint" ||
+          $(stat -Lc %u -- "/proc/self/fd/$descriptor") != "$OV_UID" ]]; then
+        exec {descriptor}<&-; return 1
+    fi
+    # The directory must still be empty immediately before the bind. Content
+    # written underneath later remains independent and is never reconciled.
+    if [[ -n $(find "/proc/self/fd/$descriptor/" -mindepth 1 -maxdepth 1 -print -quit) ]]; then
+        exec {descriptor}<&-; return 1
+    fi
+    mount --no-canonicalize --bind "$engine" "/proc/self/fd/$descriptor" >&2 || rc=$?
+    exec {descriptor}<&-
+    ((rc==0)) || return "$rc"
+    [[ $(stat -Lc '%d:%i' -- "$mountpoint") == $(stat -Lc '%d:%i' -- "$engine") ]]
+}
+
 ov_vault_backing() {
     local alias
     # Tests and legacy imported objects without an id use their original file.
@@ -121,6 +158,13 @@ ov_vault_image_embed() {
     return "$rc"
 }
 
+ov_vault_text_embed() {
+    local key=$1 cipher=$2 output=$3
+    ov_vault_temporary
+    ov_as_user cat -- "$cipher" > "$OV_VAULT_TEMP_DIR/cloak-cipher" || return 1
+    /usr/libexec/tomb/cloakify -i "$key" -c "$OV_VAULT_TEMP_DIR/cloak-cipher" > "$output"
+}
+
 ov_vault_plain_key() {
     local record=$1 auth key
     auth=$(ov_vault_field "$record" auth); key=$(ov_vault_field "$record" key_file)
@@ -208,7 +252,7 @@ ov_vault_require_closed() {
 ov_vault_is_open() {
     local record=$1 file mountpoint source device loops loop
     file=$(ov_vault_backing "$record")
-    mountpoint=$(ov_vault_field "$record" mountpoint)
+    mountpoint=$(ov_vault_active_mount "$record")
     [[ -n $mountpoint && -n $file ]] || return 1
     source=$(findmnt -rn --mountpoint "$mountpoint" --output SOURCE 2>/dev/null) || return 1
     source=${source%%\[*}
@@ -226,9 +270,17 @@ ov_vault_is_open() {
 
 # Tomb accepts a mapper-hash selector. Selecting only a basename could close
 # another vault with the same filename on a different device or account.
+ov_vault_is_exposed() {
+    local record=$1 user_mount engine
+    ov_vault_is_open "$record" || return 1
+    user_mount=$(ov_vault_field "$record" mountpoint); engine=$(ov_vault_active_mount "$record")
+    findmnt -rn --mountpoint "$user_mount" >/dev/null 2>&1 || return 1
+    [[ $(stat -Lc '%d:%i' -- "$user_mount") == $(stat -Lc '%d:%i' -- "$engine") ]]
+}
+
 ov_vault_selector() {
     local source selector
-    source=$(findmnt -rn --mountpoint "$(ov_vault_field "$1" mountpoint)" --output SOURCE) || return 1
+    source=$(findmnt -rn --mountpoint "$(ov_vault_active_mount "$1")" --output SOURCE) || return 1
     source=${source%%\[*}; selector=${source%.*}; selector=${selector##*.}
     [[ $selector =~ ^[a-fA-F0-9]{64}$ ]] || return 1
     printf '%s\n' "$selector"
@@ -236,7 +288,7 @@ ov_vault_selector() {
 
 ov_vault_unbind() {
     local record=$1 mountpoint mapper mounts target
-    mountpoint=$(ov_vault_field "$record" mountpoint)
+    mountpoint=$(ov_vault_active_mount "$record")
     mapper=$(findmnt -rn --mountpoint "$mountpoint" --output SOURCE) || return 1
     mapper=${mapper%%\[*}
     mounts=$(findmnt --json --list --source "$mapper" --output TARGET) || return 1
@@ -248,7 +300,7 @@ ov_vault_unbind() {
 
 ov_vault_status() {
     local record=$1 status=closed usage='null' mountpoint
-    mountpoint=$(ov_vault_field "$record" mountpoint)
+    mountpoint=$(ov_vault_active_mount "$record")
     if ov_vault_is_open "$record"; then
         status=open
         usage=$(df -B1 --output=size,used,avail,pcent -- "$mountpoint" 2>/dev/null | tail -n 1 |
@@ -292,16 +344,41 @@ ov_vault_validate_record() {
 # The immutable pinentry adapter reads a seekable inherited FD, never argv.
 ov_vault_tomb() {
     local password=${OV_VAULT_PASSWORD:-} rc=0 backend
-    local -a command=(/usr/bin/tomb --no-color)
-    # Released Tomb exposes `source` but does not accept -n for close/slam.
-    # Use its own close implementation with its existing no-hooks option set.
-    # Only these fixed function names execute; caller data remains arguments.
-    if [[ ${1:-} == close || ${1:-} == slam ]]; then
-        local action=$1 selector=${2:-}
-        SUDO_USER="$OV_USER" SUDO_UID="$OV_UID" SUDO_GID="$(id -g "$OV_USER")" HOME="$OV_HOME" \
-            /usr/bin/zsh -f -c 'source /usr/bin/tomb source || exit; OPTS[--no-color]=1; OPTS[-n]=1; [[ $1 == slam ]] && SLAM=1; umount_tomb "$2"' octovault "$action" "$selector" >&2
-        return
-    fi
+    ov_vault_temporary
+    install -d -m 0700 "$OV_VAULT_TEMP_DIR/gnupg"
+    # Tomb remains the encryption and mount engine. Its sourced interface
+    # lets us disable root metadata writes that otherwise follow symlinks
+    # inside imported filesystems. OctoVault records lifecycle metadata itself.
+    # shellcheck disable=SC2016 # This fixed script is parsed by zsh, not Bash.
+    local -a command=(/usr/bin/zsh -f -c '
+        source /usr/bin/tomb source || exit
+        TMPDIR=$OV_TOMB_TMP
+        _get_home() { print -r -- "$OV_TOMB_TMP"; }
+        _track_stat() { return 0; }
+        _restore_stat() { return 0; }
+        _update_control_file() { return 0; }
+        touch() {
+            [[ -n "$OV_TOMB_ENGINE" && "${@[-1]}" == "$OV_TOMB_ENGINE/.cleanexit" ]] && return 0
+            command touch "$@"
+        }
+        cat() {
+            local control_path
+            for control_path in "$@"; do
+                case "$control_path" in
+                    "$OV_TOMB_ENGINE/.last"|"$OV_TOMB_ENGINE/.uid"|"$OV_TOMB_ENGINE/.host"|"$OV_TOMB_ENGINE/.tty")
+                        return 1 ;;
+                esac
+            done
+            command cat "$@"
+        }
+        if [[ $1 == close || $1 == slam ]]; then
+            OPTS[--no-color]=1; OPTS[-n]=1
+            [[ $1 == slam ]] && SLAM=1
+            umount_tomb "$2"
+        else
+            main --no-color "$@"
+        fi
+    ' octovault)
     if [[ -n $password ]]; then
         [[ -x /usr/bin/pinentry-octovault ]] || ov_fail missing_dependency "OctoVault's secure passphrase adapter is missing."
         ov_vault_temporary
@@ -313,12 +390,12 @@ ov_vault_tomb() {
         done
         ov_secret_fd "$password"
         if [[ -n ${OV_VAULT_OLD_PASSWORD:-} ]]; then ov_old_secret_fd "$OV_VAULT_OLD_PASSWORD"; fi
-        PATH="$OV_VAULT_TEMP_DIR/pinentry:/usr/sbin:/usr/bin:/sbin:/bin" DISPLAY='' WAYLAND_DISPLAY='' OV_PINENTRY_RAW=1 SUDO_USER="$OV_USER" SUDO_UID="$OV_UID" SUDO_GID="$(id -g "$OV_USER")" \
+        OV_TOMB_TMP="$OV_VAULT_TEMP_DIR" GNUPGHOME="$OV_VAULT_TEMP_DIR/gnupg" OV_TOMB_ENGINE="${OV_VAULT_ENGINE_MOUNT:-}" PATH="$OV_VAULT_TEMP_DIR/pinentry:/usr/sbin:/usr/bin:/sbin:/bin" DISPLAY='' WAYLAND_DISPLAY='' OV_PINENTRY_RAW=1 SUDO_USER="$OV_USER" SUDO_UID="$OV_UID" SUDO_GID="$(id -g "$OV_USER")" \
             HOME="$OV_HOME" "${command[@]}" "$@" >&2 || rc=$?
         ov_secret_close
         return "$rc"
     fi
-    SUDO_USER="$OV_USER" SUDO_UID="$OV_UID" SUDO_GID="$(id -g "$OV_USER")" HOME="$OV_HOME" \
+    OV_TOMB_TMP="$OV_VAULT_TEMP_DIR" GNUPGHOME="$OV_VAULT_TEMP_DIR/gnupg" OV_TOMB_ENGINE="${OV_VAULT_ENGINE_MOUNT:-}" SUDO_USER="$OV_USER" SUDO_UID="$OV_UID" SUDO_GID="$(id -g "$OV_USER")" HOME="$OV_HOME" \
         "${command[@]}" "$@" >&2
 }
 
@@ -440,7 +517,7 @@ ov_vault_bind_hooks() {
 }
 
 ov_vault_open_record() {
-    local record=$1 id mountpoint
+    local record=$1 id mountpoint engine
     id=$(ov_vault_field "$record" id)
     mountpoint=$(ov_vault_field "$record" mountpoint)
     ov_vault_is_open "$record" && return 0
@@ -449,10 +526,23 @@ ov_vault_open_record() {
     findmnt -rn --mountpoint "$mountpoint" >/dev/null 2>&1 && ov_fail occupied "The vault mountpoint is already in use."
     [[ -z $(find "$mountpoint" -mindepth 1 -maxdepth 1 -print -quit) ]] ||
         ov_fail occupied "The vault mountpoint must be empty."
+    engine=$(ov_vault_engine_mount "$record")
+    OV_VAULT_ENGINE_MOUNT=$engine
+    install -d -m 0700 /run/octovault/mounts "/run/octovault/mounts/$OV_UID" "$engine"
     ov_progress unlock "Unlocking the vault" 20
-    ov_vault_tomb_keyed "$record" open "$(ov_vault_field "$record" file)" "$mountpoint" -n -p ||
+    ov_vault_tomb_keyed "$record" open "$(ov_vault_field "$record" file)" "$engine" -n -p ||
         ov_fail unlock_failed "Tomb could not unlock the vault. Check the key and passphrase."
     ov_vault_is_open "$record" || ov_fail verification_failed "The unlocked device could not be verified."
+    if [[ $(ov_vault_field "$record" created_by_octovault) == true && -z $(ov_vault_field "$record" last_opened_at) ]]; then
+        # Newly formatted ext4 starts root-owned. Preserve all content ownership
+        # and initialize only this new filesystem's top-level directory.
+        chown --no-dereference "$OV_UID:$(id -g "$OV_USER")" -- "$engine" || ov_fail permission_denied "Could not initialize the vault directory owner."
+    fi
+    if ! ov_vault_expose "$record"; then
+        ov_vault_unbind "$record" || true
+        ov_vault_tomb close "$(ov_vault_selector "$record")" || true
+        ov_fail mapping_failed "The user mountpoint changed or could not be safely exposed."
+    fi
     if ! ov_vault_bind_hooks "$record"; then
         ov_vault_unbind "$record" || true
         ov_vault_tomb close "$(ov_vault_selector "$record")" -n || true
@@ -470,6 +560,7 @@ ov_vault_open_record() {
 ov_vault_close_record() {
     local record=$1 force=${2:-false} id name
     id=$(ov_vault_field "$record" id)
+    OV_VAULT_ENGINE_MOUNT=$(ov_vault_active_mount "$record")
     if ! ov_vault_is_open "$record"; then
         ov_vault_require_closed "$record"
         return 0
@@ -490,6 +581,7 @@ ov_vault_close_record() {
     fi
     ov_vault_require_closed "$record"
     ov_vault_unpin "$record" || ov_fail cleanup_failed "The vault is closed, but its temporary container reference could not be detached."
+    rmdir -- "$(ov_vault_engine_mount "$record")" 2>/dev/null || true
     record=$(jq --arg time "$(ov_now)" '.last_closed_at=$time | .updated_at=$time' <<< "$record")
     ov_save vaults "$id" "$record"
     OV_RECORD=$record
@@ -509,13 +601,14 @@ ov_vault_new_record() {
     ov_vault_clean_path "$mountpoint" >/dev/null
     ov_as_user mkdir -p -m 0700 -- "$mountpoint" || ov_fail permission_denied "Could not create the vault mountpoint."
     mountpoint=$(ov_vault_user_path "$mountpoint")
-    [[ $mountpoint != *' '* ]] || ov_fail invalid_mount "Choose a mountpoint without spaces; mapped user locations may contain spaces."
+    [[ $mountpoint != *' '* && $mountpoint != *';'* && $mountpoint != *'['* && $mountpoint != *']'* ]] ||
+        ov_fail invalid_mount "Choose a mountpoint without spaces, semicolons or brackets; mapped user locations may contain spaces."
     [[ -d $mountpoint && $(stat -c %u -- "$mountpoint") == "$OV_UID" ]] || ov_fail invalid_mount "The mountpoint must be a directory owned by your account."
     [[ $file != "$key" && $file != "$mountpoint" && $key != "$mountpoint" ]] || ov_fail invalid_path "Container, key and mountpoint must be separate paths."
     OV_RECORD=$(jq --arg id "$id" --arg name "$name" --arg file "$file" --arg key "$key" --arg mount "$mountpoint" \
         --arg auth "$auth" --arg time "$(ov_now)" \
         '. as $p | {schema_version:1,id:$id,name:$name,file:$file,key_file:$key,mountpoint:$mount,auth:$auth,
-        recipient:($p.recipient//""),cipher_file:(if ($p.cipher_file//"")=="" then "/usr/share/doc/tomb/examples/cloak-ciphers/amphibians" else $p.cipher_file end),size_gb:($p.size_gb//null),
+        recipient:($p.recipient//""),cipher_file:(if ($p.cipher_file//"")=="" then "/usr/share/octovault/cloak-ciphers/words" else $p.cipher_file end),size_gb:($p.size_gb//null),
         open_on:($p.open_on//"login"),drive_uuid:($p.drive_uuid//""),close_on:($p.close_on//["shutdown"]),
         force_close:($p.force_close//false),trust_native_hooks:($p.trust_native_hooks//false),hooks:($p.hooks//{}),created_at:$time,updated_at:$time}' <<< "$OV_PARAMS")
     ov_vault_validate_record "$OV_RECORD"
@@ -525,7 +618,7 @@ ov_vault_create() {
     local id record file key auth size tempkey rootkey
     id=$(ov_new_id)
     ov_vault_new_record "$id"
-    record=$OV_RECORD
+    record=$(jq '.created_by_octovault=true' <<< "$OV_RECORD")
     file=$(ov_vault_field "$record" file); key=$(ov_vault_field "$record" key_file)
     auth=$(ov_vault_field "$record" auth); size=$(ov_vault_mib "$(ov_require size_gb)")
     [[ ! -e $file && ! -L $file ]] || ov_fail exists "A file already exists at the selected container path."
@@ -564,7 +657,7 @@ ov_vault_create() {
         ov_vault_publish "$OV_VAULT_TEMP_DIR/export.jpg" "$key" true || ov_fail key_failed "The image could not be saved; the ordinary encrypted key was retained."
         ov_as_user rm -f -- "$tempkey"
     elif [[ $auth == text ]]; then
-        tomb --no-color cloak "$(ov_vault_field "$record" cipher_file)" "$OV_VAULT_TEMP_DIR/export.txt" -k "$rootkey" >&2 ||
+        ov_vault_text_embed "$rootkey" "$(ov_vault_field "$record" cipher_file)" "$OV_VAULT_TEMP_DIR/export.txt" ||
             ov_fail key_failed "Text key export failed; the ordinary encrypted key was retained."
         ov_vault_publish "$OV_VAULT_TEMP_DIR/export.txt" "$key" || ov_fail key_failed "The text key could not be saved; the ordinary encrypted key was retained."
         ov_as_user rm -f -- "$tempkey"
@@ -629,7 +722,7 @@ ov_vault_change_password() {
             ov_vault_publish "$OV_VAULT_TEMP_DIR/rewrapped.jpg" "$key" true || ov_fail key_failed "Could not save the replacement image."
             ;;
         text)
-            tomb --no-color cloak "$(ov_vault_field "$record" cipher_file)" "$OV_VAULT_TEMP_DIR/rewrapped.txt" -k "$OV_VAULT_MATERIALIZED_KEY" >&2 ||
+            ov_vault_text_embed "$OV_VAULT_MATERIALIZED_KEY" "$(ov_vault_field "$record" cipher_file)" "$OV_VAULT_TEMP_DIR/rewrapped.txt" ||
                 ov_fail key_failed "Could not update the text carrier; the original remains unchanged."
             ov_vault_publish "$OV_VAULT_TEMP_DIR/rewrapped.txt" "$key" true || ov_fail key_failed "Could not save the replacement text."
             ;;
@@ -682,7 +775,7 @@ ov_vault_export_key() {
             ;;
         text)
             cipher=$(ov_vault_user_path "$(ov_require cipher_file)")
-            tomb --no-color cloak "$cipher" "$OV_VAULT_TEMP_DIR/export.txt" -k "$key" >&2 || ov_fail export_failed "Could not cloak the key; check installed Tomb extras."
+            ov_vault_text_embed "$key" "$cipher" "$OV_VAULT_TEMP_DIR/export.txt" || ov_fail export_failed "Could not cloak the key; check installed Tomb extras."
             ov_vault_publish "$OV_VAULT_TEMP_DIR/export.txt" "$output" || ov_fail export_failed "Could not save the cloaked key."
             ;;
         qr)
@@ -693,6 +786,29 @@ ov_vault_export_key() {
         *) ov_fail invalid_format "Choose key, image, text or qr." ;;
     esac
     ov_ok "$(jq -n --arg output "$output" '{output:$output}')"
+}
+
+ov_vault_index_or_search() {
+    local record=$1 action=$2 query=${3:-} mountpoint mapper inventory
+    ov_vault_is_exposed "$record" || ov_fail locked "Open the vault before indexing or searching."
+    mountpoint=$(ov_vault_field "$record" mountpoint)
+    mapper=$(findmnt -rn --mountpoint "$mountpoint" --output SOURCE); mapper=${mapper%%\[*}
+    inventory="$mapper;$mountpoint;ext4;(rw);[OctoVault]"
+    # Tomb's native index/search functions consume a mount inventory. Scope
+    # that inventory to this verified vault and its accessible user exposure.
+    # All actual indexing and searching still use packaged Tomb's functions.
+    # shellcheck disable=SC2016
+    ov_as_user /usr/bin/zsh -f -c '
+        source /usr/bin/tomb source || exit
+        OCTOVAULT_INVENTORY=$1
+        list_tomb_mounts() { print -r -- "$OCTOVAULT_INVENTORY"; }
+        OPTS[--no-color]=1
+        case "$2" in
+            index) index_tombs ;;
+            search) search_tombs "$3" ;;
+            *) exit 2 ;;
+        esac
+    ' octovault "$inventory" "$action" "$query"
 }
 
 # Staging is adjacent to the original so renaming is atomic and works across
@@ -908,11 +1024,11 @@ ov_vault_dispatch() {
                 vault.key-export) ov_vault_export_key "$record" ;;
                 vault.index)
                     ov_vault_is_open "$record" || ov_fail locked "Open the vault before indexing."
-                    ov_as_user tomb --no-color index "$(ov_vault_selector "$record")" >&2 || ov_fail index_failed "Tomb indexing failed."
+                    ov_vault_index_or_search "$record" index >&2 || ov_fail index_failed "Tomb indexing failed."
                     ov_ok '{"indexed":true}' ;;
                 vault.search)
                     ov_vault_is_open "$record" || ov_fail locked "Open the vault before searching."
-                    result=$(ov_as_user tomb --no-color search "$(ov_require query)" 2>/dev/null) || ov_fail search_failed "Tomb could not search its indexes."
+                    result=$(ov_vault_index_or_search "$record" search "$(ov_require query)" 2>/dev/null) || ov_fail search_failed "Tomb could not search its indexes."
                     ov_ok "$(jq -n --arg results "$result" '{results:$results}')" ;;
                 migration.list) ov_ok "$(ov_migration_list "$id")" ;;
                 *) ov_fail unknown_operation "Unknown vault operation." ;;

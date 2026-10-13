@@ -19,10 +19,19 @@ esac
 jq -cn --argjson request "$request" --arg uid "$1" '{ok:true,data:{uid:$uid,request:$request}}'
 BACKEND
 chmod 755 "$work/backend"
+cat > "$work/priority-backend" <<'PRIORITY'
+#!/usr/bin/env bash
+set -euo pipefail
+work=$(dirname -- "$0")
+printf '%s\n' "$1" > "$work/priority-called"
+exec "$work/backend" "$@"
+PRIORITY
+chmod 755 "$work/priority-backend"
 # Test-only binary: private bus and compile-time authorization bypass. Never installed.
 read -r -a cflags <<<"$(pkg-config --cflags gio-2.0 gio-unix-2.0 json-glib-1.0)"
 read -r -a libs <<<"$(pkg-config --libs gio-2.0 gio-unix-2.0 json-glib-1.0)"
 cc -std=c11 -Wall -Wextra -Werror -DOCTOVAULT_TEST "-DOV_BACKEND_PATH=\"$work/backend\"" \
+    "-DOV_PRIORITY_BACKEND_PATH=\"$work/priority-backend\"" \
     -Isrc/service "${cflags[@]}" src/service/daemon.c src/service/client.c -o "$work/daemon" "${libs[@]}"
 cc -std=c11 -Wall -Wextra -Werror -DOCTOVAULT_TEST -Isrc/service "${cflags[@]}" \
     src/service/cli.c src/service/client.c -o "$work/cli" "${libs[@]}"
@@ -59,10 +68,12 @@ for _ in {1..40}; do
     sleep .1
 done
 jq -e '.state == "cancelled" and .result.error.code == "CANCELLED"' <<<"$result" >/dev/null
+[[ ! -e $work/priority-called ]]
 # A security close takes priority and stops a running upload before it waits for the owner lock.
 reply=$(gdbus call --session --dest io.vdm.OctoVault1 --object-path /io/vdm/OctoVault1 --method io.vdm.OctoVault1.Submit '{"op":"backup.run","params":{}}')
 id=$(sed -n "s/^('\([^']*\)',)$/\1/p" <<<"$reply")
-timeout 10 "$work/cli" --json vault close --id x | jq -e .ok >/dev/null
+timeout 10 "$work/cli" --json vault close --id x | jq -e '.ok and .data.request.op == "vault.close"' >/dev/null
+[[ $(cat "$work/priority-called") == "$(id -u)" ]]
 "$work/cli" --json job get "$id" | jq -e '.state == "cancelled"' >/dev/null
 # Complete results do not consume the active-job allowance; repeated dashboard refresh works.
 for _ in {1..20}; do "$work/cli" --json vault list | jq -e .ok >/dev/null; done

@@ -20,6 +20,7 @@ mkdir -p "$OV_ROOT" "$OV_HOME" "$TEST_ROOT/storage" "$TEST_ROOT/source dir"
 ov_credential_set() { ov_id "$1"; mkdir -p "$OV_ROOT/credentials"; printf '%s' "$2" >"$OV_ROOT/credentials/$1"; }
 ov_credential_get() { ov_id "$1"; cat "$OV_ROOT/credentials/$1"; }
 ov_vault_is_open() { [[ ${TEST_VAULT_STATE:-closed} == open ]]; }
+ov_vault_is_exposed() { [[ ${TEST_VAULT_EXPOSED:-true} == true ]]; }
 ov_vault_attached() { case ${TEST_VAULT_STATE:-closed} in open) return 0;; closed) return 1;; *) return 2;; esac; }
 ov_schedule_sync() { :; }
 ov_resource_lock() { :; }
@@ -133,6 +134,9 @@ linked=$(request backup.save "$(jq -n --arg rid "$repository_id" --arg source "$
 linked_id=$(jq -r .data.id <<<"$linked")
 expect_error vault_closed backup.run "{\"id\":\"$linked_id\"}"
 TEST_VAULT_STATE=open
+TEST_VAULT_EXPOSED=false
+expect_error vault_not_exposed backup.run "{\"id\":\"$linked_id\"}"
+TEST_VAULT_EXPOSED=true
 findmnt() { if [[ " $* " == *' --mountpoint '* ]]; then printf '253:1\n'; else printf '8:1\n'; fi; }
 expect_error source_not_in_vault backup.run "{\"id\":\"$linked_id\"}"
 unset -f findmnt
@@ -182,4 +186,28 @@ sftp() {
 }
 assert_json "$(request destination.test "{\"id\":\"$ssh_id\"}")" '.ok and .data.reachable'
 unset -f sftp ssh-keyscan
+
+printf 'Testing shared vault-event and backup EXIT cleanup...\n'
+(
+    # Exercise the real vault cleanup and unpin logic without requiring mounts.
+    # The fake attached loop must keep its alias available for a future close.
+    source "$PROJECT_ROOT/lib/octovault/vault.sh"
+    OV_VAULT_TEMP_DIR="$TEST_ROOT/vault-runtime"
+    # shellcheck disable=SC2034 # Consumed by the dynamically sourced vault cleanup.
+    OV_VAULT_PIN_RECORD='{"id":"event-vault"}'
+    mkdir -m 0700 "$OV_VAULT_TEMP_DIR"
+    printf 'disposable runtime key' >"$OV_VAULT_TEMP_DIR/key"
+    printf 'pinned container' >"$TEST_ROOT/pinned-container"
+    ov_vault_alias() { printf '%s\n' "$TEST_ROOT/pinned-container"; }
+    losetup() { printf '/dev/loop-test\n'; }
+    umount() { printf 'Attached vault alias was unexpectedly unmounted.\n' >&2; return 99; }
+    unset OV_BACKUP_TMP
+    ov_backup_workspace
+    printf '%s' "$OV_BACKUP_TMP" >"$TEST_ROOT/backup-runtime-path"
+    printf 'disposable backup password' >"$OV_BACKUP_TMP/password"
+    # The workspace EXIT trap must clean both adapters without losing the alias.
+)
+[[ ! -e $TEST_ROOT/vault-runtime ]]
+[[ ! -e $(cat "$TEST_ROOT/backup-runtime-path") ]]
+[[ -f $TEST_ROOT/pinned-container ]]
 printf 'All backup integration tests passed.\n'

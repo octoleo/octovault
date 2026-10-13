@@ -101,8 +101,13 @@ jobs:
           install -d /usr/libexec/octovault
           install -m 0755 build/pinentry-octovault /usr/bin/pinentry-octovault
           install -m 0755 build/steghide /usr/libexec/octovault/steghide
+          install -d /usr/share/octovault/cloak-ciphers
+          install -m 0644 data/cloak-ciphers/words /usr/share/octovault/cloak-ciphers/words
       - name: Exercise vault creation, actual mounts, migration, and closure
         run: |
+          # Hosted runners have swap enabled; remove it only in this disposable
+          # privileged test VM. The application retains Tomb's swap safeguard.
+          swapoff -a
           modprobe dm_mod
           modprobe loop
           install -d /dev/mapper
