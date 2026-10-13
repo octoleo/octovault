@@ -381,7 +381,7 @@ static void result_window(App *app,const char *title,JsonNode *node,gboolean rev
   if(reveal){
     Recovery *r=g_new0(Recovery,1);r->window=w;r->acknowledge=acknowledge;
     GString *s=g_string_new("OctoVault repository recovery\nKeep this record in a secure password manager outside this computer.\n\n");recovery_flatten(s,NULL,node);
-    g_string_append(s,"\nUse the repository address and repository password with Restic on a replacement computer. Restore any required SSH key, verify the server host fingerprint, or configure the S3 access credentials before connecting.\n");
+    g_string_append(s,"\nUse the saved repository connection and password to recover your backup on a replacement computer. Restore any required SSH key, verify the server host fingerprint, or configure the S3 access credentials before connecting.\n");
     r->text=g_string_free(s,FALSE);g_object_set_data_full(G_OBJECT(w),"recovery",r,recovery_free);
     append_text(content,"Save this complete recovery record in your password manager. OctoVault stores its credentials encrypted. A machine-bound credential file cannot recover your backup on another computer.",NULL);
     GtkWidget *toggle=gtk_toggle_button_new_with_mnemonic("_Reveal recovery information");r->toggle=toggle;gtk_box_append(content,toggle);
@@ -406,7 +406,7 @@ static const Spec vault_fields[]={
  S("password","Key _passphrase","password",NULL,"Required for a password-protected key. It is sent only to the authorized service and never saved.",FALSE),
  S("_confirm_password","_Confirm key passphrase","password",NULL,NULL,FALSE),
  S("recipient","OpenPGP _recipient","text",NULL,"Full fingerprint of an existing encryption-capable OpenPGP recipient.",FALSE),
- S("cipher_file","Text cipher _file","file",NULL,"Leave blank to use the included default cipher. For an existing text key, choose the cipher originally used.",FALSE),
+ S("cipher_file","Text cipher _file","file",NULL,"Leave blank to use OctoVault's included word-list cipher. Keep the same word list with your recovery material. For an existing text key, choose its original cipher.",FALSE),
  S("mountpoint","_Mount location","folder",NULL,"An empty, dedicated directory. Leave blank for the managed default.",FALSE),
  S("open_on","_Unlock automatically","choice","login|manual|drive|token",NULL,FALSE),S("drive_uuid","Key drive _UUID","text",NULL,"Used for drive-triggered unlocking.",FALSE),
  S("close_on","_Lock automatically","flags","screen-lock|logout|sleep|shutdown",NULL,FALSE),
@@ -416,7 +416,7 @@ static const Spec vault_settings[]={
  S("name","_Vault name","text",NULL,NULL,TRUE),
  S("auth","_Authentication","choice","key|gpg|image|text","Select the method used by the existing key or carrier below.",TRUE),
  S("key_file","_Key file or image/text carrier","file",NULL,"Select an existing compatible key. Use Replace key to change the vault's encryption key.",TRUE),
- S("recipient","OpenPGP _recipient","text",NULL,NULL,FALSE),S("cipher_file","Text cipher _file","file",NULL,NULL,FALSE),
+ S("recipient","OpenPGP _recipient","text",NULL,NULL,FALSE),S("cipher_file","Text cipher _file","file",NULL,"Leave blank to use OctoVault's included word-list cipher. Existing text keys need their original cipher.",FALSE),
  S("open_on","_Unlock automatically","choice","login|manual|drive|token",NULL,FALSE),
  S("drive_uuid","Key drive _UUID","text",NULL,NULL,FALSE),S("close_on","_Lock automatically","flags","screen-lock|logout|sleep|shutdown",NULL,FALSE),
  S("force_close","Allow force close of _busy applications","boolean",NULL,"Applications holding this vault open may be terminated.",FALSE),
@@ -429,7 +429,7 @@ static const Spec vault_close[]={S("force","_Force close busy applications","boo
 static const Spec vault_resize[]={S("size_gb","New size in _gigabytes","number","20","The vault must be closed. Shrinking is not supported.",TRUE),S("password","Key _passphrase","password",NULL,NULL,FALSE),END};
 static const Spec vault_passwd[]={S("old_password","_Current passphrase","password",NULL,NULL,TRUE),S("password","_New passphrase","password",NULL,NULL,TRUE),S("_confirm_password","_Confirm new passphrase","password",NULL,NULL,TRUE),END};
 static const Spec vault_setkey[]={S("new_key_file","_Replacement key file","file",NULL,NULL,TRUE),S("old_password","Current key _passphrase","password",NULL,NULL,FALSE),S("password","Replacement key p_assphrase","password",NULL,NULL,FALSE),END};
-static const Spec vault_export[]={S("format","_Export format","choice","key|image|text|qr",NULL,TRUE),S("output","_Output file","save",NULL,"For an image export, choose an existing JPEG carrier. Keep exported key material secure.",TRUE),S("cipher_file","Text cipher _file","file",NULL,"Leave blank to use the included default cipher.",FALSE),S("password","Key _passphrase","password",NULL,NULL,FALSE),END};
+static const Spec vault_export[]={S("format","_Export format","choice","key|image|text|qr",NULL,TRUE),S("output","_Output file","save",NULL,"For an image export, choose an existing JPEG carrier. Keep exported key material secure.",TRUE),S("cipher_file","Text cipher _file","file",NULL,"Leave blank to use OctoVault's included word-list cipher. Keep this word list with your recovery material.",FALSE),S("password","Key _passphrase","password",NULL,NULL,FALSE),END};
 static const Spec vault_search[]={S("query","_Search text","text",NULL,NULL,TRUE),END};
 static const Spec migration_add[]={S("source","_File or folder to protect","path",NULL,"The original is retained temporarily until the close/reopen comparison succeeds.",TRUE),S("relative","_Location inside vault","text",NULL,"Relative destination, for example Documents or browser/profile.",TRUE),S("password","Key _passphrase to reopen","password",NULL,NULL,FALSE),END};
 static const Spec migration_recover[]={S("migration_id","_Migration identifier","text",NULL,"Find this in Migration recovery records.",TRUE),S("action","_Recovery action","choice","resume|rollback",NULL,TRUE),S("password","Key _passphrase","password",NULL,NULL,FALSE),END};
@@ -587,6 +587,120 @@ static void choose_file(GtkButton *button,gpointer data){
   else gtk_file_dialog_open(dialog,parent,NULL,file_chosen,p);
   g_object_unref(dialog);
 }
+
+/* Public-key discovery is deliberately unprivileged and read-only. GnuPG's
+ * colon protocol is used rather than parsing translated terminal output. */
+typedef struct { char *fingerprint, *identity; } GpgKey;
+typedef struct {
+  GtkWidget *entry, *row;
+  GtkWindow *parent;
+  GSubprocess *process;
+  GCancellable *cancel;
+  guint timeout;
+  gboolean detect, timed_out;
+  char *card_fingerprint;
+} GpgLookup;
+static void gpg_key_free(gpointer data){GpgKey*k=data;g_free(k->fingerprint);g_free(k->identity);g_free(k);}
+static gboolean valid_fingerprint(const char *value){
+  gsize length=strlen(value);gboolean nonzero=FALSE;
+  if(length!=40&&length!=64)return FALSE;
+  for(gsize i=0;i<length;i++){if(!g_ascii_isxdigit(value[i]))return FALSE;if(value[i]!='0')nonzero=TRUE;}
+  return nonzero;
+}
+static char *card_encryption_fingerprint(const char *output){
+  char **lines=g_strsplit(output,"\n",-1),*fingerprint=NULL;
+  for(guint i=0;lines[i];i++)if(g_str_has_prefix(lines[i],"fpr:")){
+    char **parts=g_strsplit(lines[i],":",-1);
+    /* OpenPGP slots are signing, encryption, then authentication. */
+    if(g_strv_length(parts)>=4&&valid_fingerprint(parts[2]))fingerprint=g_ascii_strup(parts[2],-1);
+    g_strfreev(parts);break;
+  }
+  g_strfreev(lines);return fingerprint;
+}
+static GPtrArray *parse_encryption_keys(const char *output){
+  GPtrArray *keys=g_ptr_array_new_with_free_func(gpg_key_free);char **lines=g_strsplit(output,"\n",-1);
+  char *identity=g_strdup("OpenPGP encryption key");gboolean usable=FALSE,primary_usable=TRUE;GpgKey *pending_identity=NULL;
+  gint64 now=g_get_real_time()/G_USEC_PER_SEC;
+  for(guint i=0;lines[i];i++){
+    char **fields=g_strsplit(lines[i],":",-1);guint length=g_strv_length(fields);
+    if(length>11&&(!strcmp(fields[0],"pub")||!strcmp(fields[0],"sub"))){
+      gboolean primary=!strcmp(fields[0],"pub");
+      gboolean available=(!*fields[1]||!strchr("redi",fields[1][0]))&&!strchr(fields[11],'D');
+      gint64 expires=*fields[6]?g_ascii_strtoll(fields[6],NULL,10):0;
+      if(expires&&expires<=now)available=FALSE;
+      if(primary){primary_usable=available;g_free(identity);identity=g_strdup("OpenPGP encryption key");pending_identity=NULL;}
+      usable=available&&primary_usable&&(strchr(fields[11],'e')||strchr(fields[11],'E'));
+    }else if(length>9&&!strcmp(fields[0],"fpr")){
+      if(usable&&valid_fingerprint(fields[9])){
+        GpgKey*k=g_new0(GpgKey,1);k->fingerprint=g_ascii_strup(fields[9],-1);k->identity=g_strdup(identity);g_ptr_array_add(keys,k);pending_identity=k;
+      }
+      usable=FALSE;
+    }else if(length>9&&!strcmp(fields[0],"uid")&&(!*fields[1]||!strchr("red",fields[1][0]))){
+      g_free(identity);identity=g_utf8_make_valid(fields[9],-1);
+      if(pending_identity){g_free(pending_identity->identity);pending_identity->identity=g_strdup(identity);pending_identity=NULL;}
+    }
+    g_strfreev(fields);
+  }
+  g_strfreev(lines);g_free(identity);return keys;
+}
+static void gpg_lookup_free(GpgLookup *lookup){
+  if(lookup->timeout)g_source_remove(lookup->timeout);
+  gtk_widget_set_sensitive(lookup->row,TRUE);
+  g_clear_object(&lookup->process);g_clear_object(&lookup->cancel);g_object_unref(lookup->entry);g_object_unref(lookup->row);g_object_unref(lookup->parent);g_free(lookup->card_fingerprint);g_free(lookup);
+}
+static void gpg_message(GpgLookup *lookup,const char *message){
+  if(gtk_widget_get_visible(GTK_WIDGET(lookup->parent))){GtkAlertDialog*dialog=gtk_alert_dialog_new("%s",message);gtk_alert_dialog_show(dialog,lookup->parent);g_object_unref(dialog);}
+}
+static gboolean gpg_timeout(gpointer data){GpgLookup*lookup=data;lookup->timeout=0;lookup->timed_out=TRUE;g_subprocess_force_exit(lookup->process);g_cancellable_cancel(lookup->cancel);return G_SOURCE_REMOVE;}
+typedef struct { GtkWidget *entry; GtkWindow *window; char *recipient; } GpgChoice;
+static void gpg_choice_free(gpointer data,GClosure*closure){(void)closure;GpgChoice*choice=data;g_object_unref(choice->entry);g_free(choice->recipient);g_free(choice);}
+static void gpg_choice_clicked(GtkButton*button,gpointer data){(void)button;GpgChoice*choice=data;gtk_editable_set_text(GTK_EDITABLE(choice->entry),choice->recipient);gtk_window_destroy(choice->window);}
+static void gpg_choose_result(GpgLookup *lookup,GPtrArray *keys){
+  GtkWindow*w=GTK_WINDOW(gtk_window_new());gtk_window_set_title(w,"Choose an OpenPGP recipient");gtk_window_set_transient_for(w,lookup->parent);gtk_window_set_destroy_with_parent(w,TRUE);gtk_window_set_modal(w,TRUE);gtk_window_set_default_size(w,650,500);
+  GtkBox*box=GTK_BOX(gtk_box_new(GTK_ORIENTATION_VERTICAL,12));margin(GTK_WIDGET(box),24);append_text(box,"Choose an encryption key","title-2");append_text(box,"These usable public keys are already in your personal GnuPG keyring. Use Detect security key to match a connected hardware token.","dim-label");
+  GtkWidget*scroll=gtk_scrolled_window_new();gtk_widget_set_vexpand(scroll,TRUE);GtkBox*list=GTK_BOX(gtk_box_new(GTK_ORIENTATION_VERTICAL,12));gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroll),GTK_WIDGET(list));gtk_box_append(box,scroll);
+  for(guint i=0;i<keys->len&&i<256;i++){
+    GpgKey*key=g_ptr_array_index(keys,i);GtkBox*row=GTK_BOX(gtk_box_new(GTK_ORIENTATION_VERTICAL,6));margin(GTK_WIDGET(row),12);gtk_widget_add_css_class(GTK_WIDGET(row),"card");gtk_box_append(list,GTK_WIDGET(row));append_text(row,key->identity,"heading");GtkWidget*fingerprint=label(key->fingerprint,"monospace");gtk_label_set_selectable(GTK_LABEL(fingerprint),TRUE);gtk_box_append(row,fingerprint);
+    GtkWidget*button=gtk_button_new_with_label("Use this key");gtk_widget_set_halign(button,GTK_ALIGN_START);gtk_box_append(row,button);GpgChoice*choice=g_new0(GpgChoice,1);choice->entry=g_object_ref(lookup->entry);choice->window=w;choice->recipient=g_strdup(key->fingerprint);g_signal_connect_data(button,"clicked",G_CALLBACK(gpg_choice_clicked),choice,gpg_choice_free,0);
+  }
+  if(keys->len>256)append_text(box,"Only the first 256 keys are displayed. You can enter any full fingerprint directly in the recipient field.","dim-label");
+  GtkWidget*close=gtk_button_new_with_label("Cancel");gtk_widget_set_halign(close,GTK_ALIGN_END);g_signal_connect(close,"clicked",G_CALLBACK(close_window),w);gtk_box_append(box,close);gtk_window_set_child(w,GTK_WIDGET(box));gtk_window_present(w);
+}
+static void gpg_lookup_launch(GpgLookup *lookup,gboolean card);
+static void gpg_lookup_finished(GObject *source,GAsyncResult *result,gpointer data){
+  GpgLookup*lookup=data;char*output=NULL;GError*error=NULL;
+  gboolean completed=g_subprocess_communicate_utf8_finish(G_SUBPROCESS(source),result,&output,NULL,&error);
+  if(lookup->timeout){g_source_remove(lookup->timeout);lookup->timeout=0;}
+  if(!gtk_widget_get_visible(GTK_WIDGET(lookup->parent))){g_free(output);g_clear_error(&error);gpg_lookup_free(lookup);return;}
+  if(!completed||!g_subprocess_get_successful(G_SUBPROCESS(source))||!output||strlen(output)>1048576){
+    gpg_message(lookup,lookup->timed_out?"The security key or GnuPG keyring did not respond within 12 seconds. Check the connection and try again.":lookup->detect&&!lookup->card_fingerprint?"No usable OpenPGP security key was found. Connect a key with an existing OpenPGP encryption key and check that its OpenPGP application is enabled.":"The public key could not be read. Import the matching public key into your personal GnuPG keyring, then try again. This action does not initialize or reset a security key.");
+    g_free(output);g_clear_error(&error);gpg_lookup_free(lookup);return;
+  }
+  if(lookup->detect&&!lookup->card_fingerprint){
+    lookup->card_fingerprint=card_encryption_fingerprint(output);g_free(output);
+    if(!lookup->card_fingerprint){gpg_message(lookup,"The connected OpenPGP card has no encryption key in its encryption slot. Set up or restore its OpenPGP encryption key using your security-key management software, then detect it again. OctoVault will not modify or reset the card.");gpg_lookup_free(lookup);return;}
+    gpg_lookup_launch(lookup,FALSE);return;
+  }
+  GPtrArray*keys=parse_encryption_keys(output);g_free(output);
+  if(lookup->detect){
+    gboolean matched=FALSE;for(guint i=0;i<keys->len;i++){GpgKey*key=g_ptr_array_index(keys,i);if(!strcmp(key->fingerprint,lookup->card_fingerprint)){matched=TRUE;break;}}
+    if(matched){char*recipient=g_strconcat(lookup->card_fingerprint,"!",NULL);gtk_editable_set_text(GTK_EDITABLE(lookup->entry),recipient);g_free(recipient);gpg_message(lookup,"Security key detected. Its encryption fingerprint has been selected. Unlocking will honour the key's PIN and touch policy. Keep a separate recovery key.");}
+    else gpg_message(lookup,"The security key is connected, but its matching usable public encryption key is missing from your GnuPG keyring. Import that public key into your account, then detect the security key again. No private key needs to be exported from the device.");
+  }else if(keys->len)gpg_choose_result(lookup,keys);
+  else gpg_message(lookup,"No usable public encryption keys are available in your GnuPG keyring. Import your public key using your OpenPGP key manager, then choose it here. Revoked, expired and disabled keys are excluded.");
+  g_ptr_array_unref(keys);gpg_lookup_free(lookup);
+}
+static void gpg_lookup_launch(GpgLookup *lookup,gboolean card){
+  g_clear_object(&lookup->process);g_clear_object(&lookup->cancel);lookup->cancel=g_cancellable_new();GError*error=NULL;
+  const char *card_args[]={"/usr/bin/gpg","--no-options","--batch","--no-tty","--with-colons","--card-status",NULL};
+  const char *list_args[]={"/usr/bin/gpg","--no-options","--batch","--no-tty","--with-colons","--with-fingerprint","--with-subkey-fingerprint","--list-keys",lookup->card_fingerprint,NULL};
+  lookup->process=g_subprocess_newv(card?card_args:list_args,G_SUBPROCESS_FLAGS_STDOUT_PIPE|G_SUBPROCESS_FLAGS_STDERR_SILENCE,&error);
+  if(!lookup->process){gpg_message(lookup,"GnuPG could not start. Install the OctoVault package dependencies and try again.");g_clear_error(&error);gpg_lookup_free(lookup);return;}
+  lookup->timeout=g_timeout_add_seconds(12,gpg_timeout,lookup);g_subprocess_communicate_utf8_async(lookup->process,NULL,lookup->cancel,gpg_lookup_finished,lookup);
+}
+static void choose_gpg(GtkButton*button,gpointer data){
+  Field*field=data;GpgLookup*lookup=g_new0(GpgLookup,1);lookup->entry=g_object_ref(field->widget);lookup->row=g_object_ref(field->row);lookup->parent=g_object_ref(GTK_WINDOW(gtk_widget_get_root(GTK_WIDGET(button))));lookup->detect=GPOINTER_TO_INT(g_object_get_data(G_OBJECT(button),"detect-token"));gtk_widget_set_sensitive(field->row,FALSE);gpg_lookup_launch(lookup,lookup->detect);
+}
 static char *choice_label(const char *s){
   if(!strcmp(s,"key"))return g_strdup("Password-protected key file");
   if(!strcmp(s,"gpg"))return g_strdup("OpenPGP / YubiKey");
@@ -648,6 +762,11 @@ static Field *create_field(Form*form,const Spec*spec,JsonObject*record,GtkBox*co
     if(!strcmp(kind,"password"))gtk_password_entry_set_show_peek_icon(GTK_PASSWORD_ENTRY(f->widget),TRUE);
     else gtk_editable_set_text(GTK_EDITABLE(f->widget),initial);
     GtkBox*line=GTK_BOX(gtk_box_new(GTK_ORIENTATION_HORIZONTAL,8));gtk_widget_set_hexpand(f->widget,TRUE);gtk_box_append(line,f->widget);gtk_box_append(row,GTK_WIDGET(line));
+    if(!strcmp(spec->key,"recipient")){
+      GtkBox*controls=GTK_BOX(gtk_box_new(GTK_ORIENTATION_HORIZONTAL,8));gtk_box_append(row,GTK_WIDGET(controls));
+      GtkWidget*detect=gtk_button_new_with_label("Detect security key");g_object_set_data(G_OBJECT(detect),"detect-token",GINT_TO_POINTER(1));g_signal_connect(detect,"clicked",G_CALLBACK(choose_gpg),f);gtk_box_append(controls,detect);
+      GtkWidget*choose=gtk_button_new_with_label("Choose existing key…");g_signal_connect(choose,"clicked",G_CALLBACK(choose_gpg),f);gtk_box_append(controls,choose);
+    }
     if(!strcmp(kind,"file")||!strcmp(kind,"folder")||!strcmp(kind,"path")||!strcmp(kind,"save")){GtkWidget*b=gtk_button_new_from_icon_name("document-open-symbolic");gtk_widget_set_tooltip_text(b,"Choose a file or folder");gtk_box_append(line,b);g_signal_connect(b,"clicked",G_CALLBACK(choose_file),f);if(!strcmp(kind,"path")){b=gtk_button_new_from_icon_name("folder-open-symbolic");gtk_widget_set_tooltip_text(b,"Choose a folder");g_object_set_data(G_OBJECT(b),"choose-folder",GINT_TO_POINTER(1));gtk_box_append(line,b);g_signal_connect(b,"clicked",G_CALLBACK(choose_file),f);}}
   }
   gtk_label_set_mnemonic_widget(GTK_LABEL(name),f->widget);

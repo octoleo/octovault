@@ -6,6 +6,8 @@ Save each repository's recovery information outside this computer. Preserve the 
 
 Keep an independently stored copy of a vault's key or supported key carrier and its passphrase. For hardware-token authentication, keep your own tested OpenPGP recovery arrangement. OctoVault cannot recreate a lost private key, hardware token, or passphrase. Do not put the only vault key inside the vault that it opens.
 
+Text key carriers also require the exact word map used to create them. OctoVault includes its original 66-word map at `/usr/share/octovault/cloak-ciphers/words`; preserve a copy with your recovery materials, especially when using a custom map. This stable data file only translates the already encrypted key into words. The distribution's Tomb helpers perform the conversion, and the key still requires its passphrase.
+
 ## Restore on another computer
 
 Install OctoVault and its dependencies. Recreate the destination using the saved remote credentials, then import the existing repository with its saved repository password. List snapshots, choose files, and restore into a new empty directory. Check the restored contents and ownership before replacing existing files. This process does not require the original machine's encrypted credential store.

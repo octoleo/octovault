@@ -22,7 +22,9 @@ cleanup() {
                 device=$(cryptsetup status "$mapper" 2>/dev/null | awk '$1=="device:"{print $2}')
                 [[ $device == "$loop" ]] || continue
                 while IFS= read -r mountpoint; do
-                    [[ $mountpoint == "$WORK/"* ]] && umount -- "$mountpoint"
+                    if [[ $mountpoint == "$WORK/"* || $mountpoint == "/run/octovault/mounts/$OV_UID/"* ]]; then
+                        umount -- "$mountpoint"
+                    fi
                 done < <(findmnt --json --list --source "$mapper" --output TARGET 2>/dev/null |
                     jq -r '.filesystems|sort_by(.target|length)|reverse|.[].target')
                 cryptsetup close "$mapper"
@@ -31,6 +33,7 @@ cleanup() {
         done < <(losetup --noheadings --output NAME --associated "$OV_HOME/ci.tomb" 2>/dev/null)
     fi
     ov_secret_close; ov_resource_unlock; ov_vault_cleanup
+    if [[ -n ${INTEGRATION_USER:-} ]]; then userdel "$INTEGRATION_USER" 2>/dev/null || true; fi
     if ! findmnt -rn -o TARGET | awk -v root="$WORK/" 'index($0,root)==1 {found=1} END {exit !found}'; then
         rm -rf -- "$WORK"
     fi
@@ -40,7 +43,7 @@ trap cleanup EXIT
 OV_UID=$(id -u); OV_USER=$(id -un); OV_HOME="$WORK/home"; OV_ROOT="$WORK/state"
 mkdir -p "$OV_HOME" "$OV_ROOT"
 export OV_UID OV_USER OV_HOME OV_ROOT
-ov_as_user() { "$@"; }
+if [[ ${1:-} != --integration ]]; then ov_as_user() { "$@"; }; fi
 ov_progress() { :; }
 assert_equal() { [[ $1 == "$2" ]] || { printf 'Expected [%s], got [%s]\n' "$2" "$1" >&2; exit 1; }; }
 assert_fails() { if ( "$@" ) >/dev/null 2>&1; then printf 'Expected failure: %s\n' "$*" >&2; exit 1; fi; }
@@ -216,23 +219,54 @@ integration() {
     for program in tomb cryptsetup losetup pinentry-octovault rsync; do command -v "$program" >/dev/null; done
     [[ -e /dev/mapper/control ]] || { printf 'Device mapper unavailable.\n' >&2; exit 1; }
     INTEGRATION_RUNNING=true
+    INTEGRATION_USER="octovault-ci-$(date +%s)"
+    chmod 0755 "$WORK"
+    useradd --no-create-home --home-dir "$OV_HOME" --shell /bin/bash "$INTEGRATION_USER"
+    OV_USER=$INTEGRATION_USER; OV_UID=$(id -u "$OV_USER")
+    chown "$OV_UID:$(id -g "$OV_USER")" "$OV_HOME"
+    chmod 0700 "$OV_HOME"
     local response id file="$OV_HOME/ci.tomb" key="$OV_HOME/ci.key" source="$OV_HOME/Documents"
     OV_PARAMS=$(jq -n --arg file "$file" --arg key "$key" '{name:"CI vault",file:$file,key_file:$key,size_gb:"0.05",auth:"key",password:"OctoVault-CI-only-passphrase",open_on:"manual"}')
-    OV_OP=vault.create; response=$(ov_vault_dispatch) || { printf '%s\n' "$response" >&2; return 1; }; id=$(jq -er .data.id <<< "$response")
+    OV_OP=vault.create
+    ov_vault_dispatch > "$WORK/response.json" || { cat "$WORK/response.json" >&2; return 1; }
+    response=$(cat "$WORK/response.json"); id=$(jq -er .data.id <<< "$response")
+    ov_load vaults "$id"
+    assert_equal "$(stat -c %u "$file")" "$OV_UID"
+    assert_equal "$(stat -c %u "$key")" "$OV_UID"
     OV_PARAMS=$(jq -n --arg id "$id" '{id:$id,password:"OctoVault-CI-only-passphrase"}')
     OV_OP=vault.open; ov_vault_dispatch >/dev/null
-    mkdir "$source"; printf 'important\n' > "$source/data"
+    ov_as_user mkdir "$source"
+    printf 'important\n' | ov_as_user tee "$source/data" >/dev/null
     OV_PARAMS=$(jq -n --arg id "$id" --arg source "$source" '{id:$id,source:$source,relative:"Documents",password:"OctoVault-CI-only-passphrase"}')
     OV_OP=migration.add; ov_vault_dispatch >/dev/null
     [[ -f $source/data ]]
     OV_PARAMS=$(jq -n --arg id "$id" '{id:$id}'); OV_OP=vault.close; ov_vault_dispatch >/dev/null
     [[ ! -e $source/data ]]
-    printf 'independent\n' > "$source/local"
+    printf 'independent\n' | ov_as_user tee "$source/local" >/dev/null
     OV_PARAMS=$(jq -n --arg id "$id" '{id:$id,password:"OctoVault-CI-only-passphrase"}'); OV_OP=vault.open; ov_vault_dispatch >/dev/null
     [[ -f $source/data && ! -e $source/local ]]
     OV_OP=vault.close; ov_vault_dispatch >/dev/null
     assert_equal "$(cat "$source/local")" independent
-    printf 'ok - real Tomb lifecycle, migration and independent closed locations\n'
+    # Imported native metadata must never cause root writes through symlinks;
+    # executable native hooks stay dormant until the user explicitly trusts them.
+    local mountpoint guard="$WORK/root-owned-guard"
+    printf 'must stay unchanged\n' > "$guard"; chmod 0600 "$guard"
+    ov_load vaults "$id"; mountpoint=$(ov_vault_field "$OV_RECORD" mountpoint)
+    OV_OP=vault.open; ov_vault_dispatch >/dev/null
+    local metadata
+    for metadata in .uid .tty .host .last .cleanexit; do
+        ov_as_user ln -sf "$guard" "$mountpoint/$metadata"
+    done
+    printf '#!/bin/sh\ntouch "$HOME/untrusted-hook-ran"\n' | ov_as_user tee "$mountpoint/exec-hooks" >/dev/null
+    ov_as_user chmod 0700 "$mountpoint/exec-hooks"
+    OV_OP=vault.close; ov_vault_dispatch >/dev/null
+    OV_OP=vault.open; ov_vault_dispatch >/dev/null
+    assert_equal "$(cat "$guard")" 'must stay unchanged'
+    assert_equal "$(stat -c %u "$guard")" 0
+    [[ ! -e $OV_HOME/untrusted-hook-ran ]]
+    OV_OP=vault.close; ov_vault_dispatch >/dev/null
+    assert_equal "$(cat "$guard")" 'must stay unchanged'
+    printf 'ok - real nonroot-owner lifecycle, migration, independent closed locations, metadata symlinks and untrusted hooks\n'
 }
 
 if [[ ${1:-} == --integration ]]; then integration

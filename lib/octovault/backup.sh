@@ -4,8 +4,13 @@
 
 ov_backup_cleanup() {
     [[ -z ${OV_BACKUP_TMP:-} ]] || rm -rf -- "$OV_BACKUP_TMP"
+    unset OV_BACKUP_TMP
     if declare -F ov_secret_close >/dev/null; then ov_secret_close; fi
     if declare -F ov_resource_unlock >/dev/null; then ov_resource_unlock; fi
+    # A vault event can enter the backup adapter in the same worker. Preserve
+    # the backend's vault cleanup when this adapter installs its EXIT trap.
+    # ov_vault_unpin deliberately retains aliases that still have a loop device.
+    if declare -F ov_vault_cleanup >/dev/null; then ov_vault_cleanup; fi
 }
 
 ov_backup_workspace() {
@@ -40,7 +45,7 @@ ov_backup_snapshot() {
 }
 
 ov_backup_require_tools() {
-    command -v restic >/dev/null || ov_fail dependency_missing 'Restic is not installed.'
+    command -v restic >/dev/null || ov_fail dependency_missing 'The backup engine is not installed.'
 }
 
 ov_backup_save_record() {
@@ -183,12 +188,12 @@ ov_backup_execute() {
             printf '%s\n' "$line" >>"$OV_BACKUP_TMP/output"
             if jq -e '.message_type == "status" and (.percent_done | type == "number")' >/dev/null 2>&1 <<<"$line"; then
                 percent=$(jq -r '(.percent_done * 100 | floor) | if . < 0 then 0 elif . > 100 then 100 else . end' <<<"$line")
-                ov_progress "$stage" 'Restic is processing the operation.' "$percent"
+                ov_progress "$stage" 'The backup engine is processing the operation.' "$percent"
             fi
         done <"$OV_BACKUP_TMP/progress"
     ) &
     parser=$!
-    ov_progress "$stage" 'Starting Restic.' 0
+    ov_progress "$stage" 'Starting the backup engine.' 0
     ov_backup_restic_process "$@" >"$OV_BACKUP_TMP/progress" 2>"$OV_BACKUP_TMP/errors" || result=$?
     wait "$parser" || :
     rm -f "$OV_BACKUP_TMP/progress"
@@ -202,12 +207,12 @@ ov_backup_execute() {
 ov_backup_check_result() {
     case ${OV_RESTIC_STATUS:-1} in
         0) return 0 ;;
-        3) ov_fail partial 'Restic completed with unreadable source files or incomplete removals. Review source permissions and retry.' ;;
+        3) ov_fail partial 'The backup engine completed with unreadable source files or incomplete removals. Review source permissions and retry.' ;;
         10) ov_fail repository_missing 'The backup repository does not exist at the configured location.' ;;
         11) ov_fail repository_locked 'The repository is in use. Wait for the other operation to finish.' ;;
         12) ov_fail incorrect_password 'The repository password is incorrect.' ;;
         130|143) ov_fail cancelled 'The backup operation was cancelled.' ;;
-        *) ov_fail restic_failed 'Restic could not complete the operation. Check destination access, available storage, and the selected paths.' ;;
+        *) ov_fail restic_failed 'The backup engine could not complete the operation. Check destination access, available storage, and the selected paths.' ;;
     esac
 }
 
@@ -219,7 +224,7 @@ ov_backup_json_result() {
     elif [[ -z ${OV_RESTIC_OUTPUT:-} ]]; then
         ov_ok '{}'
     else
-        result=$(jq -sc 'if length == 1 then .[0] else . end' <<<"$OV_RESTIC_OUTPUT") || ov_fail invalid_output 'Restic returned an unexpected response.'
+        result=$(jq -sc 'if length == 1 then .[0] else . end' <<<"$OV_RESTIC_OUTPUT") || ov_fail invalid_output 'The backup engine returned an unexpected response.'
         ov_ok "$result"
     fi
 }
@@ -438,11 +443,11 @@ ov_repository_action() {
                 case $overwrite in
                     never)
                         if [[ -e $target ]] && [[ ! -d $target || -n $(find "$target" -mindepth 1 -maxdepth 1 -print -quit) ]]; then
-                            ov_fail restic_upgrade_required 'This Restic version can safely restore without overwriting only into a new or empty folder. Choose another destination or upgrade Restic.'
+                            ov_fail restic_upgrade_required 'This backup engine version can safely restore without overwriting only into a new or empty folder. Choose another destination or update the backup engine.'
                         fi
                         ;;
                     always) ;;
-                    *) ov_fail restic_upgrade_required 'Conditional overwrite requires a newer Restic version. Choose a new destination or upgrade Restic.' ;;
+                    *) ov_fail restic_upgrade_required 'Conditional overwrite requires a newer backup engine version. Choose a new destination or update the backup engine.' ;;
                 esac
             fi
             jq -e '(.include // []) | type == "array" and all(.[]; type == "string")' >/dev/null <<<"$OV_PARAMS" || ov_fail invalid_include 'Include must be an array of file patterns.'
@@ -486,7 +491,7 @@ ov_repository_action() {
     elif [[ $action == prune ]]; then ov_backup_json_result text
     elif [[ $action == restore ]] && ! jq -e . >/dev/null 2>&1 <<<"$OV_RESTIC_OUTPUT"; then ov_backup_json_result text
     elif [[ $action == files || $action == find || $action == diff ]]; then
-        result=$(jq -sc 'if length == 1 and (.[0] | type == "array") then .[0] else . end' <<<"$OV_RESTIC_OUTPUT") || ov_fail invalid_output 'Restic returned an unexpected response.'
+        result=$(jq -sc 'if length == 1 and (.[0] | type == "array") then .[0] else . end' <<<"$OV_RESTIC_OUTPUT") || ov_fail invalid_output 'The backup engine returned an unexpected response.'
         ov_ok "$result"
     else ov_backup_json_result; fi
 }
@@ -552,7 +557,9 @@ ov_backup_vault_guard() {
     ov_resource_lock "$(jq -r .file <<<"$vault")"
     if [[ $mode == open-files ]]; then
         declare -F ov_vault_is_open >/dev/null || ov_fail vault_verification_unavailable 'Vault mount verification is unavailable.'
+        declare -F ov_vault_is_exposed >/dev/null || ov_fail vault_verification_unavailable 'Vault exposure verification is unavailable.'
         ov_vault_is_open "$vault" || ov_fail vault_closed 'The linked vault is not open at its verified mountpoint; no backup was started.'
+        ov_vault_is_exposed "$vault" || ov_fail vault_not_exposed 'The linked vault is open, but its user mountpoint no longer exposes the verified filesystem; no backup was started.'
         expected_device=$(findmnt -rn --mountpoint "$(jq -r .mountpoint <<<"$vault")" --output MAJ:MIN) || ov_fail vault_verification_failed 'Unable to identify the mounted vault filesystem.'
         [[ $expected_device =~ ^[0-9]+:[0-9]+$ ]] || ov_fail vault_verification_failed 'The mounted vault filesystem identity is invalid.'
         for source in "${OV_BACKUP_SOURCES[@]}"; do
@@ -649,7 +656,7 @@ ov_repository_copy() {
     target_options=("${OV_RESTIC_OPTIONS[@]}"); target_env=("${OV_RESTIC_ENV[@]}")
     source_type=$(jq -r .type <<<"$source_destination"); target_type=$(jq -r .type <<<"$target_destination")
     if [[ $source_type == "$target_type" && $source_type != local && $(jq -r .id <<<"$source_destination") != "$(jq -r .id <<<"$target_destination")" ]]; then
-        ov_fail incompatible_copy_credentials 'Direct copy between different accounts of the same remote backend is not supported by this Restic credential interface. Copy through a local repository or use a shared destination account.'
+        ov_fail incompatible_copy_credentials 'Direct copy between different accounts of the same remote backend is not supported by this backup engine credential interface. Copy through a local repository or use a shared destination account.'
     fi
     if [[ $source_type == sftp && $target_type == sftp ]]; then
         # A shared destination uses the same host/account/key. Either private

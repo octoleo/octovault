@@ -103,6 +103,45 @@ static void test_readable_recovery(void)
     json_node_free(node);
 }
 
+static void test_openpgp_card_selection(void)
+{
+    const char *signing = "1111111111111111111111111111111111111111";
+    const char *encryption = "2222222222222222222222222222222222222222";
+    char *status = g_strdup_printf("Reader:Test:AID:1234:openpgp-card:\nfpr:%s:%s:3333333333333333333333333333333333333333:\n", signing, encryption);
+    char *selected = card_encryption_fingerprint(status);
+    g_assert_cmpstr(selected, ==, encryption);
+    g_free(selected);
+    g_free(status);
+    /* A signing-only card must not be mistaken for an encryption token. */
+    selected = card_encryption_fingerprint("fpr:1111111111111111111111111111111111111111::3333333333333333333333333333333333333333:\n");
+    g_assert_null(selected);
+    selected = card_encryption_fingerprint("fpr:1111111111111111111111111111111111111111:0000000000000000000000000000000000000000::\n");
+    g_assert_null(selected);
+    g_assert_false(valid_fingerprint("not-a-fingerprint"));
+}
+
+static void test_usable_encryption_keys(void)
+{
+    const char *listing =
+        "pub:u:4096:1:1111111111111111:1700000000:0::u:::scSC:\n"
+        "fpr:::::::::1111111111111111111111111111111111111111:\n"
+        "uid:u::::::::Person <person@example.test>:\n"
+        "sub:u:4096:1:2222222222222222:1700000000:0:::::e:\n"
+        "fpr:::::::::2222222222222222222222222222222222222222:\n"
+        "sub:r:4096:1:3333333333333333:1700000000:0:::::e:\n"
+        "fpr:::::::::3333333333333333333333333333333333333333:\n"
+        "sub:u:4096:1:4444444444444444:1700000000:1:::::e:\n"
+        "fpr:::::::::4444444444444444444444444444444444444444:\n"
+        "pub:u:4096:1:5555555555555555:1700000000:0::u:::eD:\n"
+        "fpr:::::::::5555555555555555555555555555555555555555:\n";
+    GPtrArray *keys = parse_encryption_keys(listing);
+    g_assert_cmpuint(keys->len, ==, 1);
+    GpgKey *key = g_ptr_array_index(keys, 0);
+    g_assert_cmpstr(key->fingerprint, ==, "2222222222222222222222222222222222222222");
+    g_assert_cmpstr(key->identity, ==, "Person <person@example.test>");
+    g_ptr_array_unref(keys);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -110,5 +149,7 @@ int main(int argc, char **argv)
     g_test_add_func("/ui/nested-policies", test_nested_policies);
     g_test_add_func("/ui/restore-retention-contract", test_restore_and_retention_contract);
     g_test_add_func("/ui/readable-recovery", test_readable_recovery);
+    g_test_add_func("/ui/openpgp-card-selection", test_openpgp_card_selection);
+    g_test_add_func("/ui/usable-encryption-keys", test_usable_encryption_keys);
     return g_test_run();
 }

@@ -2,14 +2,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # Test the distribution's installed package, never a downloaded replacement.
 set -Eeuo pipefail
+trap 'printf "Tomb package capability check failed at line %s: %s\n" "$LINENO" "$BASH_COMMAND" >&2; dpkg-query -L tomb | grep -E "cloak|cipher" >&2 || true' ERR
 version=$(dpkg-query -W -f='${Version}' tomb)
 dpkg --compare-versions "$version" ge 2.13
 for helper in cloakify decloakify; do
     test -x "/usr/libexec/tomb/$helper"
     dpkg-query -S "/usr/libexec/tomb/$helper" >/dev/null
 done
-cipher=/usr/share/doc/tomb/examples/cloak-ciphers/amphibians
+cipher=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)/data/cloak-ciphers/words
 test -r "$cipher"
+[[ $(wc -l <"$cipher") -eq 66 ]]
+[[ $(sort -u "$cipher" | wc -l) -eq 66 ]]
 command -v qrencode >/dev/null
 work=$(mktemp -d)
 trap 'rm -rf -- "$work"' EXIT
