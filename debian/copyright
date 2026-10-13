@@ -1,0 +1,19 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: OctoVault
+Upstream-Contact: Vast Development Method <https://www.vdm.io>
+Source: https://github.com/octoleo/octovault
+
+Files: *
+Copyright: 2026 Vast Development Method
+License: Apache-2.0
+ Licensed under the Apache License, Version 2.0 (the "License");
+ you may not use this file except in compliance with the License.
+ You may obtain a copy of the License at
+ https://www.apache.org/licenses/LICENSE-2.0
+ .
+ On Debian systems, the complete license is available in
+ /usr/share/common-licenses/Apache-2.0.
+ .
+ Tomb and Restic are separately installed dependencies, not incorporated
+ copies of their source. Their licenses remain available in
+ /usr/share/doc/tomb/copyright and /usr/share/doc/restic/copyright.

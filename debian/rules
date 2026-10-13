@@ -1,0 +1,24 @@
+#!/usr/bin/make -f
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+include /usr/share/dpkg/default.mk
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	dh_auto_build -- all
+
+override_dh_auto_test:
+ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))
+	dh_auto_test -- check
+endif
+
+override_dh_auto_install:
+	dh_auto_install --destdir=$(CURDIR)/debian/octovault -- install
+
+# D-Bus starts the service on demand. Never enable user automation at install.
+override_dh_installsystemd:
+	dh_installsystemd --no-enable --no-start
+
+override_dh_installsystemduser:
+	dh_installsystemduser --no-enable --no-start

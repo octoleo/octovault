@@ -1,0 +1,13 @@
+[Unit]
+Description=Close configured OctoVault vaults before shutdown
+Documentation=https://github.com/octoleo/octovault
+DefaultDependencies=no
+Before=shutdown.target umount.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/octovault/event-system shutdown
+User=root
+UMask=0077
+TimeoutStartSec=120s
+NoNewPrivileges=yes

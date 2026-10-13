@@ -1,0 +1,13 @@
+[Unit]
+Description=Close configured OctoVault vaults before sleep
+Documentation=https://github.com/octoleo/octovault
+DefaultDependencies=no
+Before=systemd-suspend.service systemd-hibernate.service systemd-hybrid-sleep.service systemd-suspend-then-hibernate.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/octovault/event-system sleep
+User=root
+UMask=0077
+TimeoutStartSec=120s
+NoNewPrivileges=yes

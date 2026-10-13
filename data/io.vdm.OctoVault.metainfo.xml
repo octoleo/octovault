@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.vdm.OctoVault</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>Apache-2.0</project_license>
+  <name>OctoVault</name>
+  <summary>Protect local folders and manage encrypted backups</summary>
+  <description>
+    <p>OctoVault brings encrypted local vaults and independent encrypted backups into one native GNOME application, with a matching command-line interface.</p>
+    <p>Create and manage vaults, move folders safely, configure desktop events, schedule backups, browse snapshots, and restore files. Keep portable recovery information outside the computer so your data remains recoverable.</p>
+    <p>Developed by Vast Development Method as part of the OctoLeo Suite.</p>
+  </description>
+  <launchable type="desktop-id">io.vdm.OctoVault.desktop</launchable>
+  <developer id="io.vdm"><name>Vast Development Method</name></developer>
+  <url type="homepage">https://www.vdm.io</url>
+  <url type="bugtracker">https://github.com/octoleo/octovault/issues</url>
+  <url type="vcs-browser">https://github.com/octoleo/octovault</url>
+  <provides><binary>octovault</binary><binary>octovault-gtk</binary></provides>
+  <content_rating type="oars-1.1"/>
+  <releases><release version="1.0.0" date="2026-10-13"><description><p>Initial release of vault management, independent encrypted backups, native GNOME controls, and command-line access.</p></description></release></releases>
+</component>

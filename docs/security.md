@@ -1,0 +1,21 @@
+# Security model
+
+The GNOME interface, command-line client, and desktop event observer run as the signed-in user. The root D-Bus service derives the user's UID from the sender connection, authorizes privileged requests with PolicyKit, and invokes a fixed backend executable. Requests cannot choose a different UID, executable, or environment. Recovery credential disclosure uses a separate authorization action. Results are private to their job owner and sensitive results expire.
+
+Record directories under `/var/lib/octovault/users/UID` are root-owned with mode 0700; JSON records and encrypted credentials are mode 0600. Saved configuration is data, never sourced shell code. Arguments are passed as arrays rather than evaluated command text. The adapters invoke the installed encryption and backup engines.
+
+Repository and remote-access secrets are encrypted by `systemd-creds`. Automatic key selection uses the host's supported key protection. Where TPM support is unavailable, host-key encryption is still encryption, but copying the credential ciphertext together with its host decryption key defeats that binding. This is not equivalent to TPM-backed or user-present protection. It must never be described as secure against a compromised root account.
+
+An unattended backup requires usable credentials while it runs. Secrets can therefore exist briefly in process memory, inherited descriptors, restrictive runtime files, or a child process's environment. OctoVault avoids secret command-line values, persistent plaintext configuration, diagnostic output, and application logs. A root attacker can read runtime secrets, intercept an authorized process, replace binaries, or read an already mounted vault. Hardware-backed keys limit key export but do not make a compromised authorized session trustworthy.
+
+Keep recovery information in an independently secured password manager or other offline recovery location. Protect that vault separately. A password manager on the same unlocked compromised desktop does not provide an independent boundary. A lost repository password cannot be reconstructed from encrypted backup data.
+
+Tomb keys, encrypted containers, and Restic repositories retain their upstream formats. Image/text concealment hides a key carrier; it does not replace cryptographic protection or make weak passphrases strong. Hardware tokens retain their PIN/touch requirements. User-installed executable hooks run with the vault owner's identity; treat them as trusted programs because they can read open data. Do not import unreviewed hooks or scripts.
+
+Vault mounts must be visible to the user session. The privileged service intentionally does not create a private mount namespace using `ProtectSystem`, `ProtectHome`, `PrivateTmp`, or `PrivateDevices`; those directives can prevent bind mounts from appearing at their intended host paths. This makes strict authorization, path validation, ownership, and a fixed subprocess interface particularly important.
+
+Sleep protection runs before the actual systemd suspend/hibernate executor through required ordered dependencies. If a configured vault cannot close, the helper fails and prevents that executor from proceeding. Forced power loss and a forcibly bypassed shutdown cannot be made into orderly close operations. A hard stop ends access to RAM-backed encryption mappings, but can leave filesystem or application writes incomplete. Force-close policies can kill processes and should be chosen deliberately.
+
+Backup integrity checks validate repository structures and optionally read stored data. They are not a substitute for a successful restore test, nor can they prove an application database was transaction-consistent at backup time. Repository retention and pruning are separate operations, with retention preview available before deletion.
+
+Security reports should be made privately to the project maintainer through the repository's security reporting channel when available. Do not publish credentials, raw recovery output, private keys, or personally identifying file listings in issues or CI artifacts.

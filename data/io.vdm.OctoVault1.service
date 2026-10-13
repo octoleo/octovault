@@ -1,0 +1,5 @@
+[D-BUS Service]
+Name=io.vdm.OctoVault1
+Exec=/usr/libexec/octovault/daemon
+User=root
+SystemdService=octovault.service

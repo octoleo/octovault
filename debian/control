@@ -1,0 +1,27 @@
+Source: octovault
+Section: utils
+Priority: optional
+Maintainer: Vast Development Method <octoleo@users.noreply.github.com>
+Build-Depends: debhelper-compat (= 13), pkg-config, libgtk-4-dev (>= 4.12), libadwaita-1-dev (>= 1.4), libjson-glib-dev, libglib2.0-dev, desktop-file-utils, libxml2-utils, appstream, jq, rsync, restic, shellcheck, dbus-daemon, xvfb, xauth
+Standards-Version: 4.7.0
+Rules-Requires-Root: no
+Homepage: https://www.vdm.io
+Vcs-Git: https://github.com/octoleo/octovault.git
+Vcs-Browser: https://github.com/octoleo/octovault
+
+Package: octovault
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, bash (>= 5.1), tomb (>= 2.10), restic (>= 0.16), systemd (>= 252), jq, rsync, openssh-client, curl, gnupg, pinentry-gnome3 | pinentry, cryptsetup-bin, util-linux, procps, lsof, steghide, polkitd, dbus, adwaita-icon-theme, ca-certificates
+Recommends: scdaemon, pcscd, fuse3, libnotify-bin
+Description: Native GNOME encrypted vault and independent backup manager
+ OctoVault manages encrypted local vaults and encrypted backup repositories
+ through a native GTK4 interface and a matching command-line interface.
+ It provides folder migration, event policies, backup schedules, snapshot
+ browsing, recovery information, and file restoration.
+ .
+ The desktop interface runs without administrator privileges. A restricted
+ system service authorizes privileged operations through PolicyKit. Secret
+ configuration is encrypted using systemd credentials. Removing the package
+ preserves vaults, backups, credentials, and configuration.
+ .
+ Maintained by Vast Development Method as part of the OctoLeo Suite.

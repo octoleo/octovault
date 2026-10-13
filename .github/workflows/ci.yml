@@ -1,0 +1,129 @@
+name: Test and package
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish the current main version after all checks pass
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  package:
+    name: Ubuntu ${{ matrix.ubuntu }} amd64
+    runs-on: ubuntu-24.04
+    container: ubuntu:${{ matrix.ubuntu }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        ubuntu: ['26.04']
+    steps:
+      - name: Install build and integration-test dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends ca-certificates git build-essential debhelper pkg-config libgtk-4-dev libadwaita-1-dev libjson-glib-dev libglib2.0-dev desktop-file-utils libxml2-utils appstream jq rsync restic tomb cryptsetup-bin systemd systemd-sysv curl openssh-client gnupg pinentry-gnome3 steghide lsof polkitd dbus dbus-daemon xvfb xauth adwaita-icon-theme shellcheck
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Build, lint, and run tests inside Debian packaging
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          dpkg-buildpackage -us -uc -b
+          version=$(cat VERSION)
+          bash scripts/test-packaging.sh "../octovault_${version}_amd64.deb"
+      - name: Run actual native interface as an ordinary desktop user
+        run: |
+          useradd --create-home octovault-test
+          chmod -R a+rX "$GITHUB_WORKSPACE"
+          runuser -u octovault-test -- dbus-run-session -- xvfb-run -a env GTK_A11Y=none GSK_RENDERER=cairo build/octovault-gtk --smoke-test
+      - name: Verify installation, upgrade, reinstall, and removal
+        env:
+          OCTOVAULT_DISPOSABLE_TEST: '1'
+        run: |
+          version=$(cat VERSION)
+          bash scripts/test-package-lifecycle.sh --disposable-system "../octovault_${version}_amd64.deb"
+      - name: Prepare versioned downloads
+        env:
+          UBUNTU_VERSION: ${{ matrix.ubuntu }}
+        run: |
+          mkdir -p dist
+          version=$(cat VERSION)
+          cp "../octovault_${version}_amd64.deb" "dist/octovault_${version}_ubuntu${UBUNTU_VERSION}_amd64.deb"
+          cd dist
+          sha256sum *.deb > "SHA256SUMS-ubuntu${UBUNTU_VERSION}"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: octovault-ubuntu-${{ matrix.ubuntu }}-amd64
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+
+  vault-integration:
+    name: Real Tomb encryption and mounts
+    runs-on: ubuntu-24.04
+    container:
+      image: ubuntu:26.04
+      options: --privileged --volume /lib/modules:/lib/modules:ro
+    timeout-minutes: 20
+    steps:
+      - name: Install actual Ubuntu vault dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends ca-certificates git build-essential tomb cryptsetup-bin jq rsync pinentry-curses gnupg steghide lsof systemd util-linux procps kmod
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Compile credential helpers
+        run: |
+          mkdir -p build
+          cc -std=c11 -O2 -Wall -Wextra src/service/pinentry.c -o build/pinentry-octovault
+          cc -std=c11 -O2 -Wall -Wextra src/service/steghide.c -o build/steghide -lutil
+          install -d /usr/libexec/octovault
+          install -m 0755 build/pinentry-octovault /usr/bin/pinentry-octovault
+          install -m 0755 build/steghide /usr/libexec/octovault/steghide
+      - name: Exercise vault creation, actual mounts, migration, and closure
+        run: |
+          modprobe dm_mod
+          modprobe loop
+          install -d /dev/mapper
+          test -c /dev/mapper/control || mknod /dev/mapper/control c 10 236
+          bash tests/test-vault.sh --integration
+
+  release:
+    name: Publish reviewed version
+    needs: [package, vault-integration]
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    concurrency:
+      group: octovault-release
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Install publication tools
+        run: sudo apt-get install --yes jq libxml2-utils
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: octovault-ubuntu-*-amd64
+          path: release
+          merge-multiple: true
+      - name: Publish complete verified assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: bash scripts/publish-release.sh "$GITHUB_SHA" release
