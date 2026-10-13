@@ -11,15 +11,37 @@ root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 version=$(bash "$root/scripts/version.sh")
 tag="v$version"
 bash "$root/scripts/version.sh" --check "$tag"
+release_output() { if [[ -n ${GITHUB_OUTPUT:-} ]]; then printf '%s=%s\n' "$1" "$2" >>"$GITHUB_OUTPUT"; fi; }
+release_output tag "$tag"
+release_output available false
 [[ $(gh api "repos/$GH_REPO/git/ref/heads/main" --jq .object.sha) == "$commit" ]] || { printf 'A newer main commit exists; skipping publication.\n'; exit 0; }
 temp=$(mktemp -d)
 trap 'rm -rf -- "$temp"' EXIT
+# A public release may be reused by optional distribution only if its tag
+# identifies this exact source. Resolve lightweight and annotated tags alike.
+resolve_tag() {
+    gh api "repos/$GH_REPO/git/matching-refs/tags/$tag" >"$temp/tags.json"
+    tag_sha=$(jq -r --arg ref "refs/tags/$tag" '.[] | select(.ref == $ref) | .object.sha' "$temp/tags.json")
+    tag_type=$(jq -r --arg ref "refs/tags/$tag" '.[] | select(.ref == $ref) | .object.type' "$temp/tags.json")
+    for ((depth=0; depth<8; depth++)); do
+        [[ $tag_type == tag ]] || break
+        gh api "repos/$GH_REPO/git/tags/$tag_sha" >"$temp/tag.json"
+        tag_sha=$(jq -er .object.sha "$temp/tag.json")
+        tag_type=$(jq -er .object.type "$temp/tag.json")
+    done
+}
 gh api --paginate --slurp "repos/$GH_REPO/releases?per_page=100" >"$temp/releases.json"
 jq --arg tag "$tag" '[.[][] | select(.tag_name == $tag)]' "$temp/releases.json" >"$temp/matches.json"
 count=$(jq length "$temp/matches.json")
 [[ $count -le 1 ]] || { printf 'Duplicate release records require review.\n' >&2; exit 1; }
 if [[ $count == 1 ]] && jq -e '.[0].draft == false' "$temp/matches.json" >/dev/null; then
     printf 'Version %s is already public; it will not be overwritten.\n' "$tag"
+    resolve_tag
+    if [[ $tag_type == commit && $tag_sha == "$commit" ]]; then
+        release_output available true
+    else
+        printf 'The published version belongs to different code; increment VERSION for a new release.\n'
+    fi
     exit 0
 fi
 files=()
@@ -35,15 +57,7 @@ for ubuntu in "${ubuntu_versions[@]}"; do
 done
 # An existing tag must identify this exact source, including annotated tags.
 # --target only controls newly created tags; it cannot correct an old tag.
-gh api "repos/$GH_REPO/git/matching-refs/tags/$tag" >"$temp/tags.json"
-tag_sha=$(jq -r --arg ref "refs/tags/$tag" '.[] | select(.ref == $ref) | .object.sha' "$temp/tags.json")
-tag_type=$(jq -r --arg ref "refs/tags/$tag" '.[] | select(.ref == $ref) | .object.type' "$temp/tags.json")
-for ((depth=0; depth<8; depth++)); do
-    [[ $tag_type == tag ]] || break
-    gh api "repos/$GH_REPO/git/tags/$tag_sha" >"$temp/tag.json"
-    tag_sha=$(jq -er .object.sha "$temp/tag.json")
-    tag_type=$(jq -er .object.type "$temp/tag.json")
-done
+resolve_tag
 [[ -z $tag_sha || ( $tag_type == commit && $tag_sha == "$commit" ) ]] || { printf 'Existing tag refers to different code; refusing publication.\n' >&2; exit 1; }
 if [[ $count == 1 ]]; then
     jq -e --arg commit "$commit" '.[0].target_commitish == $commit' "$temp/matches.json" >/dev/null || { printf 'Existing draft belongs to another commit.\n' >&2; exit 1; }
@@ -80,3 +94,8 @@ for file in "${files[@]}"; do cmp "$file" "$temp/download/${file##*/}"; done
 [[ $(find "$temp/download" -maxdepth 1 -type f | wc -l) == "${#files[@]}" ]] || { printf 'Draft contains unexpected assets; refusing publication.\n' >&2; exit 1; }
 [[ $(gh api "repos/$GH_REPO/git/ref/heads/main" --jq .object.sha) == "$commit" ]] || { printf 'main changed during publication; leaving a reviewable draft.\n' >&2; exit 1; }
 gh release edit "$tag" --repo "$GH_REPO" --draft=false --latest
+gh release view "$tag" --repo "$GH_REPO" --json isDraft >"$temp/published.json"
+jq -e '.isDraft == false' "$temp/published.json" >/dev/null
+resolve_tag
+[[ $tag_type == commit && $tag_sha == "$commit" ]] || { printf 'Published tag does not identify this source.\n' >&2; exit 1; }
+release_output available true

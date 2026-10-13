@@ -63,6 +63,8 @@ Upgrading with a newer matching `.deb` preserves configuration, encrypted creden
 
 Read [packaging and release](docs/packaging.md), [security](docs/security.md), and [recovery](docs/recovery.md). CI builds the real GUI and CLI, tests the backend and service, runs native GTK smoke checks as an ordinary user, and verifies Debian install/upgrade/removal behavior. Tests run on pull requests; public release publication occurs only after a new version is merged into `main` and the required workflow jobs pass. Existing published versions are never overwritten.
 
+GitHub releases use the built-in workflow token and require no store or signing credentials. An optional, separate job publishes a signed APT repository through GitHub Pages when its signing key, fingerprint, and public URL are configured. Without that configuration, APT deployment is skipped and versioned GitHub downloads remain available. This is native Debian/APT distribution, not a Snap Store upload; see the [publisher setup](docs/packaging.md).
+
 ## Credits and licenses
 
 OctoVault is licensed under [Apache-2.0](LICENSE). Its independently installed engines are [Tomb](https://github.com/dyne/Tomb) (GPL-3.0-or-later) and [Restic](https://github.com/restic/restic) (BSD-2-Clause). Desktop integration uses GTK, libadwaita, GLib, D-Bus, PolicyKit, and systemd under their respective licenses. Installed dependency notices remain in `/usr/share/doc/PACKAGE/copyright`. OctoVault orchestrates these tools and preserves their native data formats.
