@@ -178,7 +178,7 @@ ov_vault_plain_key() {
             /usr/libexec/tomb/decloakify -i "$OV_VAULT_TEMP_DIR/cloaked.txt" -c "$OV_VAULT_TEMP_DIR/cloak-cipher" -o "$OV_VAULT_MATERIALIZED_KEY" >&2 ||
                 ov_fail key_failed "The text key could not be decoded; verify the cipher file and installed encryption extras."
             ;;
-        *) ov_as_user cat -- "$key" > "$OV_VAULT_MATERIALIZED_KEY" ;;
+        *) ov_as_user cat -- "$key" > "$OV_VAULT_MATERIALIZED_KEY" || ov_fail key_failed "The encrypted key cannot be read by your account." ;;
     esac
 }
 
