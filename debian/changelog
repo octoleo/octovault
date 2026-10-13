@@ -1,3 +1,11 @@
+octovault (1.0.1) unstable; urgency=medium
+
+  * Simplify vault creation with folder selection and managed key generation.
+  * Support existing key reuse and explain image, text, and OpenPGP protection.
+  * Manage unlock locations automatically and preserve source carrier images.
+
+ -- Vast Development Method <octoleo@users.noreply.github.com>  Tue, 13 Oct 2026 20:00:00 +0000
+
 octovault (1.0.0) unstable; urgency=medium
 
   * Initial native GNOME application and command-line interface.
