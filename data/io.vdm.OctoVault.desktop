@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=OctoVault
+GenericName=Vault and Backup Manager
+Comment=Protect local folders and manage encrypted backups
+Exec=octovault-gtk
+TryExec=octovault-gtk
+Icon=io.vdm.OctoVault
+Terminal=false
+StartupNotify=true
+Categories=GTK;Utility;Security;Archiving;
+Keywords=vault;encryption;backup;restore;privacy;
+X-GNOME-UsesNotifications=true

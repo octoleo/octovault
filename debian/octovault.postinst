@@ -1,0 +1,23 @@
+#!/bin/sh
+set -e
+
+#DEBHELPER#
+
+if [ -z "${DPKG_ROOT:-}" ] && [ -d /run/systemd/system ]; then
+    case "$1" in
+        configure|abort-upgrade|abort-remove|abort-deconfigure)
+            systemctl daemon-reload || true
+            # Preserve enabled schedules; never enable a new user backup here.
+            for timer in /etc/systemd/system/octovault-backup-*.timer; do
+                [ -f "$timer" ] || continue
+                if systemctl is-enabled --quiet "${timer##*/}"; then
+                    systemctl start "${timer##*/}" || true
+                fi
+            done
+            if [ -f /run/octovault-package-restart ]; then
+                rm -f /run/octovault-package-restart
+                systemctl start octovault.service || true
+            fi
+            ;;
+    esac
+fi

@@ -1,0 +1,26 @@
+[Unit]
+Description=OctoVault privileged vault and backup service
+Documentation=https://github.com/octoleo/octovault
+After=dbus.service
+
+[Service]
+Type=dbus
+BusName=io.vdm.OctoVault1
+ExecStart=/usr/libexec/octovault/daemon
+User=root
+Group=root
+UMask=0077
+LimitCORE=0
+StateDirectory=octovault
+StateDirectoryMode=0700
+RuntimeDirectory=octovault
+RuntimeDirectoryMode=0700
+NoNewPrivileges=yes
+RestrictRealtime=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+Restart=on-failure
+RestartSec=3s
+TimeoutStopSec=120s
+# Tomb mounts must propagate to user sessions. Do not create a private mount
+# namespace with PrivateTmp, ProtectSystem, ProtectHome, or PrivateDevices.

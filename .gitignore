@@ -1,0 +1,11 @@
+/build/
+/dist/
+/debian/.debhelper/
+/debian/debhelper-build-stamp
+/debian/files
+/debian/*.debhelper
+/debian/*.substvars
+/debian/octovault/
+*.deb
+*.buildinfo
+*.changes

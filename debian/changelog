@@ -1,0 +1,8 @@
+octovault (1.0.0) unstable; urgency=medium
+
+  * Initial native GNOME application and command-line interface.
+  * Add encrypted vault lifecycle, folder migration, and event policies.
+  * Add independent encrypted repositories, backup plans, and restoration.
+  * Package privilege separation, systemd integration, and Debian upgrades.
+
+ -- Vast Development Method <octoleo@users.noreply.github.com>  Tue, 13 Oct 2026 17:00:00 +0000

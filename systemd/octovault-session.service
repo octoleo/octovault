@@ -1,0 +1,14 @@
+[Unit]
+Description=OctoVault desktop event observer
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/octovault-session
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=graphical-session.target

@@ -1,0 +1,86 @@
+.TH OCTOVAULT 1 "October 2026" "OctoVault 1.0.0" "User Commands"
+.SH NAME
+octovault \- manage encrypted local vaults and independent backups
+.SH SYNOPSIS
+.B octovault
+.RB [ --json ]
+.I GROUP ACTION
+.RI [ --option " VALUE" ...]
+.br
+.B octovault
+.RB [ --json ]
+.B request
+.RI [ FILE | - ]
+.br
+.B octovault
+.RB [ --json ]
+.B job
+.BR get | cancel
+.I ID
+.SH DESCRIPTION
+OctoVault provides a terminal client for the same authorized service used by
+its native GNOME application. Run as your regular account. Privileged actions
+request administrator authentication through PolicyKit. Running with sudo
+selects the root account's configuration.
+.SH GROUPS
+.TP
+.B vault
+list, get, create, import, open, close, update, remove, resize, passwd,
+setkey, key-export, index, and search.
+.TP
+.B migration
+add, list, and recover.
+.TP
+.B destination
+list, get, save, test, and remove.
+.TP
+.B repository
+list, create, import, recovery, check, stats, snapshots, files, find, diff,
+restore, forget, prune, password, copy, and remove.
+.TP
+.B backup
+list, save, remove, run, and history.
+.TP
+.B schedule
+sync.
+.SH OPTIONS
+Use --id to select an existing record. Option names use hyphens. Repeat
+--source, --exclude, --include, or --close-on to supply multiple array entries.
+Boolean options accept true or false, a bare flag, or a --no-flag form.
+--size-gb is capacity in decimal gigabytes.
+.PP
+Secret options such as --password, --old-password, --secret-key,
+--ssh-private-key, and --ssh-passphrase take no argument and prompt on the
+terminal without echo. Never place secrets in command-line arguments.
+Structured requests may supply secrets through standard input. Do not retain
+secret requests in shell history or unprotected files.
+.TP
+.B --json
+Emit machine-readable results.
+.TP
+.B --help
+Show command usage.
+.TP
+.B --version
+Show the application version.
+.SH FILES
+.TP
+.B /var/lib/octovault/users/UID
+Root-owned account state and encrypted credentials. Retained on package removal.
+.TP
+.B /usr/libexec/octovault
+Fixed privileged workers; not a public invocation interface.
+.SH EXIT STATUS
+Zero indicates success. Failed, rejected, or cancelled operations return nonzero.
+.SH RECOVERY
+Save repository addresses, remote credentials, and repository passwords outside
+the computer. Host-bound encrypted credentials alone are not portable recovery
+information. The explicit repository recovery action requires authorization.
+.SH AUTHORS
+Vast Development Method, part of the OctoLeo Suite.
+.SH SEE ALSO
+.BR tomb (1),
+.BR restic (1),
+.BR systemd-creds (1)
+.br
+https://github.com/octoleo/octovault

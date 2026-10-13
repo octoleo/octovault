@@ -1,0 +1,10 @@
+#!/bin/sh
+set -e
+
+#DEBHELPER#
+
+if [ -z "${DPKG_ROOT:-}" ]; then
+    case "$1" in remove|purge) rm -f /run/octovault-package-restart ;; esac
+fi
+# User vaults, backup repositories, credentials, and migration recovery state
+# are intentionally never deleted here, including on purge.
