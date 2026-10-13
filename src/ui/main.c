@@ -701,6 +701,30 @@ static void gpg_lookup_launch(GpgLookup *lookup,gboolean card){
 static void choose_gpg(GtkButton*button,gpointer data){
   Field*field=data;GpgLookup*lookup=g_new0(GpgLookup,1);lookup->entry=g_object_ref(field->widget);lookup->row=g_object_ref(field->row);lookup->parent=g_object_ref(GTK_WINDOW(gtk_widget_get_root(GTK_WIDGET(button))));lookup->detect=GPOINTER_TO_INT(g_object_get_data(G_OBJECT(button),"detect-token"));gtk_widget_set_sensitive(field->row,FALSE);gpg_lookup_launch(lookup,lookup->detect);
 }
+typedef struct { GtkWidget *entry; GtkWindow *window; char *uuid; } DriveChoice;
+static void drive_choice_free(gpointer data,GClosure*closure){(void)closure;DriveChoice*choice=data;g_object_unref(choice->entry);g_free(choice->uuid);g_free(choice);}
+static void drive_choice_clicked(GtkButton*button,gpointer data){(void)button;DriveChoice*choice=data;gtk_editable_set_text(GTK_EDITABLE(choice->entry),choice->uuid);gtk_window_destroy(choice->window);}
+static void choose_drive(GtkButton*button,gpointer data){
+  Field*field=data;GtkWindow*parent=GTK_WINDOW(gtk_widget_get_root(GTK_WIDGET(button)));
+  GtkWindow*window=GTK_WINDOW(gtk_window_new());gtk_window_set_title(window,"Choose a drive");gtk_window_set_transient_for(window,parent);gtk_window_set_destroy_with_parent(window,TRUE);gtk_window_set_modal(window,TRUE);gtk_window_set_default_size(window,620,480);
+  GtkBox*box=GTK_BOX(gtk_box_new(GTK_ORIENTATION_VERTICAL,14));margin(GTK_WIDGET(box),24);append_text(box,"Choose a mounted drive","title-2");append_text(box,"OctoVault remembers the filesystem's stable identity, so the drive can be recognized when it mounts again.","dim-label");
+  GtkWidget*scroll=gtk_scrolled_window_new();gtk_widget_set_vexpand(scroll,TRUE);gtk_box_append(box,scroll);GtkBox*list=GTK_BOX(gtk_box_new(GTK_ORIENTATION_VERTICAL,12));gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroll),GTK_WIDGET(list));
+  /* GVolumeMonitor supplies the desktop's current local mount inventory. No
+   * root helper, network request, mounting or filesystem scanning is done. */
+  GVolumeMonitor*monitor=g_volume_monitor_get();GList*mounts=g_volume_monitor_get_mounts(monitor);guint count=0;
+  for(GList*item=mounts;item;item=item->next){
+    GMount*mount=G_MOUNT(item->data);GFile*root=g_mount_get_root(mount);char*path=g_file_get_path(root);char*uuid=g_mount_get_uuid(mount);
+    if(!uuid||!*uuid){GVolume*volume=g_mount_get_volume(mount);g_free(uuid);uuid=volume?g_volume_get_uuid(volume):NULL;g_clear_object(&volume);}
+    if(path&&uuid&&*uuid){
+      char*name=g_mount_get_name(mount);GtkBox*row=GTK_BOX(gtk_box_new(GTK_ORIENTATION_VERTICAL,6));margin(GTK_WIDGET(row),12);gtk_widget_add_css_class(GTK_WIDGET(row),"card");gtk_box_append(list,GTK_WIDGET(row));append_text(row,name,"heading");append_text(row,path,NULL);append_text(row,uuid,"dim-label");
+      GtkWidget*use=gtk_button_new_with_label("Use this drive");gtk_widget_set_halign(use,GTK_ALIGN_START);gtk_box_append(row,use);DriveChoice*choice=g_new0(DriveChoice,1);choice->entry=g_object_ref(field->widget);choice->window=window;choice->uuid=g_strdup(uuid);g_signal_connect_data(use,"clicked",G_CALLBACK(drive_choice_clicked),choice,drive_choice_free,0);g_free(name);count++;
+    }
+    g_free(path);g_free(uuid);g_object_unref(root);
+  }
+  g_list_free_full(mounts,g_object_unref);g_object_unref(monitor);
+  if(!count)append_text(list,"No mounted local drives with a filesystem UUID are available. Connect and mount your drive in Files, then reopen this chooser. You can also enter a known filesystem UUID directly.",NULL);
+  GtkWidget*close=gtk_button_new_with_label("Cancel");gtk_widget_set_halign(close,GTK_ALIGN_END);gtk_box_append(box,close);g_signal_connect(close,"clicked",G_CALLBACK(close_window),window);gtk_window_set_child(window,GTK_WIDGET(box));gtk_window_present(window);
+}
 static char *choice_label(const char *s){
   if(!strcmp(s,"key"))return g_strdup("Password-protected key file");
   if(!strcmp(s,"gpg"))return g_strdup("OpenPGP / YubiKey");
@@ -767,6 +791,7 @@ static Field *create_field(Form*form,const Spec*spec,JsonObject*record,GtkBox*co
       GtkWidget*detect=gtk_button_new_with_label("Detect security key");g_object_set_data(G_OBJECT(detect),"detect-token",GINT_TO_POINTER(1));g_signal_connect(detect,"clicked",G_CALLBACK(choose_gpg),f);gtk_box_append(controls,detect);
       GtkWidget*choose=gtk_button_new_with_label("Choose existing key…");g_signal_connect(choose,"clicked",G_CALLBACK(choose_gpg),f);gtk_box_append(controls,choose);
     }
+    if(!strcmp(spec->key,"drive_uuid")){GtkWidget*choose=gtk_button_new_with_label("Choose drive…");g_signal_connect(choose,"clicked",G_CALLBACK(choose_drive),f);gtk_box_append(row,choose);}
     if(!strcmp(kind,"file")||!strcmp(kind,"folder")||!strcmp(kind,"path")||!strcmp(kind,"save")){GtkWidget*b=gtk_button_new_from_icon_name("document-open-symbolic");gtk_widget_set_tooltip_text(b,"Choose a file or folder");gtk_box_append(line,b);g_signal_connect(b,"clicked",G_CALLBACK(choose_file),f);if(!strcmp(kind,"path")){b=gtk_button_new_from_icon_name("folder-open-symbolic");gtk_widget_set_tooltip_text(b,"Choose a folder");g_object_set_data(G_OBJECT(b),"choose-folder",GINT_TO_POINTER(1));gtk_box_append(line,b);g_signal_connect(b,"clicked",G_CALLBACK(choose_file),f);}}
   }
   gtk_label_set_mnemonic_widget(GTK_LABEL(name),f->widget);
@@ -989,15 +1014,33 @@ static void collection_cards(App*app,gint i,const char*empty){
 }
 static void theme_changed(GtkDropDown*drop,GParamSpec*pspec,gpointer data){(void)pspec;App*app=data;guint i=gtk_drop_down_get_selected(drop);app->preferred_theme=i;adw_style_manager_set_color_scheme(adw_style_manager_get_default(),i==1?ADW_COLOR_SCHEME_FORCE_LIGHT:i==2?ADW_COLOR_SCHEME_FORCE_DARK:ADW_COLOR_SCHEME_DEFAULT);save_preferences(app);}
 static void notifications_changed(GtkCheckButton*button,gpointer data){App*app=data;app->show_notifications=gtk_check_button_get_active(button);save_preferences(app);}
+#if ADW_CHECK_VERSION(1, 5, 0)
+#define OV_ABOUT_API(name) adw_about_dialog_##name
+#define OV_ABOUT(obj) ADW_ABOUT_DIALOG(obj)
+#else
+#define OV_ABOUT_API(name) adw_about_window_##name
+#define OV_ABOUT(obj) ADW_ABOUT_WINDOW(obj)
+#endif
 static void about_clicked(GtkButton*button,gpointer data){
   (void)button;App*app=data;const char*developers[]={"Vast Development Method",NULL};
-  GtkWidget*w=adw_about_window_new();adw_about_window_set_application_name(ADW_ABOUT_WINDOW(w),"OctoVault");adw_about_window_set_application_icon(ADW_ABOUT_WINDOW(w),"io.vdm.OctoVault");
-  adw_about_window_set_developer_name(ADW_ABOUT_WINDOW(w),"Vast Development Method");adw_about_window_set_developers(ADW_ABOUT_WINDOW(w),developers);adw_about_window_set_version(ADW_ABOUT_WINDOW(w),OCTOVAULT_VERSION);adw_about_window_set_website(ADW_ABOUT_WINDOW(w),"https://www.vdm.io");adw_about_window_set_issue_url(ADW_ABOUT_WINDOW(w),"https://github.com/octoleo/octovault/issues");adw_about_window_set_copyright(ADW_ABOUT_WINDOW(w),"© 2026 Vast Development Method");adw_about_window_set_license_type(ADW_ABOUT_WINDOW(w),GTK_LICENSE_APACHE_2_0);adw_about_window_set_comments(ADW_ABOUT_WINDOW(w),"Encrypted vaults and independent backups. Part of the OctoLeo Suite.");
+#if ADW_CHECK_VERSION(1, 5, 0)
+  AdwDialog*w=adw_about_dialog_new();
+#else
+  GtkWidget*w=adw_about_window_new();
+#endif
+  OV_ABOUT_API(set_application_name)(OV_ABOUT(w),"OctoVault");OV_ABOUT_API(set_application_icon)(OV_ABOUT(w),"io.vdm.OctoVault");
+  OV_ABOUT_API(set_developer_name)(OV_ABOUT(w),"Vast Development Method");OV_ABOUT_API(set_developers)(OV_ABOUT(w),developers);OV_ABOUT_API(set_version)(OV_ABOUT(w),OCTOVAULT_VERSION);OV_ABOUT_API(set_website)(OV_ABOUT(w),"https://www.vdm.io");OV_ABOUT_API(set_issue_url)(OV_ABOUT(w),"https://github.com/octoleo/octovault/issues");OV_ABOUT_API(set_copyright)(OV_ABOUT(w),"© 2026 Vast Development Method");OV_ABOUT_API(set_license_type)(OV_ABOUT(w),GTK_LICENSE_APACHE_2_0);OV_ABOUT_API(set_comments)(OV_ABOUT(w),"Encrypted vaults and independent backups. Part of the OctoLeo Suite.");
   const char*tomb[]={"Tomb developers — https://dyne.org/tomb/",NULL};const char*restic[]={"Restic contributors — https://restic.net/",NULL};const char*desktop[]={"GNOME, GTK and libadwaita contributors", "systemd, GnuPG, cryptsetup and Linux contributors",NULL};
-  adw_about_window_add_credit_section(ADW_ABOUT_WINDOW(w),"Vault technology",tomb);adw_about_window_add_credit_section(ADW_ABOUT_WINDOW(w),"Backup technology",restic);adw_about_window_add_credit_section(ADW_ABOUT_WINDOW(w),"Desktop and system integration",desktop);
-  adw_about_window_add_legal_section(ADW_ABOUT_WINDOW(w),"Tomb","Tomb contributors",GTK_LICENSE_GPL_3_0,NULL);adw_about_window_add_legal_section(ADW_ABOUT_WINDOW(w),"Restic","Restic contributors",GTK_LICENSE_CUSTOM,"BSD 2-Clause License. See https://github.com/restic/restic/blob/master/LICENSE for the full license and copyright notices.");
+  OV_ABOUT_API(add_credit_section)(OV_ABOUT(w),"Vault technology",tomb);OV_ABOUT_API(add_credit_section)(OV_ABOUT(w),"Backup technology",restic);OV_ABOUT_API(add_credit_section)(OV_ABOUT(w),"Desktop and system integration",desktop);
+  OV_ABOUT_API(add_legal_section)(OV_ABOUT(w),"Tomb","Tomb contributors",GTK_LICENSE_GPL_3_0,NULL);OV_ABOUT_API(add_legal_section)(OV_ABOUT(w),"Restic","Restic contributors",GTK_LICENSE_CUSTOM,"BSD 2-Clause License. See https://github.com/restic/restic/blob/master/LICENSE for the full license and copyright notices.");
+#if ADW_CHECK_VERSION(1, 5, 0)
+  adw_dialog_present(w,GTK_WIDGET(app->window));
+#else
   gtk_window_set_transient_for(GTK_WINDOW(w),app->window);gtk_window_present(GTK_WINDOW(w));
+#endif
 }
+#undef OV_ABOUT_API
+#undef OV_ABOUT
 static void render_page(App*app){
   if(!app->body)return;
   GtkWidget*child;while((child=gtk_widget_get_first_child(GTK_WIDGET(app->body))))gtk_box_remove(app->body,child);
