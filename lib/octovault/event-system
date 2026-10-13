@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Fail a required pre-sleep unit if any managed owner cannot close their vaults.
+set -euo pipefail
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+[[ $EUID -eq 0 && $# -eq 1 ]] || exit 64
+case "$1" in sleep|shutdown) ;; *) exit 64 ;; esac
+export OV_INTERNAL=1
+failed=0
+for state in /var/lib/octovault/users/[0-9]*; do
+    [[ -d "$state" ]] || continue
+    owner=${state##*/}
+    [[ $owner =~ ^[0-9]+$ ]] || continue
+    # Stop only the owner's scheduled backups, and only if this event has a
+    # configured lock policy. A bounded stop releases Restic locks normally;
+    # systemd kills the remaining cgroup after TimeoutStopSec if necessary.
+    needs_lock=0
+    for vault in "$state/vaults/"*.json; do
+        [[ -f "$vault" && ! -L "$vault" ]] || continue
+        if jq -e --arg event "$1" '(.close_on // ["shutdown"]) | index($event) != null' "$vault" >/dev/null; then
+            needs_lock=1; break
+        fi
+    done
+    services=()
+    if ((needs_lock)); then
+        for plan in "$state/plans/"*.json; do
+            [[ -f "$plan" && ! -L "$plan" ]] || continue
+            id=$(jq -er '.id' "$plan") || continue
+            [[ $id =~ ^[a-zA-Z0-9_-]{1,64}$ ]] || continue
+            unit="octovault-backup-$owner-$id.service"
+            active=$(systemctl show --property=ActiveState --value "$unit" 2>/dev/null) || continue
+            case "$active" in active|activating|reloading) ;;
+                *) continue ;; esac
+            install -d -m 0700 "$state/events"
+            (umask 077; jq -nc --arg id "$id" --arg reason "$1" \
+                '{plan_id:$id,reason:$reason,state:"retry-after-resume"}' > "$state/events/interrupted-$id.json")
+            services+=("$unit")
+        done
+        if ((${#services[@]})); then
+            if ! timeout --signal=TERM --kill-after=2s 25s systemctl stop "${services[@]}"; then
+                printf 'OctoVault: backup cancellation for user %s did not finish in time.\n' "$owner" >&2
+            fi
+        fi
+    fi
+    if ! jq -nc --arg event "$1" '{op:"event.handle",params:{event:$event}}' | /usr/libexec/octovault/backend "$owner"; then
+        printf 'OctoVault: event %s did not finish for user %s.\n' "$1" "$owner" >&2
+        failed=1
+    fi
+done
+exit "$failed"

@@ -3,17 +3,18 @@
 set -Eeuo pipefail
 umask 077
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C.UTF-8
-unset BASH_ENV ENV CDPATH GLOBIGNORE OV_SECRET_FD
+unset BASH_ENV ENV CDPATH GLOBIGNORE OV_SECRET_FD OV_OLD_SECRET_FD OV_OLD_KEY_PATH OV_RESOURCE_FD
 cd /
 readonly OV_LIB=/usr/lib/octovault
 source "$OV_LIB/common.sh"
-trap 'ov_secret_close' EXIT
+trap 'ov_secret_close; ov_resource_unlock; if declare -F ov_vault_cleanup >/dev/null; then ov_vault_cleanup; fi' EXIT
 trap 'ov_fail operation_failed "The operation could not complete. Existing recovery material has been retained."' ERR
 ov_init "${1-}"
 request=$(head -c 1048577)
 ((${#request} <= 1048576)) || ov_fail request_too_large 'Request exceeds the supported size.'
 jq -e 'type=="object" and (.op|type=="string") and ((.params // {})|type=="object")' <<<"$request" >/dev/null || ov_fail invalid_request 'Invalid operation request.'
 OV_OP=$(jq -r .op <<<"$request")
+# shellcheck disable=SC2034 # Shared request consumed by sourced adapters.
 OV_PARAMS=$(jq -c '.params // {}' <<<"$request")
 unset request
 source "$OV_LIB/vault.sh"
