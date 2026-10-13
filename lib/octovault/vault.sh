@@ -722,7 +722,7 @@ ov_vault_create() {
             ov_fail key_failed "The OpenPGP-protected key could not be created. The uninitialized container was retained."
         ov_as_user chmod 0600 -- "$tempkey" || ov_fail permission_denied "Could not secure the encrypted key."
     else
-        ov_vault_temporary; rootkey="$OV_VAULT_TEMP_DIR/created.key"
+        ov_vault_temporary; rootkey="$OV_VAULT_TEMP_DIR/created-$id.key"
         ov_vault_tomb forge -k "$rootkey" || ov_fail key_failed "Key generation failed. The uninitialized container was retained."
         ov_vault_publish "$rootkey" "$tempkey" || ov_fail key_failed "The encrypted recovery key could not be saved."
     fi

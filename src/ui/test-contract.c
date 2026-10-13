@@ -142,6 +142,125 @@ static void test_usable_encryption_keys(void)
     g_ptr_array_unref(keys);
 }
 
+static const Spec *find_spec(const Spec *spec,const char *key)
+{
+    for(guint i=0;spec[i].key;i++)if(!strcmp(spec[i].key,key))return &spec[i];
+    return NULL;
+}
+
+static void test_guided_creation_fields(void)
+{
+    const Spec *create=specifications("vault.create");
+    const Spec *import=specifications("vault.import");
+    g_assert_true(create!=import);
+    g_assert_cmpstr(find_spec(create,"directory")->kind,==,"folder");
+    g_assert_null(find_spec(create,"file"));
+    g_assert_null(find_spec(create,"mountpoint"));
+    g_assert_cmpstr(find_spec(create,"key_file")->kind,==,"file");
+    g_assert_cmpstr(find_spec(create,"image_source")->kind,==,"file");
+    g_assert_null(find_spec(create,"use_existing_key")->options);
+    g_assert_cmpstr(find_spec(import,"file")->kind,==,"file");
+    g_assert_cmpstr(find_spec(import,"key_file")->kind,==,"file");
+    g_assert_null(find_spec(import,"password"));
+    const char *methods[]={"key","image","text","gpg"};
+    for(guint i=0;i<G_N_ELEMENTS(methods);i++)for(guint existing=0;existing<2;existing++){
+        const char *auth=methods[i];
+        g_assert_cmpint(vault_create_field_visible("key_file",auth,existing),==,(gboolean)existing);
+        g_assert_cmpint(vault_create_field_visible("image_source",auth,existing),==,!existing&&!strcmp(auth,"image"));
+        g_assert_cmpint(vault_create_field_visible("recipient",auth,existing),==,!existing&&!strcmp(auth,"gpg"));
+        g_assert_cmpint(vault_create_field_visible("cipher_file",auth,existing),==,existing&&!strcmp(auth,"text"));
+        g_assert_cmpint(vault_create_field_visible("password",auth,existing),==,strcmp(auth,"gpg")!=0);
+        g_assert_cmpint(vault_create_field_visible("_confirm_password",auth,existing),==,!existing&&strcmp(auth,"gpg")!=0);
+        g_assert_nonnull(vault_create_guidance(auth,existing));
+    }
+}
+
+static void test_guided_creation_validation(void)
+{
+    JsonObject *params=json_object_new();
+    json_object_set_string_member(params,"name","Personal");
+    json_object_set_string_member(params,"directory",g_get_tmp_dir());
+    json_object_set_double_member(params,"size_gb",10);
+    json_object_set_string_member(params,"auth","key");
+    json_object_set_boolean_member(params,"use_existing_key",FALSE);
+    g_assert_nonnull(vault_creation_error(params));
+    json_object_set_string_member(params,"password","test-only-passphrase");
+    g_assert_null(vault_creation_error(params));
+    json_object_set_string_member(params,"name","../Personal");
+    g_assert_nonnull(vault_creation_error(params));
+    json_object_set_string_member(params,"name","Personal\nDocuments");
+    g_assert_nonnull(vault_creation_error(params));
+    json_object_set_string_member(params,"name","Personal");
+    json_object_set_string_member(params,"directory","relative/path");
+    g_assert_nonnull(vault_creation_error(params));
+    json_object_set_string_member(params,"directory",g_get_tmp_dir());
+    json_object_set_boolean_member(params,"use_existing_key",TRUE);
+    g_assert_nonnull(vault_creation_error(params));
+    json_object_set_boolean_member(params,"use_existing_key",FALSE);
+    json_object_set_string_member(params,"auth","image");
+    g_assert_nonnull(vault_creation_error(params));
+    json_object_set_string_member(params,"auth","text");
+    g_assert_null(vault_creation_error(params));
+    json_object_remove_member(params,"password");
+    json_object_set_string_member(params,"auth","gpg");
+    g_assert_nonnull(vault_creation_error(params));
+    json_object_set_string_member(params,"recipient","1111111111111111111111111111111111111111!");
+    g_assert_null(vault_creation_error(params));
+    json_object_unref(params);
+}
+
+static void test_advanced_defaults_and_preservation(void)
+{
+    Form form={0};form.original=json_object_new();
+    const Spec*plan=specifications("backup.save");
+    const Spec*retention=find_spec(plan,"retention.keep_daily");
+    JsonNode*value=hidden_advanced_value(&form,retention);
+    g_assert_cmpint(json_node_get_int(value),==,0);json_node_free(value);
+    JsonObject*saved_retention=json_object_new();json_object_set_int_member(saved_retention,"keep_daily",31);json_object_set_object_member(form.original,"retention",saved_retention);
+    value=hidden_advanced_value(&form,retention);g_assert_cmpint(json_node_get_int(value),==,31);json_node_free(value);
+    json_object_set_string_member(form.original,"path","octovault-existing-storage");
+    value=hidden_advanced_value(&form,find_spec(specifications("repository.create"),"path"));
+    g_assert_cmpstr(json_node_get_string(value),==,"octovault-existing-storage");json_node_free(value);
+    json_object_set_string_member(form.original,"password","never-restore-this-secret");
+    value=hidden_advanced_value(&form,find_spec(specifications("repository.password"),"password"));
+    g_assert_cmpstr(json_node_get_string(value),==,"");json_node_free(value);
+    value=field_default(find_spec(specifications("vault.create"),"close_on"));
+    g_assert_true(string_array_has(value,"shutdown"));g_assert_false(string_array_has(value,"sleep"));json_node_free(value);
+    value=field_default(find_spec(specifications("destination.save"),"port"));
+    g_assert_cmpint(json_node_get_int(value),==,22);json_node_free(value);
+    g_assert_false(advanced_field("backup.save","calendar"));
+    g_assert_false(advanced_field("backup.save","drive_uuid"));
+    g_assert_false(advanced_field("backup.save","vault_id"));
+    g_assert_false(advanced_field("destination.save","host_fingerprint"));
+    g_assert_false(advanced_field("destination.save","ssh_private_key"));
+    json_object_unref(form.original);
+}
+
+static void test_destination_guidance(void)
+{
+    JsonObject*params=json_object_new(),*original=json_object_new();
+    json_object_set_string_member(params,"type","local");
+    g_assert_nonnull(destination_setup_error(params,original));
+    json_object_set_string_member(params,"path",g_get_tmp_dir());
+    g_assert_null(destination_setup_error(params,original));
+    json_object_set_string_member(params,"type","s3");
+    json_object_set_string_member(params,"endpoint","https://storage.example.test");
+    json_object_set_string_member(params,"bucket","my-backups");
+    g_assert_nonnull(destination_setup_error(params,original));
+    json_object_set_string_member(params,"access_key","test-only-id");
+    json_object_set_string_member(params,"secret_key","test-only-secret");
+    g_assert_null(destination_setup_error(params,original));
+    json_object_set_string_member(params,"type","sftp");
+    json_object_set_string_member(params,"host","example.test");
+    json_object_set_string_member(params,"user","backup");
+    g_assert_nonnull(destination_setup_error(params,original));
+    json_object_set_string_member(params,"host_fingerprint","SHA256:test-only");
+    g_assert_nonnull(destination_setup_error(params,original));
+    json_object_set_string_member(params,"ssh_private_key","test-only-private-key");
+    g_assert_null(destination_setup_error(params,original));
+    json_object_unref(params);json_object_unref(original);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -151,5 +270,9 @@ int main(int argc, char **argv)
     g_test_add_func("/ui/readable-recovery", test_readable_recovery);
     g_test_add_func("/ui/openpgp-card-selection", test_openpgp_card_selection);
     g_test_add_func("/ui/usable-encryption-keys", test_usable_encryption_keys);
+    g_test_add_func("/ui/guided-creation-fields", test_guided_creation_fields);
+    g_test_add_func("/ui/guided-creation-validation", test_guided_creation_validation);
+    g_test_add_func("/ui/advanced-defaults-preservation", test_advanced_defaults_and_preservation);
+    g_test_add_func("/ui/destination-guidance", test_destination_guidance);
     return g_test_run();
 }

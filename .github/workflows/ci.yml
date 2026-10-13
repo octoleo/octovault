@@ -48,8 +48,18 @@ jobs:
           useradd --create-home octovault-test
           chmod -R a+rX "$GITHUB_WORKSPACE"
           runuser -u octovault-test -- dbus-run-session -- xvfb-run -a env GTK_A11Y=none G_DEBUG=fatal-criticals GSK_RENDERER=cairo XDG_DATA_DIRS="$GITHUB_WORKSPACE/debian/octovault/usr/share:/usr/share" build/octovault-gtk --screenshot /tmp/octovault.png
+          runuser -u octovault-test -- dbus-run-session -- xvfb-run -a env GTK_A11Y=none G_DEBUG=fatal-criticals GSK_RENDERER=cairo XDG_DATA_DIRS="$GITHUB_WORKSPACE/debian/octovault/usr/share:/usr/share" build/octovault-gtk --screenshot-create /tmp/octovault-create.png
+          runuser -u octovault-test -- dbus-run-session -- xvfb-run -a env GTK_A11Y=none G_DEBUG=fatal-criticals GSK_RENDERER=cairo XDG_DATA_DIRS="$GITHUB_WORKSPACE/debian/octovault/usr/share:/usr/share" build/octovault-gtk --screenshot-backup /tmp/octovault-backup.png
+          runuser -u octovault-test -- dbus-run-session -- xvfb-run -a env GTK_A11Y=none G_DEBUG=fatal-criticals GSK_RENDERER=cairo XDG_DATA_DIRS="$GITHUB_WORKSPACE/debian/octovault/usr/share:/usr/share" build/octovault-gtk --screenshot-backup-files /tmp/octovault-backup-files.png
+          runuser -u octovault-test -- dbus-run-session -- xvfb-run -a env GTK_A11Y=none G_DEBUG=fatal-criticals GSK_RENDERER=cairo XDG_DATA_DIRS="$GITHUB_WORKSPACE/debian/octovault/usr/share:/usr/share" build/octovault-gtk --screenshot-destination /tmp/octovault-destination.png
+          runuser -u octovault-test -- dbus-run-session -- xvfb-run -a env GTK_A11Y=none G_DEBUG=fatal-criticals GSK_RENDERER=cairo XDG_DATA_DIRS="$GITHUB_WORKSPACE/debian/octovault/usr/share:/usr/share" build/octovault-gtk --screenshot-destination /tmp/octovault-destination-advanced.png --screenshot-advanced
           mkdir -p build/screenshots
           cp /tmp/octovault.png build/screenshots/OctoVault.png
+          cp /tmp/octovault-create.png build/screenshots/Create-vault.png
+          cp /tmp/octovault-backup.png build/screenshots/Create-backup.png
+          cp /tmp/octovault-backup-files.png build/screenshots/Backup-files.png
+          cp /tmp/octovault-destination.png build/screenshots/Backup-server.png
+          cp /tmp/octovault-destination-advanced.png build/screenshots/Backup-server-advanced.png
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:

@@ -28,7 +28,7 @@ build/octovaultd: src/service/daemon.c src/service/client.c src/service/client.h
 build/octovault: src/service/cli.c src/service/client.c src/service/client.h | build
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(CORE_CFLAGS) src/service/cli.c src/service/client.c -o $@ $(LDFLAGS) $(CORE_LIBS)
 
-build/octovault-gtk: src/ui/main.c src/service/client.c src/service/client.h | build
+build/octovault-gtk: src/ui/main.c src/ui/backup-setup.c src/service/client.c src/service/client.h | build
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(GUI_CFLAGS) src/ui/main.c src/service/client.c -o $@ $(LDFLAGS) $(GUI_LIBS)
 
 build/octovault-session: src/session/main.c src/service/client.c src/service/client.h | build
