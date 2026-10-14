@@ -1,3 +1,11 @@
+octovault (1.1.1) unstable; urgency=medium
+
+  * Fix file and folder navigation in the protected GNOME application process.
+  * Use GTK's in-process chooser for all file, folder, and save actions.
+  * Exercise actual chooser buttons and selected paths in native CI tests.
+
+ -- Vast Development Method <octoleo@users.noreply.github.com>  Wed, 14 Oct 2026 09:30:00 +0000
+
 octovault (1.1.0) unstable; urgency=medium
 
   * Simplify vault creation with folder selection and managed key generation.

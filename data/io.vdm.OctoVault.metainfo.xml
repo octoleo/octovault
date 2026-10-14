@@ -18,6 +18,7 @@
   <provides><binary>octovault</binary><binary>octovault-gtk</binary></provides>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.1.1" date="2026-10-14"><description><p>Fix native file and folder navigation while retaining process protection, with regression tests for the actual chooser controls.</p></description></release>
     <release version="1.1.0" date="2026-10-13"><description><p>Guided vault and backup setup with sensible defaults, multiple file and folder selection, automatic key management, and optional advanced controls.</p></description></release>
     <release version="1.0.0" date="2026-10-13"><description><p>Initial release of vault management, independent encrypted backups, native GNOME controls, and command-line access.</p></description></release>
   </releases>
