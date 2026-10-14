@@ -32,7 +32,7 @@ jobs:
       - name: Install build and integration-test dependencies
         run: |
           apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends ca-certificates git build-essential debhelper pkg-config libgtk-4-dev libadwaita-1-dev libjson-glib-dev libglib2.0-dev desktop-file-utils libxml2-utils appstream apt-utils jq rsync restic tomb cryptsetup-bin systemd systemd-sysv curl openssh-client gnupg pinentry-gnome3 steghide qrencode lsof polkitd dbus dbus-daemon xvfb xauth adwaita-icon-theme shellcheck
+          DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends ca-certificates git build-essential debhelper pkg-config libgtk-4-dev libadwaita-1-dev libjson-glib-dev libglib2.0-dev desktop-file-utils libxml2-utils appstream apt-utils jq rsync restic tomb cryptsetup-bin systemd systemd-sysv curl openssh-client gnupg pinentry-gnome3 steghide qrencode lsof polkitd dbus dbus-daemon xvfb xauth adwaita-icon-theme shellcheck xdg-desktop-portal xdg-desktop-portal-gtk
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
@@ -47,6 +47,7 @@ jobs:
         run: |
           useradd --create-home octovault-test
           chmod -R a+rX "$GITHUB_WORKSPACE"
+          runuser -u octovault-test -- dbus-run-session -- xvfb-run -a env GDK_DEBUG=portals OCTOVAULT_PICKER_SCREENSHOT=/tmp/octovault-picker.png bash tests/test-picker.sh --native
           runuser -u octovault-test -- dbus-run-session -- xvfb-run -a env GTK_A11Y=none G_DEBUG=fatal-criticals GSK_RENDERER=cairo XDG_DATA_DIRS="$GITHUB_WORKSPACE/debian/octovault/usr/share:/usr/share" build/octovault-gtk --screenshot /tmp/octovault.png
           runuser -u octovault-test -- dbus-run-session -- xvfb-run -a env GTK_A11Y=none G_DEBUG=fatal-criticals GSK_RENDERER=cairo XDG_DATA_DIRS="$GITHUB_WORKSPACE/debian/octovault/usr/share:/usr/share" build/octovault-gtk --screenshot-create /tmp/octovault-create.png
           runuser -u octovault-test -- dbus-run-session -- xvfb-run -a env GTK_A11Y=none G_DEBUG=fatal-criticals GSK_RENDERER=cairo XDG_DATA_DIRS="$GITHUB_WORKSPACE/debian/octovault/usr/share:/usr/share" build/octovault-gtk --screenshot-backup /tmp/octovault-backup.png
@@ -54,6 +55,7 @@ jobs:
           runuser -u octovault-test -- dbus-run-session -- xvfb-run -a env GTK_A11Y=none G_DEBUG=fatal-criticals GSK_RENDERER=cairo XDG_DATA_DIRS="$GITHUB_WORKSPACE/debian/octovault/usr/share:/usr/share" build/octovault-gtk --screenshot-destination /tmp/octovault-destination.png
           runuser -u octovault-test -- dbus-run-session -- xvfb-run -a env GTK_A11Y=none G_DEBUG=fatal-criticals GSK_RENDERER=cairo XDG_DATA_DIRS="$GITHUB_WORKSPACE/debian/octovault/usr/share:/usr/share" build/octovault-gtk --screenshot-destination /tmp/octovault-destination-advanced.png --screenshot-advanced
           mkdir -p build/screenshots
+          cp /tmp/octovault-picker.png build/screenshots/File-navigator.png
           cp /tmp/octovault.png build/screenshots/OctoVault.png
           cp /tmp/octovault-create.png build/screenshots/Create-vault.png
           cp /tmp/octovault-backup.png build/screenshots/Create-backup.png
