@@ -663,63 +663,7 @@ static char *field_text(Field *f){
   if(GTK_IS_TEXT_VIEW(f->widget)){GtkTextBuffer *b=gtk_text_view_get_buffer(GTK_TEXT_VIEW(f->widget));GtkTextIter start,end;gtk_text_buffer_get_bounds(b,&start,&end);return gtk_text_buffer_get_text(b,&start,&end,FALSE);}
   return g_strdup(gtk_editable_get_text(GTK_EDITABLE(f->widget)));
 }
-typedef struct { GtkWidget *widget; GtkWindow *parent; gboolean secret; int mode; } Picker;
-static void file_chosen(GObject *source,GAsyncResult *result,gpointer data){
-  Picker*p=data;
-  GError *select_error=NULL;
-  GtkFileDialog *dialog=GTK_FILE_DIALOG(source);
-  GListModel*files=p->mode==4?gtk_file_dialog_select_multiple_folders_finish(dialog,result,&select_error):p->mode==3?gtk_file_dialog_open_multiple_finish(dialog,result,&select_error):NULL;
-  GFile *file=p->mode>=3?NULL:p->mode==2?gtk_file_dialog_select_folder_finish(dialog,result,&select_error):p->mode==1?gtk_file_dialog_save_finish(dialog,result,&select_error):gtk_file_dialog_open_finish(dialog,result,&select_error);
-  for(guint index=0;;index++){
-    if(files)file=index<g_list_model_get_n_items(files)?g_list_model_get_item(files,index):NULL;
-    if(!file)break;
-    char *path=g_file_get_path(file);
-    if(path){
-      if(p->secret){
-        GError*error=NULL;GFileInfo*info=g_file_query_info(file,G_FILE_ATTRIBUTE_STANDARD_TYPE,G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS,NULL,&error);
-        GFileInputStream*stream=info&&g_file_info_get_file_type(info)==G_FILE_TYPE_REGULAR?g_file_read(file,NULL,&error):NULL;
-        char*contents=g_malloc0(262146);gsize size=0;
-        gboolean read_ok=stream&&g_input_stream_read_all(G_INPUT_STREAM(stream),contents,262145,&size,NULL,&error);
-        if(read_ok&&size<=262144&&!memchr(contents,'\0',size)&&g_utf8_validate(contents,(gssize)size,NULL))gtk_text_buffer_set_text(gtk_text_view_get_buffer(GTK_TEXT_VIEW(p->widget)),contents,(int)size);
-        else{GtkAlertDialog*message=gtk_alert_dialog_new("%s",error?error->message:"Select a regular UTF-8 private-key file no larger than 256 KiB.");gtk_alert_dialog_show(message,p->parent);g_object_unref(message);}
-        volatile char*secret=(volatile char*)contents;for(gsize i=0;i<262146;i++)secret[i]=0;
-        g_free(contents);g_clear_object(&stream);g_clear_object(&info);g_clear_error(&error);
-      }
-      else if(GTK_IS_TEXT_VIEW(p->widget)){
-        if(strchr(path,'\n')||strchr(path,'\r')){GtkAlertDialog*message=gtk_alert_dialog_new("Choose a path without a line break in its name.");gtk_alert_dialog_show(message,p->parent);g_object_unref(message);}
-        else{GtkTextBuffer*b=gtk_text_view_get_buffer(GTK_TEXT_VIEW(p->widget));GtkTextIter start,end;gtk_text_buffer_get_bounds(b,&start,&end);char*current=gtk_text_buffer_get_text(b,&start,&end,FALSE);char**lines=g_strsplit(current,"\n",-1);gboolean duplicate=FALSE;for(guint i=0;lines[i];i++)if(!strcmp(lines[i],path))duplicate=TRUE;if(!duplicate){if(*current)gtk_text_buffer_insert(b,&end,"\n",1);gtk_text_buffer_insert(b,&end,path,-1);}g_strfreev(lines);g_free(current);}
-      }
-      else gtk_editable_set_text(GTK_EDITABLE(p->widget),path);
-    }else{GtkAlertDialog*message=gtk_alert_dialog_new("Choose a local file or mounted drive. Remote document URLs are not supported for this operation.");gtk_alert_dialog_show(message,p->parent);g_object_unref(message);}g_free(path);g_object_unref(file);
-    if(!files)break;
-  }
-  g_clear_object(&files);
-  if(select_error&&!g_error_matches(select_error,GTK_DIALOG_ERROR,GTK_DIALOG_ERROR_DISMISSED)&&!g_error_matches(select_error,GTK_DIALOG_ERROR,GTK_DIALOG_ERROR_CANCELLED)&&!g_error_matches(select_error,G_IO_ERROR,G_IO_ERROR_CANCELLED)){
-    GtkAlertDialog*message=gtk_alert_dialog_new("Could not open the file chooser");gtk_alert_dialog_set_detail(message,select_error->message);gtk_alert_dialog_show(message,p->parent);g_object_unref(message);
-  }
-  g_clear_error(&select_error);g_object_unref(p->widget);g_object_unref(p->parent);g_free(p);
-}
-static void choose_file(GtkButton *button,gpointer data){
-  Field*f=data;const char *kind=f->spec->kind;
-  GtkWindow *parent=GTK_WINDOW(gtk_widget_get_root(GTK_WIDGET(button)));
-  gboolean folder=!strcmp(kind,"folder")||GPOINTER_TO_INT(g_object_get_data(G_OBJECT(button),"choose-folder"));
-  GtkFileDialog *dialog=gtk_file_dialog_new();gtk_file_dialog_set_title(dialog,folder?"Choose a folder":"Choose a file");
-  Picker*p=g_new0(Picker,1);p->widget=g_object_ref(f->widget);p->parent=g_object_ref(parent);p->secret=!strcmp(kind,"secret-file");p->mode=folder?2:!strcmp(kind,"save")?1:0;
-  if(!strcmp(kind,"paths"))p->mode=folder?4:3;
-  const char*current=GTK_IS_EDITABLE(f->widget)?gtk_editable_get_text(GTK_EDITABLE(f->widget)):"";
-  char*initial=*current&&g_path_is_absolute(current)?(g_file_test(current,G_FILE_TEST_IS_DIR)?g_strdup(current):g_path_get_dirname(current)):g_strdup(g_get_home_dir());
-  if(g_file_test(initial,G_FILE_TEST_IS_DIR)){GFile*start=g_file_new_for_path(initial);gtk_file_dialog_set_initial_folder(dialog,start);g_object_unref(start);}g_free(initial);
-  if(!strcmp(f->spec->key,"image_source")){
-    GtkFileFilter*filter=gtk_file_filter_new();gtk_file_filter_set_name(filter,"JPEG or BMP images");gtk_file_filter_add_mime_type(filter,"image/jpeg");gtk_file_filter_add_mime_type(filter,"image/bmp");gtk_file_filter_add_pattern(filter,"*.jpg");gtk_file_filter_add_pattern(filter,"*.jpeg");gtk_file_filter_add_pattern(filter,"*.bmp");gtk_file_filter_add_pattern(filter,"*.JPG");gtk_file_filter_add_pattern(filter,"*.JPEG");gtk_file_filter_add_pattern(filter,"*.BMP");
-    GListStore*filters=g_list_store_new(GTK_TYPE_FILE_FILTER);g_list_store_append(filters,filter);gtk_file_dialog_set_filters(dialog,G_LIST_MODEL(filters));gtk_file_dialog_set_default_filter(dialog,filter);g_object_unref(filters);g_object_unref(filter);
-  }
-  if(p->mode==4)gtk_file_dialog_select_multiple_folders(dialog,parent,NULL,file_chosen,p);
-  else if(p->mode==3)gtk_file_dialog_open_multiple(dialog,parent,NULL,file_chosen,p);
-  else if(p->mode==2)gtk_file_dialog_select_folder(dialog,parent,NULL,file_chosen,p);
-  else if(p->mode==1)gtk_file_dialog_save(dialog,parent,NULL,file_chosen,p);
-  else gtk_file_dialog_open(dialog,parent,NULL,file_chosen,p);
-  g_object_unref(dialog);
-}
+#include "file-picker.c"
 
 /* Public-key discovery is deliberately unprivileged and read-only. GnuPG's
  * colon protocol is used rather than parsing translated terminal output. */
