@@ -21,6 +21,16 @@ if [[ -z ${DISPLAY:-} && -z ${WAYLAND_DISPLAY:-} ]]; then
     printf 'Native picker tests require a display (run under xvfb-run in CI).\n' >&2
     exit 1
 fi
+# Force an actual working desktop FileChooser portal for the regression gate.
+# Merely installing its packages can silently leave GTK using a fallback when
+# D-Bus activation did not inherit the Xvfb display.
+if [[ ${GDK_DEBUG:-} == *portals* || ${OCTOVAULT_TEST_PORTAL:-0} == 1 ]]; then
+    printf 'Verifying the desktop FileChooser portal is available...\n'
+    gdbus call --session --dest org.freedesktop.portal.Desktop \
+        --object-path /org/freedesktop/portal/desktop \
+        --method org.freedesktop.DBus.Properties.Get \
+        org.freedesktop.portal.FileChooser version
+fi
 mkdir -p "$work/config" "$work/cache" "$work/data"
 G_DEBUG=fatal-criticals GTK_A11Y=none GSK_RENDERER=cairo GSETTINGS_BACKEND=memory \
     XDG_CONFIG_HOME="$work/config" XDG_CACHE_HOME="$work/cache" XDG_DATA_HOME="$work/data" \
