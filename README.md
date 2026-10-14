@@ -10,7 +10,7 @@ Download the `.deb` matching **your Ubuntu release and CPU architecture** from [
 
 ```bash
 sha256sum --check SHA256SUMS-ubuntu26.04
-sudo apt install ./octovault_1.1.0_ubuntu26.04_amd64.deb
+sudo apt install ./octovault_1.1.1_ubuntu26.04_amd64.deb
 ```
 
 APT installs the required encryption, backup, desktop, and system-integration dependencies. The checksum detects damaged or changed downloads; it is not an independent publisher signature. A downloaded Debian package does not enroll the computer into an automatic update repository.
