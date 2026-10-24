@@ -15,7 +15,7 @@ ov_vault_temporary() {
 ov_vault_cleanup() {
     if [[ -n ${OV_VAULT_PIN_RECORD:-} ]]; then ov_vault_unpin "$OV_VAULT_PIN_RECORD" || true; fi
     [[ -z ${OV_VAULT_TEMP_DIR:-} ]] || rm -rf -- "$OV_VAULT_TEMP_DIR"
-    unset OV_VAULT_TEMP_DIR OV_VAULT_PASSWORD OV_VAULT_OLD_PASSWORD
+    unset OV_VAULT_TEMP_DIR OV_VAULT_PASSWORD OV_VAULT_OLD_PASSWORD OV_VAULT_TOKEN_KEY
 }
 
 ov_vault_alias() {
@@ -224,9 +224,185 @@ ov_vault_relative() {
 
 ov_vault_mib() {
     local size=$1
-    [[ $size =~ ^[0-9]+([.][0-9]{1,6})?$ ]] || ov_fail invalid_size "Size must be a positive decimal number of GB."
+    # JSON serializers may render 0.05 as 0.050000000000000003, or use
+    # scientific notation. Validate the entire token before applying bounds.
+    [[ ${#size} -le 128 && $size =~ ^[0-9]+([.][0-9]+)?([eE][+-]?[0-9]+)?$ ]] ||
+        ov_fail invalid_size "Size must be a positive decimal number of GB."
     awk -v gb="$size" 'BEGIN {m=gb*1000000000/1048576; n=int(m); if(n<m)n++; if(n<10||n>2147483647)exit 1; printf "%.0f\n",n}' ||
         ov_fail invalid_size "The requested size is outside the supported range."
+}
+
+# Interpret only documented GnuPG status records. Raw stderr and credentials
+# never become GUI messages or activity history. Numeric errors use libgpg-error
+# codes (the low 16 bits), independent of the source component.
+ov_vault_auth_failure() {
+    local status=$1 rc=$2 reason code message
+    reason=$(awk '
+      $1=="[GNUPG:]" {
+        if ($2=="SC_OP_FAILURE" && $3==1) cancelled=1
+        if ($2=="SC_OP_FAILURE" && $3==2) bad_pin=1
+        if ($2=="NO_SECKEY") missing=1
+        if ($2=="BAD_PASSPHRASE" || $2=="MISSING_PASSPHRASE") passphrase=1
+        if ($2=="INV_RECP" && $3==10) untrusted=1
+        if ($2=="ERROR" || $2=="FAILURE") {
+          split($4, parts, "_"); value=parts[1]
+          if (value ~ /^[0-9]+$/) {
+            value=value % 65536
+            if (value==99 || value==198) cancelled=1
+            if (value==85) pinentry=1
+            if (value==87) bad_pin=1
+            if (value==112) card=1
+          }
+        }
+      }
+      END {
+        if (cancelled) print "cancelled"
+        else if (bad_pin) print "bad_pin"
+        else if (pinentry) print "pinentry"
+        else if (card) print "card"
+        else if (missing) print "missing"
+        else if (untrusted) print "untrusted"
+        else if (passphrase) print "passphrase"
+      }' "$status")
+    rm -f -- "$status"
+    if [[ $rc == 124 || $rc == 137 ]]; then
+        code=authentication_timeout; message="Authentication timed out. Check the PIN or passphrase window, connect your security key if needed, and try again."
+    else
+        case $reason in
+            cancelled) code=authentication_cancelled; message="Authentication was cancelled. Try again when you are ready to enter your PIN or passphrase." ;;
+            bad_pin) code=incorrect_pin; message="The security key rejected the PIN. Check it before trying again; repeated incorrect PINs can block the key." ;;
+            pinentry) code=pinentry_unavailable; message="GnuPG could not open its PIN or passphrase window. Check your desktop GnuPG pinentry setup and try again." ;;
+            card) code=token_missing; message="The required security key is not available. Connect it and try again." ;;
+            missing) code=private_key_missing; message="The matching private OpenPGP key is unavailable. Connect its security key or restore the private key using your OpenPGP key manager." ;;
+            untrusted) code=key_untrusted; message="GnuPG does not trust this public key for encryption. Verify its fingerprint and certify it in your OpenPGP key manager, then try again." ;;
+            passphrase) code=incorrect_passphrase; message="GnuPG could not unlock the private key with that passphrase. Check the passphrase and try again." ;;
+            *) code=authentication_failed; message="GnuPG could not verify this key. Check that its private key or security key is available and that the PIN or passphrase prompt can open." ;;
+        esac
+    fi
+    ov_fail "$code" "$message"
+}
+
+ov_vault_require_token() {
+    local expected=${1:-} card fingerprint serial secrets binding status
+    ov_vault_temporary
+    status="$OV_VAULT_TEMP_DIR/card-status"
+    ov_progress authentication "Checking the connected OpenPGP security key" 1
+    if ! card=$(ov_as_user timeout --foreground --signal=TERM --kill-after=5 15 \
+        gpg --no-options --batch --no-tty --status-fd 2 --with-colons --card-status 2> "$status"); then
+        rm -f -- "$status"
+        ov_fail token_missing "No usable OpenPGP security key was found. Connect a key with its OpenPGP application enabled, then try again."
+    fi
+    fingerprint=$(awk -F: '$1=="fpr" {print toupper($3);exit}' <<< "$card")
+    serial=$(awk -F: '$1=="AID" {print toupper($2);exit}' <<< "$card")
+    [[ $fingerprint =~ ^([[:xdigit:]]{40}|[[:xdigit:]]{64})$ && -n ${fingerprint//0/} ]] ||
+        ov_fail token_unconfigured "The connected security key has no OpenPGP encryption key. Set up or restore that key with your OpenPGP key manager first."
+    [[ $serial =~ ^[[:xdigit:]]{16,64}$ ]] || ov_fail token_unconfigured "The connected OpenPGP security key could not be identified. Check its setup in your OpenPGP key manager."
+    expected=${expected%!}
+    [[ -z $expected || ${expected^^} == "$fingerprint" ]] ||
+        ov_fail token_mismatch "The connected security key does not match this vault. Connect the matching key and try again."
+    if ! secrets=$(ov_as_user timeout --foreground --signal=TERM --kill-after=5 15 \
+        gpg --no-options --batch --no-tty --with-colons --with-fingerprint --with-subkey-fingerprint \
+        --list-secret-keys -- "$fingerprint" 2> "$status"); then
+        rm -f -- "$status"
+        ov_fail private_key_missing "GnuPG cannot use the security key's private encryption key. Check the card association in your OpenPGP key manager."
+    fi
+    # GnuPG doc/DETAILS field 15 contains the token serial for sec/ssb.
+    # An empty field or '+' represents a local secret, not proof of a token.
+    binding=$(awk -F: -v wanted="$fingerprint" '
+      $1=="sec" || $1=="ssb" {serial=toupper($15)}
+      $1=="fpr" && toupper($10)==wanted {print serial;exit}' <<< "$secrets")
+    rm -f -- "$status"
+    [[ $binding == "$serial" ]] ||
+        ov_fail token_not_bound "The selected private key is not bound to the connected security key in GnuPG. Use its card-backed encryption key; a software private-key copy cannot satisfy security-key authentication."
+    OV_VAULT_TOKEN_FINGERPRINT=$fingerprint
+}
+
+ov_vault_auth_preflight() {
+    local recipient=$1 require_token=$2 existing_key=${3:-} fingerprint='' card_fingerprint=''
+    local keys state trust selected card_usable primary_usable status encrypted challenge decrypted actual rc=0 exact=no
+    [[ $require_token == true || $require_token == false ]] || ov_fail invalid_auth "The security-key requirement must be true or false."
+    if [[ -z $existing_key || -n $recipient ]]; then
+        [[ $recipient =~ ^([[:xdigit:]]{40}|[[:xdigit:]]{64})!?$ ]] ||
+            ov_fail invalid_recipient "Choose a complete OpenPGP encryption-key fingerprint."
+        fingerprint=${recipient%!}; fingerprint=${fingerprint^^}
+        [[ -n ${fingerprint//0/} ]] || ov_fail invalid_recipient "Choose a valid OpenPGP encryption-key fingerprint."
+        recipient=${recipient^^}
+        [[ $recipient != *! ]] || exact=yes
+    fi
+    ov_vault_temporary
+    status="$OV_VAULT_TEMP_DIR/auth-status"
+    if [[ $require_token == true ]]; then
+        ov_vault_require_token
+        card_fingerprint=$OV_VAULT_TOKEN_FINGERPRINT
+    fi
+    if [[ -z $existing_key ]]; then
+        if ! keys=$(ov_as_user timeout --foreground --signal=TERM --kill-after=5 15 \
+            gpg --no-options --batch --no-tty --with-colons --with-fingerprint --with-subkey-fingerprint \
+            --list-keys -- "$fingerprint" 2> "$status"); then
+            rm -f -- "$status"
+            ov_fail public_key_missing "The selected public OpenPGP key is missing from your keyring. Import its matching public key, then choose it again."
+        fi
+        # Tomb checks primary-key validity before forge. Check it here, plus
+        # expiration, encryption usage and the exact requested fingerprint.
+        state=$(awk -F: -v wanted="$fingerprint" -v card="$card_fingerprint" -v exact="$exact" -v now="$(date +%s)" '
+          $1=="pub" || $1=="sub" {
+            usable=($2 !~ /^[redi]/ && $12 !~ /D/ && ($7=="" || $7==0 || $7>now))
+            if ($1=="pub") {trust=$2; primary=usable}
+            encryption=($12 ~ /e/ || ($1=="pub" && exact=="no" && $12 ~ /E/))
+          }
+          $1=="fpr" {
+            if (toupper($10)==wanted && usable && encryption) selected=1
+            if (toupper($10)==card && usable && encryption) matched=1
+          }
+          END {printf "%s %d %d %d\n", (trust=="" ? "-" : trust),selected,matched,primary}' <<< "$keys")
+        read -r trust selected card_usable primary_usable <<< "$state"
+        [[ $primary_usable == 1 && $selected == 1 ]] || ov_fail key_unusable "The selected OpenPGP key cannot encrypt. Choose a current encryption key that is not expired, revoked or disabled."
+        [[ $trust == [mfuws] ]] || ov_fail key_untrusted "The selected public key is not trusted for vault encryption. Verify its fingerprint and certify it in your OpenPGP key manager, then try again."
+        if [[ $require_token == true ]]; then
+            [[ $card_usable == 1 && ( $exact == no || $fingerprint == "$card_fingerprint" ) ]] ||
+                ov_fail token_mismatch "The connected security key does not match the selected encryption key. Connect the matching key or detect the intended key again."
+            recipient="$card_fingerprint!"
+        fi
+        challenge="OctoVault authentication check $(ov_new_id)"
+        encrypted="$OV_VAULT_TEMP_DIR/auth-challenge.gpg"
+        ov_progress authentication "Verifying access to your OpenPGP key; enter its PIN or passphrase and touch the key if requested" 2
+        printf '%s' "$challenge" | ov_as_user timeout --foreground --signal=TERM --kill-after=5 30 \
+            gpg --no-options --batch --no-tty --status-fd 2 --output - --encrypt --recipient "$recipient" \
+            > "$encrypted" 2> "$status" || rc=$?
+        ((rc==0)) || ov_vault_auth_failure "$status" "$rc"
+        decrypted=$(ov_as_user timeout --foreground --signal=TERM --kill-after=5 120 \
+            gpg --no-options --batch --no-tty --status-fd 2 --output - --decrypt < "$encrypted" 2> "$status") || rc=$?
+        rm -f -- "$encrypted"
+        ((rc==0)) || ov_vault_auth_failure "$status" "$rc"
+        [[ $decrypted == "$challenge" ]] || ov_fail authentication_failed "The OpenPGP verification did not return the expected result. No new vault has been allocated."
+        unset challenge decrypted
+    else
+        ov_progress authentication "Verifying your existing encrypted vault key; enter its PIN or passphrase if requested" 2
+        ov_as_user cat -- "$existing_key" | ov_as_user timeout --foreground --signal=TERM --kill-after=5 120 \
+            gpg --no-options --batch --no-tty --status-fd 2 --output - --decrypt > /dev/null 2> "$status" || rc=$?
+        ((rc==0)) || ov_vault_auth_failure "$status" "$rc"
+    fi
+    actual=$(awk '$1=="[GNUPG:]" && $2=="DECRYPTION_KEY" {print toupper($3);exit}' "$status")
+    rm -f -- "$status"
+    [[ $actual =~ ^([[:xdigit:]]{40}|[[:xdigit:]]{64})$ ]] ||
+        ov_fail invalid_key "The selected file or key did not authenticate with an OpenPGP private key. Choose an OpenPGP-encrypted vault key."
+    [[ $require_token != true || $actual == "$card_fingerprint" ]] ||
+        ov_fail token_mismatch "The encrypted vault key belongs to a different OpenPGP key than the connected security key."
+    if [[ $require_token == true ]]; then OV_VAULT_AUTH_RECIPIENT="$card_fingerprint!"
+    else OV_VAULT_AUTH_RECIPIENT=${recipient:-$actual!}; fi
+}
+
+ov_vault_auth_check() {
+    local recipient require_token reuse key=''
+    recipient=$(ov_param recipient); require_token=$(ov_param require_token false); reuse=$(ov_param use_existing_key false)
+    jq -e '((.require_token//false)|type=="boolean") and ((.use_existing_key//false)|type=="boolean")' <<< "$OV_PARAMS" >/dev/null ||
+        ov_fail invalid_auth "The security-key and existing-key options must be true or false."
+    if [[ $reuse == true ]]; then
+        key=$(ov_vault_user_path "$(ov_require key_file)")
+        [[ -f $key ]] || ov_fail invalid_key "Choose an existing encrypted vault key file."
+    fi
+    ov_vault_auth_preflight "$recipient" "$require_token" "$key"
+    ov_ok "$(jq -n --arg recipient "$OV_VAULT_AUTH_RECIPIENT" --argjson token "$require_token" '{verified:true,recipient:$recipient,require_token:$token}')"
 }
 
 # The desktop selects a directory, while scripts may still supply the complete
@@ -365,10 +541,13 @@ ov_vault_validate_record() {
       (.open_on|IN("manual","login","drive","token")) and
       (.close_on|type=="array" and all(.[];IN("screen-lock","logout","sleep","shutdown"))) and
       (.force_close|type=="boolean") and ((.trust_native_hooks//false)|type=="boolean") and
+      ((.require_token//false)|type=="boolean") and
       ((.recipient//"")|type=="string") and (.hooks|type=="object")' <<< "$record" >/dev/null ||
         ov_fail invalid_vault "The vault configuration is invalid."
     [[ $(ov_vault_field "$record" auth) != text || -n $(ov_vault_field "$record" cipher_file) ]] ||
         ov_fail invalid_auth "A text-cloaking cipher file is required."
+    [[ $(ov_vault_field "$record" require_token) != true || $(ov_vault_field "$record" auth) == gpg ]] ||
+        ov_fail invalid_auth "Security-key authentication requires OpenPGP protection."
     [[ $(ov_vault_field "$record" open_on) != drive || -n $(ov_vault_field "$record" drive_uuid) ]] ||
         ov_fail invalid_event "Select a drive UUID before enabling drive-triggered unlocking."
     local hook
@@ -455,6 +634,30 @@ ov_vault_auth_args() {
         OV_VAULT_AUTH_ARGS+=(-g -r "$(ov_vault_field "$record" recipient)")
 }
 
+ov_vault_read_token_key() {
+    local record=$1 key status actual bytes rc=0
+    ov_vault_require_token "$(ov_vault_field "$record" recipient)"
+    key=$(ov_vault_field "$record" key_file)
+    status="$OV_VAULT_TEMP_DIR/token-decrypt-status"
+    # A bounded base64 value stays in shell memory until GnuPG proves which
+    # private key decrypted it. No decrypted key is written to disk or argv.
+    OV_VAULT_TOKEN_KEY=$(ov_as_user timeout --foreground --signal=TERM --kill-after=5 120 \
+        gpg --no-options --batch --no-tty --status-fd 2 --output - --decrypt -- "$key" 2> "$status" |
+        head -c 4097 | base64 -w0) || rc=$?
+    if ((rc!=0)); then unset OV_VAULT_TOKEN_KEY; ov_vault_auth_failure "$status" "$rc"; fi
+    actual=$(awk '$1=="[GNUPG:]" && $2=="DECRYPTION_KEY" {print toupper($3);exit}' "$status")
+    rm -f -- "$status"
+    if [[ $actual != "$OV_VAULT_TOKEN_FINGERPRINT" ]]; then
+        unset OV_VAULT_TOKEN_KEY
+        ov_fail token_mismatch "The encrypted vault key does not belong to the connected security key."
+    fi
+    bytes=$(printf '%s' "$OV_VAULT_TOKEN_KEY" | base64 --decode | wc -c)
+    if ((bytes==0 || bytes>4096)); then
+        unset OV_VAULT_TOKEN_KEY
+        ov_fail invalid_key "The encrypted vault key does not contain a valid amount of key material."
+    fi
+}
+
 ov_vault_tomb_keyed() {
     local record=$1 action=$2 file=$3
     shift 3
@@ -470,8 +673,15 @@ ov_vault_tomb_keyed() {
         # Keep the user's GPG configuration, agent and smartcard interaction
         # outside the privileged process. Tomb's documented stdin key interface
         # avoids ever writing the decrypted key to disk.
-        ov_as_user gpg --no-options --decrypt -- "$key" |
-            ov_vault_tomb --unsafe "$action" "$file" -k cleartext "$@" || rc=$?
+        if [[ $(ov_vault_field "$record" require_token) == true ]]; then
+            ov_vault_read_token_key "$record"
+            printf '%s' "$OV_VAULT_TOKEN_KEY" | base64 --decode |
+                ov_vault_tomb --unsafe "$action" "$file" -k cleartext "$@" || rc=$?
+            unset OV_VAULT_TOKEN_KEY
+        else
+            ov_as_user gpg --no-options --decrypt -- "$key" |
+                ov_vault_tomb --unsafe "$action" "$file" -k cleartext "$@" || rc=$?
+        fi
     else
         ov_vault_plain_key "$record"
         ov_vault_tomb "$action" "$file" -k "$OV_VAULT_MATERIALIZED_KEY" "$@" || rc=$?
@@ -643,7 +853,7 @@ ov_vault_new_record() {
     OV_RECORD=$(jq --arg id "$id" --arg name "$name" --arg file "$file" --arg key "$key" --arg mount "$mountpoint" \
         --arg auth "$auth" --arg time "$(ov_now)" \
         '. as $p | {schema_version:1,id:$id,name:$name,file:$file,key_file:$key,mountpoint:$mount,auth:$auth,
-        recipient:($p.recipient//""),cipher_file:(if ($p.cipher_file//"")=="" then "/usr/share/octovault/cloak-ciphers/words" else $p.cipher_file end),size_gb:($p.size_gb//null),
+        recipient:($p.recipient//""),require_token:($p.require_token//false),cipher_file:(if ($p.cipher_file//"")=="" then "/usr/share/octovault/cloak-ciphers/words" else $p.cipher_file end),size_gb:($p.size_gb//null),
         open_on:($p.open_on//"login"),drive_uuid:($p.drive_uuid//""),close_on:($p.close_on//["shutdown"]),
         force_close:($p.force_close//false),trust_native_hooks:($p.trust_native_hooks//false),hooks:($p.hooks//{}),created_at:$time,updated_at:$time}' <<< "$OV_PARAMS")
     ov_vault_validate_record "$OV_RECORD"
@@ -656,7 +866,7 @@ ov_vault_new_record() {
 
 ov_vault_create() {
     local id record file key auth size tempkey rootkey reuse image_source managed=false key_directory='' image_kind=''
-    local locking_record recovery_record cipher
+    local locking_record recovery_record cipher require_token
     id=$(ov_new_id)
     file=$(ov_require file); key=$(ov_param key_file); auth=$(ov_param auth key)
     reuse=$(ov_param use_existing_key false); image_source=$(ov_param image_source)
@@ -695,6 +905,20 @@ ov_vault_create() {
         cipher=$(ov_param cipher_file)
         ov_as_user test -r "${cipher:-/usr/share/octovault/cloak-ciphers/words}" || ov_fail not_found "The cloak cipher file is unavailable."
     fi
+    require_token=$(ov_param require_token false)
+    jq -e '(.require_token//false)|type=="boolean"' <<< "$OV_PARAMS" >/dev/null ||
+        ov_fail invalid_auth "The security-key requirement must be true or false."
+    [[ $require_token != true || $auth == gpg ]] || ov_fail invalid_auth "Security-key authentication requires OpenPGP protection."
+    if [[ $auth == gpg ]]; then
+        unset OV_VAULT_AUTH_RECIPIENT
+        if [[ $reuse == true ]]; then
+            ov_vault_auth_preflight "$(ov_param recipient)" "$require_token" "$key"
+        else
+            ov_vault_auth_preflight "$(ov_param recipient)" "$require_token"
+        fi
+        OV_PARAMS=$(jq --arg recipient "${OV_VAULT_AUTH_RECIPIENT:-$(ov_param recipient)}" --argjson token "$require_token" \
+            '.recipient=$recipient | .require_token=$token' <<< "$OV_PARAMS")
+    fi
     if [[ -z $key ]]; then
         key_directory=$(ov_vault_managed_key_directory "$id"); managed=true
         case $auth in
@@ -713,17 +937,20 @@ ov_vault_create() {
     fi
 
     ov_progress create "Allocating the encrypted container" 5
+    ov_failure_retain "$file"
     ov_as_user tomb --no-color dig -s "$size" "$file" >&2 || ov_fail create_failed "The vault container could not be allocated."
     ov_progress key "Preparing the protected encryption key" 40
     if [[ $reuse == true ]]; then
         locking_record=$record
     elif [[ $auth == gpg ]]; then
+        ov_failure_retain "$tempkey"
         ov_as_user tomb --no-color forge -g -r "$(ov_vault_field "$record" recipient)" -k "$tempkey" >&2 ||
             ov_fail key_failed "The OpenPGP-protected key could not be created. The uninitialized container was retained."
         ov_as_user chmod 0600 -- "$tempkey" || ov_fail permission_denied "Could not secure the encrypted key."
     else
         ov_vault_temporary; rootkey="$OV_VAULT_TEMP_DIR/created-$id.key"
         ov_vault_tomb forge -k "$rootkey" || ov_fail key_failed "Key generation failed. The uninitialized container was retained."
+        ov_failure_retain "$tempkey"
         ov_vault_publish "$rootkey" "$tempkey" || ov_fail key_failed "The encrypted recovery key could not be saved."
     fi
     if [[ $reuse != true ]]; then
@@ -733,6 +960,8 @@ ov_vault_create() {
     # is interrupted. Incomplete records never trigger an automatic unlock.
     recovery_record=$(jq '.creation_state="initializing" | .open_on="manual"' <<< "$locking_record")
     if [[ $tempkey != "$key" ]]; then recovery_record=$(jq '.key_managed=true' <<< "$recovery_record"); fi
+    ov_failure_retain "$tempkey"
+    ov_failure_retain "$OV_ROOT/vaults/$id.json"
     ov_save vaults "$id" "$recovery_record"
     ov_progress initialize "Initializing the vault filesystem" 65
     ov_vault_tomb_keyed "$locking_record" lock "$file" || ov_fail initialize_failed "The vault could not be initialized; its container, encrypted key and recovery record were retained."
@@ -761,6 +990,10 @@ ov_vault_import() {
     id=$(ov_new_id); ov_vault_new_record "$id"; record=$OV_RECORD
     file=$(ov_vault_field "$record" file); key=$(ov_vault_field "$record" key_file)
     [[ -f $file && -f $key ]] || ov_fail invalid_path "The existing container and key must both be regular files."
+    if [[ $(ov_vault_field "$record" require_token) == true ]]; then
+        ov_vault_auth_preflight "$(ov_vault_field "$record" recipient)" true "$key"
+        record=$(jq --arg recipient "$OV_VAULT_AUTH_RECIPIENT" '.recipient=$recipient' <<< "$record")
+    fi
     ov_as_user test -w "$file" || ov_fail permission_denied "Your account must own or be able to write the container."
     ov_vault_pin "$record"
     cryptsetup isLuks "$OV_VAULT_CONTAINER_ALIAS" || ov_fail invalid_container "This file does not contain a LUKS encrypted container."
@@ -777,23 +1010,39 @@ ov_vault_update() {
     jq -e 'has("file") or has("mountpoint")' <<< "$OV_PARAMS" >/dev/null &&
         ov_fail immutable "Container and mountpoint paths cannot be changed on a registered vault."
     record=$(jq --argjson record "$record" --arg time "$(ov_now)" '
-       . as $p | $record + ($p | with_entries(select(.key|IN("name","key_file","auth","recipient","cipher_file","open_on","drive_uuid","close_on","force_close","hooks","trust_native_hooks")))) | .updated_at=$time' <<< "$OV_PARAMS")
+        . as $p | $record + ($p | with_entries(select(.key|IN("name","key_file","auth","recipient","require_token","cipher_file","open_on","drive_uuid","close_on","force_close","hooks","trust_native_hooks")))) | .updated_at=$time' <<< "$OV_PARAMS")
     ov_vault_validate_record "$record"
     ov_vault_user_path "$(ov_vault_field "$record" key_file)" >/dev/null
+    if [[ $(ov_vault_field "$record" require_token) == true ]] &&
+        jq -e 'has("key_file") or has("auth") or has("recipient") or has("require_token")' <<< "$OV_PARAMS" >/dev/null; then
+        ov_vault_auth_preflight "$(ov_vault_field "$record" recipient)" true "$(ov_vault_field "$record" key_file)"
+        record=$(jq --arg recipient "$OV_VAULT_AUTH_RECIPIENT" '.recipient=$recipient' <<< "$record")
+    fi
     ov_save vaults "$id" "$record"
     ov_ok "$(ov_vault_status "$record")"
 }
 
 ov_vault_change_password() {
-    local record=$1 auth key new_password recipient
+    local record=$1 auth key new_password recipient token_key rc=0
     auth=$(ov_vault_field "$record" auth); key=$(ov_vault_field "$record" key_file)
     ov_vault_password; ov_vault_temporary
     if [[ $auth == gpg ]]; then
         recipient=$(ov_param recipient "$(ov_vault_field "$record" recipient)")
         [[ -n $recipient ]] || ov_fail invalid_auth "Choose the replacement OpenPGP recipient."
-        ov_as_user gpg --no-options --decrypt -- "$key" |
-            ov_as_user gpg --no-options --batch --armor --encrypt --recipient "$recipient" > "$OV_VAULT_TEMP_DIR/rewrapped.key" ||
-            ov_fail key_failed "The key could not be re-encrypted for the selected recipient."
+        if [[ $(ov_vault_field "$record" require_token) == true ]]; then
+            ov_vault_read_token_key "$record"
+            token_key=$OV_VAULT_TOKEN_KEY; unset OV_VAULT_TOKEN_KEY
+            ov_vault_auth_preflight "$recipient" true
+            recipient=$OV_VAULT_AUTH_RECIPIENT
+            printf '%s' "$token_key" | base64 --decode |
+                ov_as_user gpg --no-options --batch --armor --encrypt --recipient "$recipient" > "$OV_VAULT_TEMP_DIR/rewrapped.key" || rc=$?
+            unset token_key
+            ((rc==0)) || ov_fail key_failed "The key could not be re-encrypted for the selected security key."
+        else
+            ov_as_user gpg --no-options --decrypt -- "$key" |
+                ov_as_user gpg --no-options --batch --armor --encrypt --recipient "$recipient" > "$OV_VAULT_TEMP_DIR/rewrapped.key" ||
+                ov_fail key_failed "The key could not be re-encrypted for the selected recipient."
+        fi
         ov_vault_publish "$OV_VAULT_TEMP_DIR/rewrapped.key" "$key" true || ov_fail key_failed "Could not save the replacement encrypted key."
         record=$(jq --arg recipient "$recipient" '.recipient=$recipient' <<< "$record")
         ov_save vaults "$(ov_vault_field "$record" id)" "$record"
@@ -833,8 +1082,15 @@ ov_vault_replace_key() {
     local new_material="$OV_VAULT_TEMP_DIR/replacement.key"
     ov_as_user cat -- "$new_key" > "$new_material" || ov_fail key_failed "The replacement key cannot be read."
     if [[ $auth == gpg ]]; then
-        ov_as_user gpg --no-options --decrypt -- "$key" |
-            ov_vault_tomb --unsafe setkey cleartext "$OV_VAULT_CONTAINER_ALIAS" -k "$new_material" || rc=$?
+        if [[ $(ov_vault_field "$record" require_token) == true ]]; then
+            ov_vault_read_token_key "$record"
+            printf '%s' "$OV_VAULT_TOKEN_KEY" | base64 --decode |
+                ov_vault_tomb --unsafe setkey cleartext "$OV_VAULT_CONTAINER_ALIAS" -k "$new_material" || rc=$?
+            unset OV_VAULT_TOKEN_KEY
+        else
+            ov_as_user gpg --no-options --decrypt -- "$key" |
+                ov_vault_tomb --unsafe setkey cleartext "$OV_VAULT_CONTAINER_ALIAS" -k "$new_material" || rc=$?
+        fi
     else
         [[ -n $OV_VAULT_OLD_PASSWORD ]] || ov_fail password_required "Provide the current key passphrase."
         new_password=$OV_VAULT_PASSWORD; OV_VAULT_PASSWORD=$OV_VAULT_OLD_PASSWORD
@@ -844,7 +1100,7 @@ ov_vault_replace_key() {
     fi
     ((rc==0)) || ov_fail key_failed "The key could not be replaced. The saved configuration has not changed."
     ov_vault_unpin "$record" || ov_fail cleanup_failed "The key changed but its temporary container reference remains attached."
-    record=$(jq --arg key "$new_key" --arg time "$(ov_now)" '.key_file=$key | .auth="key" | .recipient="" | .cipher_file="" | .updated_at=$time' <<< "$record")
+    record=$(jq --arg key "$new_key" --arg time "$(ov_now)" '.key_file=$key | .auth="key" | .require_token=false | .recipient="" | .cipher_file="" | .updated_at=$time' <<< "$record")
     ov_save vaults "$(ov_vault_field "$record" id)" "$record"
     ov_ok "$record"
 }
@@ -1077,7 +1333,7 @@ ov_migration_recover() {
 ov_vault_dispatch() {
     local id record items result size
     case $OV_OP in
-        vault.list|vault.get|migration.list|vault.search) ;;
+        vault.list|vault.get|vault.auth-check|migration.list|vault.search) ;;
         vault.create) ov_vault_create_path; ov_resource_lock "$(ov_require file)" ;;
         vault.import) ov_resource_lock "$(ov_require file)" ;;
         *)
@@ -1091,6 +1347,7 @@ ov_vault_dispatch() {
             while IFS= read -r record; do result=$(jq --argjson item "$(ov_vault_status "$record")" '.+[$item]' <<< "$result"); done < <(jq -c '.[]' <<< "$items")
             ov_ok "$result" ;;
         vault.create) ov_vault_create ;;
+        vault.auth-check) ov_vault_auth_check ;;
         vault.import) ov_vault_import ;;
         vault.update) ov_vault_update ;;
         migration.add) ov_migration_add ;;

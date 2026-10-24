@@ -230,6 +230,10 @@ test_guided_creation() (
     ov_vault_status() { printf '%s\n' "$1"; }
     ov_vault_temporary() { :; }
     ov_vault_unpin() { :; }
+    # These creation tests isolate file lifecycle and permissions with synthetic
+    # key bytes. The authentication contract is exercised in test-vault-auth.sh
+    # and with a real protected OpenPGP key in the integration test below.
+    ov_vault_auth_preflight() { :; }
     tomb() {
         [[ $1 == --no-color && $2 == dig ]] || { printf 'Unexpected tomb call\n' >&2; return 1; }
         printf 'allocation\n' >> "$WORK/guided-allocations"
@@ -475,19 +479,42 @@ integration() {
     done
     printf 'ok - real managed image/text creation and unlock, private carrier permissions and original cover preservation\n'
 
-    # The disposable user's software OpenPGP key exercises the same public-key
-    # mode as a compatible hardware token without requiring physical hardware.
+    # Exercise a protected software key through a real GPG agent and pinentry.
+    # The scripted prompt is only for this disposable user's fixture; it proves
+    # authentication is requested, but does not stand in for physical-card tests.
     local recipient pgp_id pgp_key
-    ov_as_user gpg --batch --pinentry-mode loopback --passphrase '' --quick-generate-key \
+    ov_as_user mkdir -p -m 0700 "$OV_HOME/.gnupg"
+    cat <<'PINENTRY' | ov_as_user tee "$OV_HOME/pinentry-fixture" >/dev/null
+#!/bin/bash
+set -euo pipefail
+printf 'OK OctoVault disposable integration pinentry\n'
+while IFS= read -r request; do
+    case $request in
+        GETPIN)
+            printf 'prompt\n' >> "$HOME/pinentry-requests"
+            printf 'D OctoVault-openpgp-test-passphrase\nOK\n'
+            ;;
+        BYE) printf 'OK\n'; exit 0 ;;
+        *) printf 'OK\n' ;;
+    esac
+done
+PINENTRY
+    ov_as_user chmod 0700 "$OV_HOME/pinentry-fixture"
+    printf 'pinentry-program %s/pinentry-fixture\ndefault-cache-ttl 0\nmax-cache-ttl 0\nno-allow-external-cache\n' "$OV_HOME" |
+        ov_as_user tee "$OV_HOME/.gnupg/gpg-agent.conf" >/dev/null
+    printf 'OctoVault-openpgp-test-passphrase\n' |
+        ov_as_user gpg --batch --pinentry-mode loopback --passphrase-fd 0 --quick-generate-key \
         'OctoVault disposable CI <octovault-ci@example.invalid>' default default 1d >&2
     recipient=$(ov_as_user gpg --batch --with-colons --list-keys 'octovault-ci@example.invalid' |
         awk -F: '$1=="fpr"{print $10;exit}')
     [[ -n $recipient ]]
+    ov_as_user gpgconf --kill gpg-agent
     ov_resource_unlock
     OV_PARAMS=$(jq -n --arg directory "$OV_HOME" --arg recipient "$recipient" \
         '{name:"software-openpgp",directory:$directory,auth:"gpg",recipient:$recipient,size_gb:"0.05",open_on:"manual"}')
     OV_OP=vault.create; ov_vault_dispatch > "$WORK/response.json"
     pgp_id=$(jq -er .data.id "$WORK/response.json"); pgp_key=$(jq -er .data.key_file "$WORK/response.json")
+    [[ -s $OV_HOME/pinentry-requests ]]
     assert_equal "$(stat -c %a "$pgp_key")" 600
     OV_PARAMS=$(jq -n --arg id "$pgp_id" '{id:$id}')
     OV_OP=vault.open; ov_vault_dispatch >/dev/null
@@ -502,10 +529,10 @@ integration() {
     OV_OP=vault.open; ov_vault_dispatch >/dev/null
     OV_OP=vault.close; ov_vault_dispatch >/dev/null
     assert_equal "$(sha256sum "$pgp_key")" "$existing_hash"
-    if grep -Rq -E 'OctoVault-(CI-only|rotated|replacement|carrier-create)' "$OV_ROOT"; then
+    if grep -Rq -E 'OctoVault-(CI-only|rotated|replacement|carrier-create|openpgp-test)' "$OV_ROOT"; then
         printf 'A fixture passphrase was persisted in vault state.\n' >&2; return 1
     fi
-    printf 'ok - real software OpenPGP generation and existing-key reuse without a supplied recipient; no stored passphrases\n'
+    printf 'ok - real protected OpenPGP key, agent authentication and existing-key reuse without a supplied recipient; no stored passphrases\n'
 }
 
 if [[ ${1:-} == --integration ]]; then integration

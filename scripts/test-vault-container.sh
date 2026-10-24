@@ -13,7 +13,7 @@ set -Eeuo pipefail
 apt-get update
 DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
     ca-certificates build-essential tomb cryptsetup-bin jq rsync pinentry-curses \
-    gnupg steghide qrencode lsof systemd util-linux procps
+    gnupg scdaemon steghide qrencode lsof systemd util-linux procps
 mkdir -p build
 cc -std=c11 -O2 -Wall -Wextra src/service/pinentry.c -o build/pinentry-octovault
 cc -std=c11 -O2 -Wall -Wextra src/service/steghide.c -o build/steghide -lutil

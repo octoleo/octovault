@@ -27,11 +27,14 @@ static void usage(void)
          "Usage: octovault [--json] GROUP ACTION [--option VALUE ...]\n"
          "       octovault [--json] request [FILE|-]\n"
          "       octovault [--json] job get|cancel ID\n\n"
-         "Groups: vault, migration, destination, repository, backup, schedule, event, system\n"
+         "Groups: vault, migration, destination, repository, backup, schedule, event, system, diagnostic\n"
          "Use --id ID to select a registered item. Use --size-gb 10 for vault capacity.\n"
          "Create with --directory FOLDER and --name NAME; a new encrypted key is managed automatically.\n"
          "Use --use-existing-key --key-file FILE to reuse a key or protected carrier.\n"
          "For --auth image, --image-source FILE selects a cover image; its original is preserved.\n"
+         "For a YubiKey use --auth gpg --recipient FINGERPRINT --require-token.\n"
+         "Use vault auth-check with --recipient and --require-token to test authentication before creation.\n"
+         "Use diagnostic list or diagnostic get --id ID to inspect saved failure details.\n"
          "Repeat --source, --exclude, --include or --close-on for array values.\n"
          "Boolean options accept true/false, a bare --flag, or --no-flag.\n"
          "Secrets (for example --password or --secret-key) take NO value: they prompt\n"
@@ -120,10 +123,10 @@ static gchar *make_request(int argc, char **argv, GError **error)
         return read_request(argc == 2 ? argv[1] : "-", error);
     }
     if (argc < 2) { g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT, "Specify a group and action; see --help."); return NULL; }
-    const gchar *groups[] = { "vault", "migration", "destination", "repository", "backup", "schedule", "event", "system", NULL };
+    const gchar *groups[] = { "vault", "migration", "destination", "repository", "backup", "schedule", "event", "system", "diagnostic", NULL };
     if (!in_list(argv[0], groups)) { g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT, "Unknown operation group."); return NULL; }
     JsonObject *params = json_object_new();
-    const gchar *boolean_keys[] = { "force", "force_close", "read_data", "dry_run", "one_file_system", "on_battery", "metered", "use_existing_key", NULL };
+    const gchar *boolean_keys[] = { "force", "force_close", "read_data", "dry_run", "one_file_system", "on_battery", "metered", "use_existing_key", "require_token", NULL };
     const gchar *number_keys[] = { "size_gb", "port", "keep_daily", "keep_weekly", "keep_monthly", "keep_yearly", "keep_last", "boot_delay_sec", "idle_sec", "idle_seconds", "upload_limit", "download_limit", NULL };
     const gchar *array_keys[] = { "sources", "excludes", "include", "close_on", NULL };
     for (int i = 2; i < argc; i++) {
@@ -164,7 +167,9 @@ static gchar *make_request(int argc, char **argv, GError **error)
                 if (g_str_equal(key, "size_gb")) {
                     double number = g_ascii_strtod(value, &end);
                     if (errno || !end || end == value || *end || !isfinite(number) || number <= 0 || number > 1000000) g_set_error(error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT, "Invalid number for %s.", key);
-                    else json_object_set_double_member(params, key, number);
+                    /* Preserve decimal text; JSON doubles can expand 0.05 into
+                     * 0.050000000000000003 before backend size validation. */
+                    else json_object_set_string_member(params, key, value);
                 } else {
                     gint64 number = g_ascii_strtoll(value, &end, 10);
                     if (errno || !end || end == value || *end || number < 0) g_set_error(error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT, "Invalid integer for %s.", key);

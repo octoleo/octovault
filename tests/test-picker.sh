@@ -12,7 +12,7 @@ work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 read -r -a cflags <<<"$(pkg-config --cflags gtk4 libadwaita-1 json-glib-1.0 gio-2.0)"
 read -r -a libs <<<"$(pkg-config --libs gtk4 libadwaita-1 json-glib-1.0 gio-2.0)"
-cc -std=c11 -Wall -Wextra -Werror -Isrc/ui "${cflags[@]}" src/ui/test-picker.c -o "$work/test-picker" "${libs[@]}"
+cc -std=c11 -Wall -Wextra -Werror -Isrc/ui "${cflags[@]}" src/ui/test-picker.c src/service/client.c -o "$work/test-picker" "${libs[@]}"
 if [[ ${1:-} != --native ]]; then
     printf 'Native picker regression compiled; CI runs tests/test-picker.sh --native under D-Bus/Xvfb.\n'
     exit 0

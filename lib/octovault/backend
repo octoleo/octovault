@@ -3,19 +3,34 @@
 set -Eeuo pipefail
 umask 077
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C.UTF-8
-unset BASH_ENV ENV CDPATH GLOBIGNORE OV_SECRET_FD OV_OLD_SECRET_FD OV_OLD_KEY_PATH OV_RESOURCE_FD
+unset BASH_ENV ENV CDPATH GLOBIGNORE OV_SECRET_FD OV_OLD_SECRET_FD OV_OLD_KEY_PATH OV_RESOURCE_FD OV_ERROR_FILE OV_STAGE OV_RETAINED_PATHS OV_USER_ENV
 cd /
 readonly OV_LIB=/usr/lib/octovault
 source "$OV_LIB/common.sh"
-trap 'ov_secret_close; ov_resource_unlock; if declare -F ov_vault_cleanup >/dev/null; then ov_vault_cleanup; fi' EXIT
-trap 'ov_fail operation_failed "The operation could not complete. Existing recovery material has been retained."' ERR
+trap 'ov_secret_close; ov_resource_unlock; if declare -F ov_vault_cleanup >/dev/null; then ov_vault_cleanup; fi; ov_error_cleanup' EXIT
+trap 'ov_abort' ERR
 ov_init "${1-}"
+ov_error_init
 request=$(head -c 1048577)
 ((${#request} <= 1048576)) || ov_fail request_too_large 'Request exceeds the supported size.'
 jq -e 'type=="object" and (.op|type=="string") and ((.params // {})|type=="object")' <<<"$request" >/dev/null || ov_fail invalid_request 'Invalid operation request.'
 OV_OP=$(jq -r .op <<<"$request")
 # shellcheck disable=SC2034 # Shared request consumed by sourced adapters.
 OV_PARAMS=$(jq -c '.params // {}' <<<"$request")
+session=$(jq -c '.session // {}' <<< "$request")
+# Read-only pages and backup operations do not need a GPG session. A stale
+# terminal setting must never prevent the user from reading failure reports.
+case "$OV_OP" in
+    vault.auth-check) ov_session_init "$session" ;;
+    vault.create)
+        if [[ $(ov_param auth key) == gpg ]]; then ov_session_init "$session"; fi
+        ;;
+    vault.open|vault.passwd|vault.setkey|vault.resize|vault.key-export|migration.add|migration.recover)
+        ov_load vaults "$(ov_require id)"
+        if [[ $(jq -r '.auth // "key"' <<< "$OV_RECORD") == gpg ]]; then ov_session_init "$session"; fi
+        ;;
+esac
+unset session
 unset request
 source "$OV_LIB/vault.sh"
 source "$OV_LIB/backup.sh"
@@ -24,6 +39,8 @@ case "$OV_OP" in
     vault.*|migration.*) ov_vault_dispatch ;;
     destination.*|repository.*|backup.*) ov_backup_dispatch ;;
     event.*|schedule.*) ov_event_dispatch ;;
+    diagnostic.list) ov_ok "$(ov_list diagnostics | jq 'sort_by(.created_at) | reverse')" ;;
+    diagnostic.get) ov_load diagnostics "$(ov_require id)"; ov_ok "$OV_RECORD" ;;
     system.info)
         ov_ok "$(jq -cn --arg version '1.0.0' --arg owner "$OV_USER" --arg tomb "$(tomb --version 2>/dev/null | head -n1 || true)" --arg restic "$(restic version 2>/dev/null || true)" '{version:$version,owner:$owner,tomb:$tomb,restic:$restic}')" ;;
     *) ov_fail unsupported_operation 'This operation is not supported.' ;;

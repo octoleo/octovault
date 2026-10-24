@@ -4,13 +4,70 @@
 
 ov_now() { date -u +'%Y-%m-%dT%H:%M:%SZ'; }
 ov_new_id() { cat /proc/sys/kernel/random/uuid; }
+ov_error_init() {
+    # A private file carries the first typed failure out of command
+    # substitutions. Their stdout is data and cannot also carry an error.
+    OV_ERROR_FILE=$(mktemp "$OV_ROOT/.failure.XXXXXXXX")
+    chmod 0600 "$OV_ERROR_FILE"
+    OV_STAGE=validation
+    OV_RETAINED_PATHS=()
+}
+ov_error_cleanup() {
+    [[ -z ${OV_ERROR_FILE:-} ]] || rm -f -- "$OV_ERROR_FILE"
+    unset OV_ERROR_FILE
+}
+ov_failure_retain() { OV_RETAINED_PATHS+=("$1"); }
+ov_error_publish() {
+    local response=$1 directory="$OV_ROOT/diagnostics" id path temporary report
+    [[ -d $OV_ROOT && ! -L $directory ]] || return 1
+    install -d -m 0700 "$directory" || return 1
+    id=$(ov_new_id) || return 1
+    path="$directory/$id.json"
+    temporary=$(mktemp "$directory/.report.XXXXXXXX") || return 1
+    # Only application-authored error fields are saved. Requests, environment,
+    # passwords, PINs, key contents and raw subprocess output never enter here.
+    report=$(jq -c --arg id "$id" --arg path "$path" --arg op "${OV_OP:-unknown}" --arg time "$(ov_now)" \
+        '. + {id:$id,schema_version:1,operation:$op,created_at:$time} |
+         .error += {diagnostic_id:$id,diagnostic_file:$path}' <<< "$response") || { rm -f -- "$temporary"; return 1; }
+    if ! printf '%s\n' "$report" > "$temporary" || ! chmod 0600 "$temporary" ||
+        ! sync -f "$temporary" || ! mv -fT -- "$temporary" "$path"; then
+        rm -f -- "$temporary"; return 1
+    fi
+    # Keep the most recent hundred private summaries per account.
+    while IFS= read -r -d '' report; do
+        report=${report#* }
+        [[ $report =~ ^[a-f0-9-]+\.json$ ]] && rm -f -- "$directory/$report"
+    done < <(find "$directory" -maxdepth 1 -type f -name '*.json' -printf '%T@ %f\0' | sort -z -nr | tail -z -n +101)
+    jq -c '{ok,error}' <<< "$(cat -- "$path")"
+}
 ov_fail() {
-    jq -cn --arg code "$1" --arg message "$2" '{ok:false,error:{code:$code,message:$message}}'
+    local response saved path retained='[]'
+    if [[ -n ${OV_ERROR_FILE:-} && -s $OV_ERROR_FILE ]]; then
+        cat -- "$OV_ERROR_FILE"
+        exit 1
+    fi
+    for path in "${OV_RETAINED_PATHS[@]-}"; do
+        if [[ -n $path && ( -e $path || -L $path ) ]]; then
+            retained=$(jq -c --arg path "$path" '. + [$path] | unique' <<< "$retained")
+        fi
+    done
+    response=$(jq -cn --arg code "$1" --arg message "$2" --arg stage "${OV_STAGE:-validation}" --argjson retained "$retained" \
+        '{ok:false,error:{code:($code[:128]),message:($message[:2048]),stage:($stage[:128]),retained_paths:$retained}}')
+    if [[ -n ${OV_ERROR_FILE:-} && -n ${OV_ROOT:-} ]] && saved=$(ov_error_publish "$response" 2>/dev/null); then
+        response=$saved
+    fi
+    if [[ -n ${OV_ERROR_FILE:-} ]]; then printf '%s\n' "$response" > "$OV_ERROR_FILE"; fi
+    printf '%s\n' "$response"
     exit 1
+}
+ov_abort() {
+    # Deliberately omit the failed command: its arguments could contain secrets.
+    ov_fail operation_failed 'The operation stopped unexpectedly. Review the failure details before trying again.'
 }
 ov_ok() { jq -c '{ok:true,data:.}' <<<"${1:-null}"; }
 ov_progress() {
     local percent=${3:-0}
+    OV_STAGE=$1
     [[ $percent =~ ^[0-9]+([.][0-9]+)?$ ]] || percent=0
     jq -cn --arg stage "$1" --arg message "$2" --argjson percent "$percent" \
         '{stage:$stage,message:$message,percent:$percent}' >&2
@@ -24,7 +81,7 @@ ov_require() {
 }
 ov_id() { [[ $1 =~ ^[a-zA-Z0-9_-]{1,64}$ ]] || ov_fail invalid_id 'Invalid record identifier.'; }
 ov_collection() {
-    case "$1" in vaults|destinations|repositories|plans|migrations|history|settings) ;; *) ov_fail invalid_collection 'Invalid record collection.';; esac
+    case "$1" in vaults|destinations|repositories|plans|migrations|history|settings|diagnostics) ;; *) ov_fail invalid_collection 'Invalid record collection.';; esac
 }
 ov_load() {
     ov_collection "$1"; ov_id "$2"
@@ -60,6 +117,42 @@ ov_list() {
     if ((${#files[@]})); then jq -sce 'map(select(type == "object" and .schema_version == 1)) | sort_by(.name // .id)' "${files[@]}";
     else printf '[]\n'; fi
 }
+ov_session_init() {
+    local session=$1 value
+    OV_USER_ENV=()
+    jq -e 'type=="object" and all(to_entries[];
+        (.key|IN("display","xauthority","wayland_display","gpg_tty","gnupg_home")) and
+        (.value|type=="string" and length<=4096 and (explode | all(. >= 32 and . != 127))))' <<< "$session" >/dev/null ||
+        ov_fail invalid_session 'The desktop authentication session is invalid. Reopen OctoVault from your desktop.'
+    value=$(jq -r '.display // empty' <<< "$session")
+    [[ -z $value ]] || OV_USER_ENV+=("DISPLAY=$value")
+    value=$(jq -r '.xauthority // empty' <<< "$session")
+    if [[ -n $value ]]; then
+        [[ $value == /* && -f $value ]] && [[ $(stat -Lc %u -- "$value") == "$OV_UID" ]] ||
+            ov_fail invalid_session 'The X11 authentication file is unavailable. Reopen OctoVault from your desktop session.'
+        OV_USER_ENV+=("XAUTHORITY=$value")
+    fi
+    value=$(jq -r '.wayland_display // empty' <<< "$session")
+    if [[ -n $value ]]; then
+        [[ $value != */* || $value == /run/user/"$OV_UID"/* ]] ||
+            ov_fail invalid_session 'The Wayland display must belong to your desktop session.'
+        OV_USER_ENV+=("WAYLAND_DISPLAY=$value")
+    fi
+    value=$(jq -r '.gpg_tty // empty' <<< "$session")
+    if [[ -n $value ]]; then
+        [[ $value == /dev/pts/+([0-9]) || $value == /dev/tty+([0-9]) ]] &&
+            [[ -c $value && $(stat -Lc %u -- "$value") == "$OV_UID" ]] ||
+            ov_fail invalid_session 'The authentication terminal is unavailable. Reopen OctoVault from your desktop or terminal.'
+        OV_USER_ENV+=("GPG_TTY=$value")
+    fi
+    value=$(jq -r '.gnupg_home // empty' <<< "$session")
+    if [[ -n $value ]]; then
+        [[ $value == /* && -d $value ]] &&
+            [[ $(stat -Lc %u -- "$value") == "$OV_UID" ]] ||
+            ov_fail invalid_session 'Your selected GnuPG keyring must be an existing folder owned by your account.'
+        OV_USER_ENV+=("GNUPGHOME=$value")
+    fi
+}
 ov_as_user() (
     # Close inherited worker descriptors in this child only. In particular, a
     # user hook must not be able to unlock the parent's flock open description
@@ -73,10 +166,10 @@ ov_as_user() (
         exec {descriptor}>&-
     done
     if [[ $OV_UID == 0 ]]; then
-        exec env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME="$OV_HOME" USER="$OV_USER" LOGNAME="$OV_USER" LANG=C.UTF-8 "$@"
+        exec env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME="$OV_HOME" USER="$OV_USER" LOGNAME="$OV_USER" LANG=C.UTF-8 "${OV_USER_ENV[@]}" "$@"
     else
         exec runuser -u "$OV_USER" -- env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME="$OV_HOME" USER="$OV_USER" LOGNAME="$OV_USER" \
-            LANG=C.UTF-8 XDG_RUNTIME_DIR="/run/user/$OV_UID" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$OV_UID/bus" "$@"
+            LANG=C.UTF-8 XDG_RUNTIME_DIR="/run/user/$OV_UID" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$OV_UID/bus" "${OV_USER_ENV[@]}" "$@"
     fi
 )
 ov_run() { "$@" >&2; }

@@ -10,7 +10,7 @@ Download the `.deb` matching **your Ubuntu release and CPU architecture** from [
 
 ```bash
 sha256sum --check SHA256SUMS-ubuntu26.04
-sudo apt install ./octovault_1.1.1_ubuntu26.04_amd64.deb
+sudo apt install ./octovault_1.1.2_ubuntu26.04_amd64.deb
 ```
 
 APT installs the required encryption, backup, desktop, and system-integration dependencies. The checksum detects damaged or changed downloads; it is not an independent publisher signature. A downloaded Debian package does not enroll the computer into an automatic update repository.
@@ -19,9 +19,13 @@ Launch **OctoVault** from GNOME, or run `octovault-gtk`. Run both interfaces as 
 
 ## Vaults
 
-Create a vault by choosing its name, a folder to save it in, and its capacity in decimal GB. OctoVault creates the encrypted container in that folder and generates a new encryption key automatically. Choose a passphrase and confirm it; OctoVault remembers the encrypted key's location, never the passphrase. The private managed key folder is accessible only to your account. Select **I already have a key** only when you want to reuse an existing compatible vault key or protected carrier. Capacity is converted to whole MiB for the underlying engine.
+Create a vault by choosing its name, a folder to save it in, and its capacity in decimal GB. OctoVault creates the encrypted container in that folder and generates a new encryption key automatically. Choose a passphrase and confirm it; OctoVault remembers the encrypted key's location, never the passphrase. The private managed key folder is accessible only to your account. Select **Reuse an existing vault key file** only when you want to reuse an existing compatible vault key or protected carrier. Capacity is converted to whole MiB for the underlying engine.
 
-Choose how the generated key is protected. **Passphrase-protected key** is the default. **Key hidden in an image** asks for a cover image and saves a separate protected copy; the original image is unchanged. **Key hidden in text** generates a text carrier automatically, so no source text is needed. The image or generated text still requires your passphrase. **OpenPGP key or YubiKey** lets you choose an existing software OpenPGP encryption key or a compatible token; OctoVault generates the vault key and encrypts it for that recipient. GnuPG handles any private-key passphrase or token PIN/touch prompt. Merely attaching a USB device is not authentication.
+Choose how the generated key is protected. **Passphrase-protected key** is the default. **Key hidden in an image** asks for a cover image and saves a separate protected copy; the original image is unchanged. **Key hidden in text** generates a text carrier automatically, so no source text is needed. The image or generated text still requires your passphrase. **Software OpenPGP key** and **YubiKey / OpenPGP security key** are separate choices. OctoVault generates the vault key and encrypts it for the selected recipient. GnuPG handles the private-key passphrase or token PIN; touch the token when its policy requires it.
+
+A YubiKey must have a usable OpenPGP encryption key, and its matching public key must be available in your GnuPG keyring. A token used only for website sign-in is not automatically ready for vault encryption. OctoVault checks the selected key, token when required, and an actual decryption challenge before allocating a new vault. A detected USB device or a public key alone does not establish that you can unlock it. Resolve the specific authentication error before trying creation again.
+
+**Reuse an existing vault key file** refers to an existing encrypted vault key file or carrier created by Tomb or OctoVault. It does not mean that you already own a YubiKey or an OpenPGP key. Leave it unchecked when creating a new vault using your existing token; OctoVault will create and manage the vault key file for you. When reusing a vault key, OctoVault first checks that it can be decrypted.
 
 OctoVault chooses the folder where the unlocked contents appear automatically. This is the vault's mount location; it is separate from the folder holding the encrypted container and does not need to be configured in the creation form. An existing vault can be registered without converting its format. Automatic unlock and lock policies are available in the creation form's **Advanced options** and later in vault settings.
 
@@ -70,6 +74,15 @@ octovault vault create --name Personal --directory "$HOME" --size-gb 10 --passwo
 The command structure is `octovault GROUP ACTION`. Options use `--hyphenated-names`; arrays use repeated `--source`, `--exclude`, `--include`, or `--close-on`. Use the actual record IDs returned by list operations. Secret options such as `--password`, `--secret-key`, and `--ssh-private-key` **take no command-line value**: they prompt without terminal echo. Automated callers can supply a complete JSON request through standard input using `octovault --json request -`. Avoid persisting secret requests in shell history or world-readable files.
 
 GUI and CLI share the same service, records, authorization checks, asynchronous jobs, and adapters. See `man octovault` for available groups. An error returns a nonzero status; cancellation requests stop the worker and its subprocesses while preserving recovery material.
+
+Backend failures include the specific error and any recorded retained-file locations. Open **Technical details** or choose **Copy diagnostic report** in the error dialog. The most recent 100 private summaries remain available through **Activity → Saved diagnostic reports**, including after restarting the application. The CLI can also read them:
+
+```bash
+octovault diagnostic list
+octovault --json vault list
+```
+
+These summaries describe the failed stage and recovery locations without saving passwords, PINs, decrypted keys, or raw engine output. An authentication failure before allocation creates no new container. If a later failure retained files, inspect the reported paths and vault state before retrying; do not delete the only copy of a key or container to clear an error. See [failed vault creation](docs/recovery.md#failed-vault-creation) for recovery details.
 
 ## Security and maintenance
 

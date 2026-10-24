@@ -1,3 +1,12 @@
+octovault (1.1.2) unstable; urgency=medium
+
+  * Guide YubiKey setup separately from software OpenPGP and vault-key reuse.
+  * Verify authentication before allocating a new encrypted container.
+  * Fix decimal vault capacities and preserve specific creation failures.
+  * Retain setup choices and provide private, readable diagnostic reports.
+
+ -- Vast Development Method <octoleo@users.noreply.github.com>  Sat, 24 Oct 2026 18:00:00 +0200
+
 octovault (1.1.1) unstable; urgency=medium
 
   * Fix file and folder navigation in the protected GNOME application process.

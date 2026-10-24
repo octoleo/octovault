@@ -27,6 +27,31 @@ static void valid_request(void)
     g_assert_false(config_read("repository.recovery"));
     g_assert_false(config_read("repository.restore"));
     g_assert_false(config_read("vault.open"));
+    g_assert_true(config_read("vault.auth-check"));
+    g_assert_true(config_read("diagnostic.list"));
+    g_assert_true(config_read("diagnostic.get"));
+    g_assert_false(config_read("diagnostic.delete"));
+}
+
+static void session_allowlist(void)
+{
+    const gchar *invalid[] = {
+        "{\"op\":\"vault.auth-check\",\"params\":{},\"session\":[]}",
+        "{\"op\":\"vault.auth-check\",\"params\":{},\"session\":{\"PATH\":\"/untrusted\"}}",
+        "{\"op\":\"vault.auth-check\",\"params\":{},\"session\":{\"LD_PRELOAD\":\"/untrusted.so\"}}",
+        "{\"op\":\"vault.auth-check\",\"params\":{},\"session\":{\"home\":\"/root\"}}",
+        "{\"op\":\"vault.auth-check\",\"params\":{},\"session\":{\"display\":42}}",
+        "{\"op\":\"vault.auth-check\",\"params\":{},\"session\":{\"display\":\"\"}}",
+        "{\"op\":\"vault.auth-check\",\"params\":{},\"session\":{\"display\":\":1\\nother\"}}"
+    };
+    for (guint i = 0; i < G_N_ELEMENTS(invalid); i++) {
+        Pending pending = { .request = (gchar *)invalid[i] };
+        g_assert_false(parse_request(&pending)); g_free(pending.op);
+    }
+    Pending pending = { .request = "{\"op\":\"vault.auth-check\",\"params\":{\"require_token\":true},\"session\":{\"display\":\":1\",\"wayland_display\":\"wayland-0\",\"gpg_tty\":\"/dev/pts/3\",\"gnupg_home\":\"/home/person/.gnupg\"}}" };
+    g_assert_true(parse_request(&pending));
+    g_assert_cmpstr(pending.op, ==, "vault.auth-check");
+    g_free(pending.op);
 }
 
 static void bounded_request(void)
@@ -42,5 +67,6 @@ int main(int argc, char **argv)
     g_test_add_func("/daemon/identity-overrides", identity_overrides);
     g_test_add_func("/daemon/request-and-authorization", valid_request);
     g_test_add_func("/daemon/bounded-request", bounded_request);
+    g_test_add_func("/daemon/session-allowlist", session_allowlist);
     return g_test_run();
 }

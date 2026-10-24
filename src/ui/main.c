@@ -10,6 +10,7 @@
 #include <string.h>
 #include <sys/resource.h>
 #include <sys/prctl.h>
+#include "../service/client.h"
 
 #define BUS_NAME "io.vdm.OctoVault1"
 #define BUS_PATH "/io/vdm/OctoVault1"
@@ -23,7 +24,7 @@ typedef struct Operation Operation;
 typedef struct Form Form;
 typedef struct BackupSetup BackupSetup;
 typedef struct { const char *key, *label, *kind, *options, *hint; gboolean required; } Spec;
-typedef struct { const Spec *spec; GtkWidget *widget, *row, *picker; GtkLabel *name, *hint; GPtrArray *values; gboolean context_visible; } Field;
+typedef struct { const Spec *spec; GtkWidget *widget, *row, *picker, *detect_key, *choose_key; GtkLabel *name, *hint; GPtrArray *values; gboolean context_visible; } Field;
 struct App {
   AdwApplication *application;
   GtkWindow *window;
@@ -50,7 +51,8 @@ struct App {
 };
 struct Operation {
   App *app;
-  char *op, *request, *id, *title, *record_id, *snapshot;
+  char *op, *request, *id, *title, *record_id, *snapshot, *stage;
+  GtkWindow *setup_window;
   GMutex mutex;
   gint cancelled;
   gint collection;
@@ -81,6 +83,7 @@ static void result_window(App *app, const char *title, JsonNode *node, gboolean 
 static void snapshots_window(App *app, const char *repository, JsonNode *node);
 static void files_window(App *app, const char *repository, const char *snapshot, JsonNode *node);
 static void migrations_window(App *app, const char *vault, JsonNode *node);
+static void diagnostics_window(App *app,JsonNode *node);
 static gboolean unlock_registered(App *app, const char *id);
 static gboolean drain_unlocks(gpointer data);
 static void wipe(char *text);
@@ -98,6 +101,28 @@ static gboolean boolean(JsonObject *o, const char *key) {
   if (!o || !json_object_has_member(o, key)) return FALSE;
   JsonNode *n = json_object_get_member(o,key);
   return n && JSON_NODE_HOLDS_VALUE(n) && json_node_get_value_type(n) == G_TYPE_BOOLEAN && json_node_get_boolean(n);
+}
+static gboolean openpgp_auth(const char *auth){return !strcmp(auth,"gpg")||!strcmp(auth,"token");}
+static void normalize_vault_auth(JsonObject *params){
+  const char *auth=str(params,"auth");
+  if(!*auth)return;
+  gboolean token=!strcmp(auth,"token");
+  json_object_set_boolean_member(params,"require_token",token);
+  if(token)json_object_set_string_member(params,"auth","gpg");
+}
+/* The size control displays three decimal places. Send that exact decimal
+ * representation, rather than JSON-GLib's binary floating-point expansion. */
+static void set_decimal_size(JsonNode *node,double value){
+  char text[G_ASCII_DTOSTR_BUF_SIZE];g_ascii_formatd(text,sizeof text,"%.3f",value);
+  json_node_set_string(node,text);
+}
+static double decimal_size(JsonObject *params){
+  JsonNode *node=params&&json_object_has_member(params,"size_gb")?json_object_get_member(params,"size_gb"):NULL;
+  if(!node||!JSON_NODE_HOLDS_VALUE(node))return 0;
+  if(json_node_get_value_type(node)==G_TYPE_DOUBLE||json_node_get_value_type(node)==G_TYPE_INT64)return json_node_get_double(node);
+  if(json_node_get_value_type(node)!=G_TYPE_STRING)return 0;
+  char *end=NULL;double value=g_ascii_strtod(json_node_get_string(node),&end);
+  return end&&!*end?value:0;
 }
 static char *humanize(const char *key) {
   char *s = g_strdup(key ? key : "");
@@ -189,7 +214,7 @@ static void add_activity(App *app,const char *message) {
   g_free(time);g_date_time_unref(now);
 }
 static void operation_free(Operation *o) {
-  g_free(o->op);wipe(o->request);g_free(o->request);g_free(o->id);g_free(o->title);g_free(o->record_id);g_free(o->snapshot);g_mutex_clear(&o->mutex);g_free(o);
+  g_free(o->op);wipe(o->request);g_free(o->request);g_free(o->id);g_free(o->title);g_free(o->record_id);g_free(o->snapshot);g_free(o->stage);g_clear_object(&o->setup_window);g_mutex_clear(&o->mutex);g_free(o);
 }
 typedef struct { App *app; char *message; double percent; } Progress;
 static gboolean show_progress(gpointer data) {
@@ -213,13 +238,13 @@ static void operation_thread(GTask *task,gpointer source,gpointer data,GCancella
   Operation *o=data;GError *error=NULL;
   GDBusConnection *bus=g_bus_get_sync(G_BUS_TYPE_SYSTEM,NULL,&error);
   if(!bus){g_task_return_error(task,error);return;}
-  GVariant *reply=bus_call(bus,"Submit",g_variant_new("(s)",o->request),&error);
+  char *id=ov_client_submit(bus,o->request,&error);
   /* Remove the serialized secret-bearing request as soon as submission completes. */
   if(o->request){volatile char *p=(volatile char *)o->request;gsize len=strlen(o->request);for(gsize i=0;i<len;i++)p[i]=0;}
   g_clear_pointer(&o->request,g_free);
-  if(!reply){g_object_unref(bus);g_task_return_error(task,error);return;}
-  const char *id;g_variant_get(reply,"(&s)",&id);
-  g_mutex_lock(&o->mutex);o->id=g_strdup(id);g_mutex_unlock(&o->mutex);g_variant_unref(reply);
+  if(!id){g_object_unref(bus);g_task_return_error(task,error);return;}
+  g_mutex_lock(&o->mutex);o->id=id;g_mutex_unlock(&o->mutex);
+  GVariant *reply=NULL;
   gboolean sent_cancel=FALSE;
   for(;;){
     if(g_atomic_int_get(&o->cancelled)&&!sent_cancel){
@@ -237,6 +262,7 @@ static void operation_thread(GTask *task,gpointer source,gpointer data,GCancella
       JsonNode *pn=json_object_get_member(job,"progress");
       if(JSON_NODE_HOLDS_OBJECT(pn)){
         JsonObject *po=json_node_get_object(pn);Progress *p=g_new0(Progress,1);p->app=o->app;
+        g_free(o->stage);o->stage=g_strdup(str(po,"stage"));
         p->message=g_strdup(*str(po,"message")?str(po,"message"):o->title);p->percent=-1;
         if(json_object_has_member(po,"percent")){JsonNode *v=json_object_get_member(po,"percent");if(JSON_NODE_HOLDS_VALUE(v)&&json_node_get_value_type(v)!=G_TYPE_STRING)p->percent=json_node_get_double(v);}
         g_main_context_invoke(NULL,show_progress,p);
@@ -261,6 +287,55 @@ static void error_window(App *app,const char *title,const char *message) {
   g_signal_connect(close,"clicked",G_CALLBACK(close_window),w);gtk_box_append(box,close);
   gtk_window_set_child(w,GTK_WIDGET(box));gtk_window_present(w);
 }
+/* Copy only the backend's explicit nonsecret fields, never the original
+ * secret-bearing request or raw engine output. */
+static char *operation_error_details(Operation *operation,JsonObject *error){
+  GString *details=g_string_new(NULL);
+  const char *stage=*str(error,"stage")?str(error,"stage"):operation->stage;
+  if(*str(error,"code"))g_string_append_printf(details,"Error: %s\n",str(error,"code"));
+  if(stage&&*stage)g_string_append_printf(details,"Stage: %s\n",stage);
+  if(operation->id&&*operation->id)g_string_append_printf(details,"Job: %s\n",operation->id);
+  if(*str(error,"diagnostic_id"))g_string_append_printf(details,"Report: %s\n",str(error,"diagnostic_id"));
+  if(*str(error,"diagnostic_file"))g_string_append_printf(details,"Report file: %s\n",str(error,"diagnostic_file"));
+  JsonNode *retained=error&&json_object_has_member(error,"retained_paths")?json_object_get_member(error,"retained_paths"):NULL;
+  if(retained&&JSON_NODE_HOLDS_ARRAY(retained)){
+    JsonArray *paths=json_node_get_array(retained);
+    for(guint i=0;i<json_array_get_length(paths);i++){
+      JsonNode *path=json_array_get_element(paths,i);
+      if(JSON_NODE_HOLDS_VALUE(path)&&json_node_get_value_type(path)==G_TYPE_STRING)
+        g_string_append_printf(details,"Retained file: %s\n",json_node_get_string(path));
+    }
+  }
+  return g_string_free(details,FALSE);
+}
+static void copy_error_details(GtkButton *button,gpointer data){
+  gdk_clipboard_set_text(gtk_widget_get_clipboard(GTK_WIDGET(button)),data);
+}
+static void operation_error_window(Operation *operation,const char *message,JsonObject *error){
+  GtkWindow *window=dialog_window(operation->app,operation->title,620,360);
+  if(operation->setup_window)gtk_window_set_transient_for(window,operation->setup_window);
+  GtkBox *box=GTK_BOX(gtk_box_new(GTK_ORIENTATION_VERTICAL,18));margin(GTK_WIDGET(box),24);
+  append_text(box,"The operation needs attention","title-2");append_text(box,message,NULL);
+  char *details=operation_error_details(operation,error);
+  if(*details){
+    GtkWidget *expander=gtk_expander_new("Technical details");GtkWidget *text=label(details,"monospace");
+    gtk_label_set_selectable(GTK_LABEL(text),TRUE);gtk_label_set_wrap_mode(GTK_LABEL(text),PANGO_WRAP_WORD_CHAR);gtk_expander_set_child(GTK_EXPANDER(expander),text);gtk_box_append(box,expander);
+    GtkWidget *copy=gtk_button_new_with_label("Copy diagnostic report");gtk_widget_set_halign(copy,GTK_ALIGN_START);
+    char *report=g_strdup_printf("%s\n%s\n\n%s",operation->title,message,details);
+    g_object_set_data_full(G_OBJECT(copy),"diagnostic-report",report,g_free);
+    g_signal_connect(copy,"clicked",G_CALLBACK(copy_error_details),report);gtk_box_append(box,copy);
+  }
+  g_free(details);
+  GtkWidget *close=gtk_button_new_with_mnemonic("_Close");gtk_widget_set_halign(close,GTK_ALIGN_END);
+  g_signal_connect(close,"clicked",G_CALLBACK(close_window),window);gtk_box_append(box,close);
+  gtk_window_set_child(window,GTK_WIDGET(box));gtk_window_present(window);
+}
+static void finish_creation_form(Operation *operation,const char *error){
+  if(!operation->setup_window)return;
+  Form *form=g_object_get_data(G_OBJECT(operation->setup_window),"form");
+  if(error&&form){form->submitted=FALSE;gtk_label_set_text(form->error,error);gtk_window_present(operation->setup_window);}
+  else gtk_window_destroy(operation->setup_window);
+}
 static gboolean useful_result(const char *op) {
   return strstr(op,".get")||strstr(op,".snapshots")||strstr(op,".files")||strstr(op,".find")||strstr(op,".diff")||strstr(op,".stats")||strstr(op,".history")||strstr(op,".search")||strstr(op,".recovery")||strstr(op,".forget")||strstr(op,".check")||strstr(op,".test")||!strcmp(op,"migration.list");
 }
@@ -268,21 +343,28 @@ static void operation_done(GObject *source,GAsyncResult *result,gpointer data) {
   (void)source;Operation *o=data;App *app=o->app;GError *error=NULL;
   JsonNode *response=g_task_propagate_pointer(G_TASK(result),&error);
   JsonNode *payload=NULL;
+  JsonObject *failure=NULL;
   if(response&&JSON_NODE_HOLDS_OBJECT(response)){
     JsonObject *root=json_node_get_object(response);
     if(!boolean(root,"ok")){
       const char *message="The operation could not be completed.";
-      if(json_object_has_member(root,"error")&&JSON_NODE_HOLDS_OBJECT(json_object_get_member(root,"error")))message=str(json_object_get_object_member(root,"error"),"message");
+      if(json_object_has_member(root,"error")&&JSON_NODE_HOLDS_OBJECT(json_object_get_member(root,"error"))){failure=json_object_get_object_member(root,"error");message=str(failure,"message");}
       g_set_error_literal(&error,G_IO_ERROR,G_IO_ERROR_FAILED,*message?message:"The operation could not be completed.");
     }else if(json_object_has_member(root,"data"))payload=json_object_get_member(root,"data");
   }else if(response)g_set_error_literal(&error,G_IO_ERROR,G_IO_ERROR_INVALID_DATA,"The service returned an invalid operation response.");
   if(!o->background){app->active=NULL;gtk_widget_set_visible(app->job_box,FALSE);}
+  finish_creation_form(o,error?error->message:NULL);
   gboolean guided=!o->background&&backup_setup_handle_result(app,o->op,payload,error);
   if(guided){if(!error)refresh_all(app);g_clear_error(&error);}
   else if(error){
     if(o->background){
       if(o->collection==0){add_activity(app,error->message);if(!strcmp(app->page,"Dashboard")||!strcmp(app->page,"Vaults")){render_page(app);append_text(app->body,"The system service is unavailable or did not complete this request. Install OctoVault's system package, then use Refresh. See Activity for details.","error");}}
-    }else{add_activity(app,error->message);if(!app->priority_lock){error_window(app,o->title,error->message);notify(app,"Operation needs attention",error->message);}}
+    }else{
+      char *details=operation_error_details(o,failure);char *activity=g_strdup_printf("%s\n%s",error->message,details);
+      add_activity(app,activity);g_free(activity);g_free(details);
+      if(!app->priority_lock){operation_error_window(o,error->message,failure);notify(app,"Operation needs attention",error->message);}
+      refresh_all(app);
+    }
     g_clear_error(&error);
   }else if(o->background){
     if(app->collections[o->collection])json_node_free(app->collections[o->collection]);
@@ -300,6 +382,7 @@ static void operation_done(GObject *source,GAsyncResult *result,gpointer data) {
     else if(!strcmp(o->op,"repository.snapshots")&&payload)snapshots_window(app,o->record_id,payload);
     else if(!strcmp(o->op,"repository.files")&&payload)files_window(app,o->record_id,o->snapshot,payload);
     else if(!strcmp(o->op,"migration.list")&&payload)migrations_window(app,o->record_id,payload);
+    else if(!strcmp(o->op,"diagnostic.list")&&payload)diagnostics_window(app,payload);
     else if(useful_result(o->op)&&payload)result_window(app,o->title,payload,FALSE,FALSE);
     refresh_all(app);
   }
@@ -412,6 +495,33 @@ static void result_window(App *app,const char *title,JsonNode *node,gboolean rev
   }else{detail_nodes(content,NULL,node,0);GtkWidget *close=gtk_button_new_with_mnemonic("_Close");gtk_widget_set_halign(close,GTK_ALIGN_END);gtk_box_append(root,close);g_signal_connect(close,"clicked",G_CALLBACK(close_window),w);}
   gtk_window_set_child(w,GTK_WIDGET(root));gtk_window_present(w);
 }
+static void diagnostics_window(App *app,JsonNode *node){
+  if(!JSON_NODE_HOLDS_ARRAY(node)){error_window(app,"Saved diagnostic reports","The service returned an invalid report list.");return;}
+  GtkWindow *window=dialog_window(app,"Saved diagnostic reports",760,640);
+  GtkBox *root=GTK_BOX(gtk_box_new(GTK_ORIENTATION_VERTICAL,16));margin(GTK_WIDGET(root),24);
+  append_text(root,"Saved diagnostic reports","title-2");
+  append_text(root,"Failure summaries remain available after closing OctoVault. They contain the failed step and retained file locations, never passwords, PINs or key contents.","dim-label");
+  GtkWidget *scroll=gtk_scrolled_window_new();gtk_widget_set_vexpand(scroll,TRUE);
+  GtkBox *reports=GTK_BOX(gtk_box_new(GTK_ORIENTATION_VERTICAL,20));gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroll),GTK_WIDGET(reports));gtk_box_append(root,scroll);
+  JsonArray *items=json_node_get_array(node);
+  if(!json_array_get_length(items))append_text(reports,"No saved failures.","dim-label");
+  for(guint i=0;i<json_array_get_length(items);i++){
+    JsonNode *item=json_array_get_element(items,i);if(!JSON_NODE_HOLDS_OBJECT(item))continue;
+    JsonObject *record=json_node_get_object(item);
+    JsonNode *error_node=json_object_has_member(record,"error")?json_object_get_member(record,"error"):NULL;
+    if(!error_node||!JSON_NODE_HOLDS_OBJECT(error_node))continue;
+    JsonObject *error=json_node_get_object(error_node);Operation operation={0};
+    char *heading=g_strdup_printf("%s · %s",str(record,"created_at"),str(record,"operation"));
+    append_text(reports,heading,"heading");append_text(reports,str(error,"message"),NULL);
+    char *details=operation_error_details(&operation,error);GtkWidget *text=label(details,"monospace");gtk_label_set_selectable(GTK_LABEL(text),TRUE);gtk_label_set_wrap_mode(GTK_LABEL(text),PANGO_WRAP_WORD_CHAR);gtk_box_append(reports,text);
+    GtkWidget *copy=gtk_button_new_with_label("Copy diagnostic report");gtk_widget_set_halign(copy,GTK_ALIGN_START);
+    char *report=g_strdup_printf("%s\n%s\n\n%s",heading,str(error,"message"),details);g_object_set_data_full(G_OBJECT(copy),"diagnostic-report",report,g_free);g_signal_connect(copy,"clicked",G_CALLBACK(copy_error_details),report);gtk_box_append(reports,copy);
+    g_free(heading);g_free(details);
+    if(i+1<json_array_get_length(items))gtk_box_append(reports,gtk_separator_new(GTK_ORIENTATION_HORIZONTAL));
+  }
+  GtkWidget *close=gtk_button_new_with_mnemonic("_Close");gtk_widget_set_halign(close,GTK_ALIGN_END);g_signal_connect(close,"clicked",G_CALLBACK(close_window),window);gtk_box_append(root,close);
+  gtk_window_set_child(window,GTK_WIDGET(root));gtk_window_present(window);
+}
 
 #define S(k,l,t,o,h,r) {k,l,t,o,h,r}
 #define END {NULL,NULL,NULL,NULL,NULL,FALSE}
@@ -419,11 +529,11 @@ static const Spec vault_create[]={
  S("name","_Vault name","text",NULL,"For example, Personal. This also names the encrypted vault file.",TRUE),
  S("directory","_Save vault in","folder",NULL,"Choose a folder on your computer or a mounted drive.",TRUE),
  S("size_gb","Size in _gigabytes","number","10","Decimal GB; the actual container is rounded up to a whole MiB.",TRUE),
- S("auth","_How to unlock","choice","key|image|text|gpg",NULL,TRUE),
- S("use_existing_key","I already have a _key","boolean",NULL,"Use an existing vault key or carrier instead of generating a new one.",FALSE),
+ S("auth","_How to unlock","choice","key|token|gpg|image|text",NULL,TRUE),
+ S("use_existing_key","Reuse an existing _vault key file","boolean",NULL,"Leave unchecked for a new vault, including when you already own a YubiKey. Enable only to reuse an encrypted Tomb key file or carrier.",FALSE),
  S("key_file","_Existing key or carrier","file",NULL,"Choose the encrypted key file, image, or text file that already contains your vault key.",TRUE),
  S("image_source","_Choose an image","file",NULL,"Choose a JPEG or BMP. OctoVault hides a new encrypted key in a private copy; your original image stays unchanged.",TRUE),
- S("recipient","OpenPGP _encryption key","text",NULL,"Choose a software OpenPGP key from your keyring, or detect a compatible YubiKey. You need its private key to unlock the vault.",TRUE),
+ S("recipient","OpenPGP _encryption key","text",NULL,"Select the key that will protect this vault. OctoVault tests encryption and unlocking before creating any vault files.",TRUE),
  S("cipher_file","Text cipher _file (optional)","file",NULL,"Only needed if your existing text carrier uses a custom word list. Otherwise leave this blank.",FALSE),
  S("password","_Passphrase","password",NULL,"Remember this passphrase. OctoVault never saves it.",TRUE),
  S("_confirm_password","_Confirm passphrase","password",NULL,NULL,TRUE),
@@ -432,7 +542,7 @@ static const Spec vault_create[]={
  S("force_close","Allow force close of _busy applications","boolean",NULL,"Force closing can discard unsaved application work.",FALSE),END};
 static const Spec vault_import[]={
  S("name","_Vault name","text",NULL,NULL,TRUE),S("file","_Existing encrypted vault","file",NULL,"Choose the existing encrypted vault file to register.",TRUE),
- S("auth","_How to unlock","choice","key|image|text|gpg","Select the method used by the existing key or carrier below.",TRUE),
+ S("auth","_How to unlock","choice","key|token|gpg|image|text","Select the method used by the existing key or carrier below.",TRUE),
  S("key_file","_Existing key or carrier","file",NULL,"Select its encrypted key file, image, or text carrier. Importing never generates a replacement key.",TRUE),
  S("recipient","OpenPGP _encryption key","text",NULL,"Software OpenPGP keys and compatible YubiKeys are supported.",FALSE),
  S("cipher_file","Text cipher _file (optional)","file",NULL,"Choose the original cipher for a custom text carrier; otherwise leave blank.",FALSE),
@@ -442,7 +552,7 @@ static const Spec vault_import[]={
  S("trust_native_hooks","Trust _scripts stored inside this vault","boolean",NULL,"Allows executable hooks from the vault to run as your account. Leave disabled for untrusted imported vaults.",FALSE),END};
 static const Spec vault_settings[]={
  S("name","_Vault name","text",NULL,NULL,TRUE),
- S("auth","_Authentication","choice","key|gpg|image|text","Select the method used by the existing key or carrier below.",TRUE),
+ S("auth","_Authentication","choice","key|token|gpg|image|text","Select the method used by the existing key or carrier below.",TRUE),
  S("key_file","_Key file or image/text carrier","file",NULL,"Select an existing compatible key. Use Replace key to change the vault's encryption key.",TRUE),
  S("recipient","OpenPGP _recipient","text",NULL,NULL,FALSE),S("cipher_file","Text cipher _file","file",NULL,"Leave blank to use OctoVault's included word-list cipher. Existing text keys need their original cipher.",FALSE),
  S("open_on","_Unlock automatically","choice","login|manual|drive|token",NULL,FALSE),
@@ -589,22 +699,24 @@ static JsonNode *hidden_advanced_value(Form*form,const Spec*spec){
 static gboolean vault_create_field_visible(const char *key,const char *auth,gboolean existing){
   if(!strcmp(key,"key_file"))return existing;
   if(!strcmp(key,"image_source"))return !existing&&!strcmp(auth,"image");
-  if(!strcmp(key,"recipient"))return !existing&&!strcmp(auth,"gpg");
+  if(!strcmp(key,"recipient"))return !existing&&openpgp_auth(auth);
   if(!strcmp(key,"cipher_file"))return existing&&!strcmp(auth,"text");
-  if(!strcmp(key,"password"))return strcmp(auth,"gpg")!=0;
-  if(!strcmp(key,"_confirm_password"))return !existing&&strcmp(auth,"gpg")!=0;
+  if(!strcmp(key,"password"))return !openpgp_auth(auth);
+  if(!strcmp(key,"_confirm_password"))return !existing&&!openpgp_auth(auth);
   return TRUE;
 }
 static const char *vault_create_guidance(const char *auth,gboolean existing){
   if(existing){
-    if(!strcmp(auth,"gpg"))return "Choose your existing OpenPGP-encrypted vault key. GnuPG will ask for your software-key passphrase or security-key PIN when needed; OctoVault does not save it.";
+    if(!strcmp(auth,"token"))return "Choose an existing encrypted vault key file, and connect the security key that unlocks it. This file is separate from the OpenPGP key stored on your YubiKey. OctoVault verifies it before creating the new vault.";
+    if(!strcmp(auth,"gpg"))return "Choose your existing OpenPGP-encrypted vault key file. GnuPG asks for the private key's passphrase when needed. OctoVault verifies it before creating the new vault.";
     if(!strcmp(auth,"image"))return "Choose the image that already contains your encrypted vault key, then enter its passphrase. An ordinary image without a hidden key cannot unlock a vault.";
     if(!strcmp(auth,"text"))return "Choose the text file that already contains your encrypted vault key, then enter its passphrase. An ordinary text document cannot unlock a vault.";
     return "Choose your existing encrypted vault key and enter its passphrase. OctoVault remembers the key's location; it never saves the passphrase.";
   }
   if(!strcmp(auth,"image"))return "OctoVault generates the key automatically, protects it with your passphrase, and hides it in a copy of your chosen image. The carrier is saved privately and its location remembered.";
   if(!strcmp(auth,"text"))return "OctoVault generates the key automatically, protects it with your passphrase, and creates a text carrier. The carrier is saved privately and its location remembered.";
-  if(!strcmp(auth,"gpg"))return "OctoVault generates a vault key and encrypts it for your selected OpenPGP key. Software OpenPGP keys and compatible YubiKeys both work. GnuPG asks for your passphrase or PIN when needed.";
+  if(!strcmp(auth,"token"))return "Connect your YubiKey and choose Detect security key. OctoVault checks its existing OpenPGP encryption key and asks for PIN or touch before creating your vault. It generates the vault key file automatically; it does not reset or reconfigure your YubiKey.";
+  if(!strcmp(auth,"gpg"))return "Choose your software OpenPGP encryption key. OctoVault tests that it can encrypt and unlock a short challenge, then generates the vault key file automatically. GnuPG asks for your private-key passphrase when needed.";
   return "OctoVault generates and securely stores an encrypted key for you. You only need to enter its passphrase when unlocking. The key's location is remembered; the passphrase is never saved.";
 }
 static void update_location_preview(GtkEditable *editable,gpointer data){
@@ -636,9 +748,9 @@ static void update_form_visibility(GObject *object,GParamSpec *pspec,gpointer da
       }
     }
     if(*auth){
-      if(!strcmp(k,"recipient"))visible=!strcmp(auth,"gpg");
+      if(!strcmp(k,"recipient"))visible=openpgp_auth(auth);
       if(!strcmp(k,"cipher_file"))visible=!strcmp(auth,"text");
-      if(!strcmp(k,"password")||!strcmp(k,"_confirm_password"))visible=strcmp(auth,"gpg")!=0;
+      if(!strcmp(k,"password")||!strcmp(k,"_confirm_password"))visible=!openpgp_auth(auth);
     }
     if(!strcmp(form->operation,"vault.create"))visible=vault_create_field_visible(k,auth,existing);
     if(*format&&!strcmp(k,"cipher_file"))visible=!strcmp(format,"text");
@@ -654,6 +766,11 @@ static void update_form_visibility(GObject *object,GParamSpec *pspec,gpointer da
     f->context_visible=visible;
     if(advanced_field(form->operation,k)&&form->advanced&&!gtk_check_button_get_active(form->advanced))visible=FALSE;
     gtk_widget_set_visible(f->row,visible);
+    if(!strcmp(k,"recipient")){
+      if(f->detect_key)gtk_widget_set_visible(f->detect_key,!strcmp(auth,"token"));
+      if(f->choose_key)gtk_widget_set_visible(f->choose_key,strcmp(auth,"token")!=0);
+      gtk_label_set_text_with_mnemonic(f->name,!strcmp(auth,"token")?"Security key _encryption fingerprint":"OpenPGP _encryption key");
+    }
   }
   if(form->guidance)gtk_label_set_text(form->guidance,vault_create_guidance(auth,existing));
 }
@@ -761,7 +878,7 @@ static void gpg_lookup_finished(GObject *source,GAsyncResult *result,gpointer da
   GPtrArray*keys=parse_encryption_keys(output);g_free(output);
   if(lookup->detect){
     gboolean matched=FALSE;for(guint i=0;i<keys->len;i++){GpgKey*key=g_ptr_array_index(keys,i);if(!strcmp(key->fingerprint,lookup->card_fingerprint)){matched=TRUE;break;}}
-    if(matched){char*recipient=g_strconcat(lookup->card_fingerprint,"!",NULL);gtk_editable_set_text(GTK_EDITABLE(lookup->entry),recipient);g_free(recipient);gpg_message(lookup,"Security key detected. Its encryption fingerprint has been selected. Unlocking will honour the key's PIN and touch policy. Keep a separate recovery key.");}
+    if(matched){char*recipient=g_strconcat(lookup->card_fingerprint,"!",NULL);gtk_editable_set_text(GTK_EDITABLE(lookup->entry),recipient);g_free(recipient);gpg_message(lookup,"Security key selected. When you create the vault, OctoVault will verify that this key can unlock it before allocating files. Respond to GnuPG's PIN or touch prompt when requested.");}
     else gpg_message(lookup,"The security key is connected, but its matching usable public encryption key is missing from your GnuPG keyring. Import that public key into your account, then detect the security key again. No private key needs to be exported from the device.");
   }else if(keys->len)gpg_choose_result(lookup,keys);
   else gpg_message(lookup,"No usable public encryption keys are available in your GnuPG keyring. Import your public key using your OpenPGP key manager, then choose it here. Revoked, expired and disabled keys are excluded.");
@@ -804,7 +921,7 @@ static void choose_drive(GtkButton*button,gpointer data){
 }
 static char *choice_label(const char *s){
   if(!strcmp(s,"key"))return g_strdup("Password-protected key file");
-  if(!strcmp(s,"gpg"))return g_strdup("OpenPGP key or YubiKey");
+  if(!strcmp(s,"gpg"))return g_strdup("Software OpenPGP key");
   if(!strcmp(s,"image"))return g_strdup("Key hidden in an image");
   if(!strcmp(s,"text"))return g_strdup("Key hidden in text");
   if(!strcmp(s,"s3"))return g_strdup("S3-compatible object storage");
@@ -841,6 +958,7 @@ static void size_changed(GtkSpinButton*spin,gpointer data){
 }
 static Field *create_field(Form*form,const Spec*spec,JsonObject*record,GtkBox*content){
   Field*f=g_new0(Field,1);f->spec=spec;JsonNode*existing=lookup(record,spec->key);char *initial=existing?node_text(existing):g_strdup(spec->options?spec->options:"");
+  if(!strcmp(spec->key,"auth")&&!strcmp(initial,"gpg")&&boolean(record,"require_token")){g_free(initial);initial=g_strdup("token");}
   GtkBox*row=GTK_BOX(gtk_box_new(GTK_ORIENTATION_VERTICAL,5));f->row=GTK_WIDGET(row);gtk_box_append(content,GTK_WIDGET(row));
   GtkWidget*name=gtk_label_new_with_mnemonic(spec->label);f->name=GTK_LABEL(name);gtk_label_set_xalign(GTK_LABEL(name),0);gtk_widget_add_css_class(name,"heading");gtk_box_append(row,name);
   const char *kind=spec->kind;
@@ -854,7 +972,7 @@ static Field *create_field(Form*form,const Spec*spec,JsonObject*record,GtkBox*co
       gtk_string_list_append(model,spec->required?"Select…":"None");g_ptr_array_add(f->values,g_strdup(""));
       guint index=(guint)atoi(spec->options);JsonNode*n=form->app->collections[index];
       if(n&&JSON_NODE_HOLDS_ARRAY(n)){JsonArray*a=json_node_get_array(n);for(guint i=0;i<json_array_get_length(a);i++){JsonNode*item=json_array_get_element(a,i);if(!JSON_NODE_HOLDS_OBJECT(item))continue;JsonObject*o=json_node_get_object(item);gtk_string_list_append(model,str(o,"name"));g_ptr_array_add(f->values,g_strdup(str(o,"id")));if(existing&&!strcmp(initial,str(o,"id")))selected=f->values->len-1;}}
-    }else{gboolean matched=FALSE;char**options=g_strsplit(spec->options,"|",-1);for(guint i=0;options[i];i++){char*t=choice_label(options[i]);gtk_string_list_append(model,t);g_free(t);g_ptr_array_add(f->values,g_strdup(options[i]));if(existing&&!strcmp(initial,options[i])){selected=i;matched=TRUE;}}g_strfreev(options);if(!strcmp(kind,"schedule")&&existing&&*initial&&!matched){char*t=g_strdup_printf("Custom: %s",initial);gtk_string_list_append(model,t);g_free(t);g_ptr_array_add(f->values,g_strdup(initial));selected=f->values->len-1;}}
+    }else{gboolean matched=FALSE;char**options=g_strsplit(spec->options,"|",-1);for(guint i=0;options[i];i++){char*t=!strcmp(spec->key,"auth")&&!strcmp(options[i],"token")?g_strdup("YubiKey / OpenPGP security key"):choice_label(options[i]);gtk_string_list_append(model,t);g_free(t);g_ptr_array_add(f->values,g_strdup(options[i]));if(existing&&!strcmp(initial,options[i])){selected=i;matched=TRUE;}}g_strfreev(options);if(!strcmp(kind,"schedule")&&existing&&*initial&&!matched){char*t=g_strdup_printf("Custom: %s",initial);gtk_string_list_append(model,t);g_free(t);g_ptr_array_add(f->values,g_strdup(initial));selected=f->values->len-1;}}
     f->widget=gtk_drop_down_new(G_LIST_MODEL(model),NULL);gtk_drop_down_set_selected(GTK_DROP_DOWN(f->widget),selected);gtk_box_append(row,f->widget);
   }else if(!strcmp(kind,"number")||!strcmp(kind,"integer")){
     f->widget=gtk_spin_button_new_with_range(!strcmp(kind,"number")?0.001:0,100000000, !strcmp(kind,"number")?0.1:1);gtk_spin_button_set_digits(GTK_SPIN_BUTTON(f->widget),!strcmp(kind,"number")?3:0);gtk_spin_button_set_value(GTK_SPIN_BUTTON(f->widget),g_ascii_strtod(initial,NULL));gtk_box_append(row,f->widget);
@@ -871,8 +989,8 @@ static Field *create_field(Form*form,const Spec*spec,JsonObject*record,GtkBox*co
     GtkBox*line=GTK_BOX(gtk_box_new(GTK_ORIENTATION_HORIZONTAL,8));gtk_widget_set_hexpand(f->widget,TRUE);gtk_box_append(line,f->widget);gtk_box_append(row,GTK_WIDGET(line));
     if(!strcmp(spec->key,"recipient")){
       GtkBox*controls=GTK_BOX(gtk_box_new(GTK_ORIENTATION_HORIZONTAL,8));gtk_box_append(row,GTK_WIDGET(controls));
-      GtkWidget*detect=gtk_button_new_with_label("Detect security key");g_object_set_data(G_OBJECT(detect),"detect-token",GINT_TO_POINTER(1));g_signal_connect(detect,"clicked",G_CALLBACK(choose_gpg),f);gtk_box_append(controls,detect);
-      GtkWidget*choose=gtk_button_new_with_label("Choose existing key…");g_signal_connect(choose,"clicked",G_CALLBACK(choose_gpg),f);gtk_box_append(controls,choose);
+      GtkWidget*detect=gtk_button_new_with_label("Detect security key");f->detect_key=detect;g_object_set_data(G_OBJECT(detect),"detect-token",GINT_TO_POINTER(1));g_signal_connect(detect,"clicked",G_CALLBACK(choose_gpg),f);gtk_box_append(controls,detect);
+      GtkWidget*choose=gtk_button_new_with_label("Choose OpenPGP recipient…");f->choose_key=choose;g_signal_connect(choose,"clicked",G_CALLBACK(choose_gpg),f);gtk_box_append(controls,choose);
     }
     if(!strcmp(spec->key,"drive_uuid")){GtkWidget*choose=gtk_button_new_with_label("Choose drive…");g_signal_connect(choose,"clicked",G_CALLBACK(choose_drive),f);gtk_box_append(row,choose);}
     if(!strcmp(kind,"destination-path")){GtkWidget*b=gtk_button_new_from_icon_name("folder-open-symbolic");f->picker=b;gtk_widget_set_tooltip_text(b,"Choose a backup folder");gtk_accessible_update_property(GTK_ACCESSIBLE(b),GTK_ACCESSIBLE_PROPERTY_LABEL,"Choose a backup folder",-1);g_object_set_data(G_OBJECT(b),"choose-folder",GINT_TO_POINTER(1));gtk_box_append(line,b);g_signal_connect(b,"clicked",G_CALLBACK(choose_file),f);}
@@ -892,15 +1010,17 @@ static const char *vault_creation_error(JsonObject *params){
   for(const char*p=name;*p;p++)if(g_ascii_iscntrl(*p))return "The vault name cannot contain control characters.";
   if(!*directory||!g_path_is_absolute(directory))return "Choose a folder in Save vault in.";
   if(!g_file_test(directory,G_FILE_TEST_IS_DIR))return "The selected folder is unavailable. Choose an existing folder or connect its drive.";
-  if(!json_object_has_member(params,"size_gb")||json_object_get_double_member(params,"size_gb")<=0)return "Choose a vault size greater than zero.";
+  double size=decimal_size(params);
+  if(!isfinite(size)||size<=0)return "Choose a vault size greater than zero.";
+  if(size*1000000000.0/1048576.0<=9||size*1000000000.0/1048576.0>2147483647.0)return "Choose a vault size of at least 0.010 GB and within the supported capacity.";
   if(boolean(params,"use_existing_key")){
     if(!*str(params,"key_file"))return "Choose your existing encrypted key or carrier.";
     if(!g_file_test(str(params,"key_file"),G_FILE_TEST_IS_REGULAR))return "The selected key or carrier is unavailable. Choose an existing file.";
   }else{
     if(!strcmp(auth,"image")&&(!*str(params,"image_source")||!g_file_test(str(params,"image_source"),G_FILE_TEST_IS_REGULAR)))return "Choose an existing JPEG or BMP image to carry your new key.";
-    if(!strcmp(auth,"gpg")&&!*str(params,"recipient"))return "Choose an OpenPGP encryption key or detect your YubiKey.";
+    if(openpgp_auth(auth)&&!*str(params,"recipient"))return boolean(params,"require_token")?"Connect your YubiKey and choose Detect security key.":"Choose the OpenPGP encryption key that will protect this vault.";
   }
-  if(strcmp(auth,"gpg")&&!*str(params,"password"))return "Enter the passphrase that protects your vault key.";
+  if(!openpgp_auth(auth)&&!*str(params,"password"))return "Enter the passphrase that protects your vault key.";
   return NULL;
 }
 static const char *destination_setup_error(JsonObject*params,JsonObject*original){
@@ -931,7 +1051,10 @@ static JsonObject *form_parameters(Form*f,gboolean*accepted){
       continue;
     }
     if(!strcmp(s->kind,"boolean"))json_node_set_boolean(n,gtk_check_button_get_active(GTK_CHECK_BUTTON(field->widget)));
-    else if(!strcmp(s->kind,"number"))json_node_set_double(n,gtk_spin_button_get_value(GTK_SPIN_BUTTON(field->widget)));
+    else if(!strcmp(s->kind,"number")){
+      double value=gtk_spin_button_get_value(GTK_SPIN_BUTTON(field->widget));
+      if(!strcmp(s->key,"size_gb"))set_decimal_size(n,value);else json_node_set_double(n,value);
+    }
     else if(!strcmp(s->kind,"integer"))json_node_set_int(n,(gint64)gtk_spin_button_get_value(GTK_SPIN_BUTTON(field->widget)));
     else if(!strcmp(s->kind,"flags")){
       JsonArray*a=json_array_new();guint j=0;for(GtkWidget*w=gtk_widget_get_first_child(field->widget);w;w=gtk_widget_get_next_sibling(w),j++)if(gtk_check_button_get_active(GTK_CHECK_BUTTON(w)))json_array_add_string_element(a,g_ptr_array_index(field->values,j));json_node_free(n);n=json_node_new(JSON_NODE_ARRAY);json_node_take_array(n,a);
@@ -971,14 +1094,27 @@ static JsonObject *form_parameters(Form*f,gboolean*accepted){
       json_object_set_array_member(params,"sources",sources);
       if(!*id){gtk_label_set_text(f->error,"Select the vault whose encrypted container should be backed up.");valid=FALSE;}
     }
+    if(g_str_has_prefix(f->operation,"vault."))normalize_vault_auth(params);
     if(!strcmp(f->operation,"vault.create")){const char*error=vault_creation_error(params);if(error){gtk_label_set_text(f->error,error);valid=FALSE;}}
     if(!strcmp(f->operation,"destination.save")){const char*error=destination_setup_error(params,f->original);if(error){gtk_label_set_text(f->error,error);valid=FALSE;}}
   }
   *accepted=valid;return params;
 }
+static void clear_form_secrets(Form *form){
+  for(guint i=0;i<form->fields->len;i++){Field*field=g_ptr_array_index(form->fields,i);if(!strcmp(field->spec->kind,"password"))gtk_editable_set_text(GTK_EDITABLE(field->widget),"");}
+}
 static void submit_form(GtkButton*button,gpointer data){
   (void)button;Form*f=data;gboolean valid;JsonObject*params=form_parameters(f,&valid);
-  if(valid){f->submitted=TRUE;start_operation(f->app,f->operation,params,gtk_window_get_title(f->window),-1,f->acknowledge);gtk_window_destroy(f->window);}
+  if(valid&&f->app->active){gtk_label_set_text(f->error,"Wait for the current operation to finish before continuing.");valid=FALSE;}
+  if(valid){
+    f->submitted=TRUE;gtk_label_set_text(f->error,"");
+    start_operation(f->app,f->operation,params,gtk_window_get_title(f->window),-1,f->acknowledge);
+    if(!strcmp(f->operation,"vault.create")&&f->app->active){
+      f->app->active->setup_window=g_object_ref(f->window);
+      clear_form_secrets(f);
+      gtk_widget_set_visible(GTK_WIDGET(f->window),FALSE);
+    }else gtk_window_destroy(f->window);
+  }
   json_object_unref(params);
 }
 static void open_form(App*app,const char*operation,const char*title,JsonObject*record){
@@ -1036,6 +1172,7 @@ static void action_clicked(GtkButton*button,gpointer data){
   Action*a=data;GtkWidget*ancestor=gtk_widget_get_ancestor(GTK_WIDGET(button),GTK_TYPE_POPOVER);if(ancestor)gtk_popover_popdown(GTK_POPOVER(ancestor));
   if(!strcmp(a->operation,"ui.backup-setup")){open_backup_setup(a->app);return;}
   if(!strcmp(a->operation,"ui.browse-vault")){browse_vault(a->app,a->record);return;}
+  if(!strcmp(a->operation,"diagnostic.list")){JsonObject*params=json_object_new();start_operation(a->app,a->operation,params,a->title,-1,FALSE);json_object_unref(params);return;}
   open_form(a->app,a->operation,a->title,a->record);
 }
 static GtkWidget *action_button(App*app,const char*title,const char*operation,JsonObject*record,const char*css){
@@ -1216,6 +1353,7 @@ static void render_page(App*app){
   }else if(!strcmp(app->page,"Destinations")){
     gtk_box_append(toolbar,action_button(app,"Add destination…","destination.save",NULL,"suggested-action"));append_text(app->body,"Connect a local drive, S3 storage, SSH server, or REST backup server. Secrets are stored as encrypted service credentials.","dim-label");collection_cards(app,1,"No destinations configured.");
   }else if(!strcmp(app->page,"Activity")){
+    gtk_box_append(toolbar,action_button(app,"Saved diagnostic reports","diagnostic.list",NULL,"suggested-action"));
     append_text(app->body,"This session","title-2");if(!app->activity->len)append_text(app->body,"No operations yet.","dim-label");for(guint i=0;i<app->activity->len;i++)append_text(app->body,g_ptr_array_index(app->activity,i),NULL);
     append_text(app->body,"Each backup plan also provides its persistent Backup history in its actions menu.","dim-label");
   }else{
@@ -1299,11 +1437,11 @@ static void smoke_vault_creation(Form*f){
   for(guint i=0;i<auth->values->len;i++)for(guint reuse=0;reuse<2;reuse++){
     gtk_drop_down_set_selected(GTK_DROP_DOWN(auth->widget),i);gtk_check_button_set_active(GTK_CHECK_BUTTON(existing->widget),reuse);
     const char*method=g_ptr_array_index(auth->values,i);gboolean accepted=FALSE;JsonObject*params=form_parameters(f,&accepted);g_assert_true(accepted);
-    g_assert_cmpstr(str(params,"auth"),==,method);g_assert_cmpint(boolean(params,"use_existing_key"),==,(gboolean)reuse);
+    g_assert_cmpstr(str(params,"auth"),==,!strcmp(method,"token")?"gpg":method);g_assert_cmpint(boolean(params,"require_token"),==,!strcmp(method,"token"));g_assert_cmpint(boolean(params,"use_existing_key"),==,(gboolean)reuse);
     g_assert_cmpint(json_object_has_member(params,"key_file"),==,(gboolean)reuse);
     g_assert_cmpint(json_object_has_member(params,"image_source"),==,!reuse&&!strcmp(method,"image"));
-    g_assert_cmpint(json_object_has_member(params,"recipient"),==,!reuse&&!strcmp(method,"gpg"));
-    g_assert_cmpint(json_object_has_member(params,"password"),==,strcmp(method,"gpg")!=0);
+    g_assert_cmpint(json_object_has_member(params,"recipient"),==,!reuse&&openpgp_auth(method));
+    g_assert_cmpint(json_object_has_member(params,"password"),==,!openpgp_auth(method));
     g_assert_false(json_object_has_member(params,"file"));g_assert_false(json_object_has_member(params,"mountpoint"));g_assert_false(json_object_has_member(params,"_confirm_password"));
     json_object_unref(params);
   }
@@ -1312,6 +1450,16 @@ static void smoke_vault_creation(Form*f){
   gtk_editable_set_text(GTK_EDITABLE(find_field(f,"_confirm_password")->widget),"smoke-test-only");
   gtk_check_button_set_active(f->advanced,TRUE);gtk_drop_down_set_selected(GTK_DROP_DOWN(find_field(f,"open_on")->widget),1);gtk_check_button_set_active(GTK_CHECK_BUTTON(find_field(f,"force_close")->widget),TRUE);gtk_check_button_set_active(f->advanced,FALSE);
   params=form_parameters(f,&accepted);g_assert_true(accepted);g_assert_cmpstr(str(params,"open_on"),==,"login");g_assert_false(boolean(params,"force_close"));g_assert_true(string_array_has(json_object_get_member(params,"close_on"),"shutdown"));json_object_unref(params);
+  gtk_spin_button_set_value(GTK_SPIN_BUTTON(find_field(f,"size_gb")->widget),0.05);
+  params=form_parameters(f,&accepted);g_assert_true(accepted);g_assert_cmpstr(str(params,"size_gb"),==,"0.050");json_object_unref(params);
+  clear_form_secrets(f);f->submitted=TRUE;gtk_widget_set_visible(GTK_WIDGET(f->window),FALSE);
+  Operation failed={.setup_window=f->window};finish_creation_form(&failed,"The selected security key is not connected.");
+  g_assert_true(gtk_widget_get_visible(GTK_WIDGET(f->window)));g_assert_false(f->submitted);
+  g_assert_cmpstr(gtk_editable_get_text(GTK_EDITABLE(find_field(f,"name")->widget)),==,"Personal");
+  g_assert_cmpstr(gtk_editable_get_text(GTK_EDITABLE(find_field(f,"directory")->widget)),==,g_get_tmp_dir());
+  g_assert_cmpstr(gtk_editable_get_text(GTK_EDITABLE(find_field(f,"password")->widget)),==,"");
+  g_assert_cmpstr(gtk_editable_get_text(GTK_EDITABLE(find_field(f,"_confirm_password")->widget)),==,"");
+  gtk_label_set_text(f->error,"");
   g_assert_cmpint(g_unlink(sample_path),==,0);g_free(sample_path);
 }
 static void smoke_advanced_defaults(App*app){

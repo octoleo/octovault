@@ -9,6 +9,8 @@
 #define OV_REQUEST_LIMIT (1024 * 1024)
 #define OV_RESULT_LIMIT (4 * 1024 * 1024)
 GDBusConnection *ov_client_connect(GError **error);
+gchar *ov_client_prepare_request(const gchar *request, GError **error);
+gboolean ov_session_valid(JsonNode *session);
 gchar *ov_client_submit(GDBusConnection *bus, const gchar *request, GError **error);
 JsonNode *ov_client_get_job(GDBusConnection *bus, const gchar *id, GError **error);
 gboolean ov_client_cancel(GDBusConnection *bus, const gchar *id, GError **error);

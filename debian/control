@@ -11,8 +11,8 @@ Vcs-Browser: https://github.com/octoleo/octovault
 
 Package: octovault
 Architecture: any
-Depends: ${shlibs:Depends}, ${misc:Depends}, bash (>= 5.1), tomb (>= 2.13), restic (>= 0.16), systemd (>= 252), jq, rsync, openssh-client, curl, gnupg, pinentry-gnome3 | pinentry, cryptsetup-bin, util-linux, procps, lsof, steghide, qrencode, polkitd, dbus, adwaita-icon-theme, ca-certificates
-Recommends: scdaemon, pcscd, fuse3, libnotify-bin
+Depends: ${shlibs:Depends}, ${misc:Depends}, bash (>= 5.1), tomb (>= 2.13), restic (>= 0.16), systemd (>= 252), jq, rsync, openssh-client, curl, gnupg, scdaemon, pinentry-gnome3 | pinentry, cryptsetup-bin, util-linux, procps, lsof, steghide, qrencode, polkitd, dbus, adwaita-icon-theme, ca-certificates
+Recommends: pcscd, fuse3, libnotify-bin
 Description: Native GNOME encrypted vault and independent backup manager
  OctoVault manages encrypted local vaults and encrypted backup repositories
  through a native GTK4 interface and a matching command-line interface.
