@@ -22,12 +22,12 @@ session=$(jq -c '.session // {}' <<< "$request")
 # terminal setting must never prevent the user from reading failure reports.
 case "$OV_OP" in
     vault.auth-check) ov_session_init "$session" ;;
-    vault.create)
+    vault.create|vault.import)
         if [[ $(ov_param auth key) == gpg ]]; then ov_session_init "$session"; fi
         ;;
-    vault.open|vault.passwd|vault.setkey|vault.resize|vault.key-export|migration.add|migration.recover)
+    vault.open|vault.update|vault.passwd|vault.setkey|vault.resize|vault.key-export|migration.add|migration.recover)
         ov_load vaults "$(ov_require id)"
-        if [[ $(jq -r '.auth // "key"' <<< "$OV_RECORD") == gpg ]]; then ov_session_init "$session"; fi
+        if [[ $(ov_param auth "$(jq -r '.auth // "key"' <<< "$OV_RECORD")") == gpg ]]; then ov_session_init "$session"; fi
         ;;
 esac
 unset session
