@@ -10,6 +10,25 @@ Keys generated during creation are stored under your private `~/.local/share/oct
 
 Text key carriers also require the exact word map used to create them. OctoVault includes its original 66-word map at `/usr/share/octovault/cloak-ciphers/words`; preserve a copy with your recovery materials, especially when using a custom map. This stable data file only translates the already encrypted key into words. The distribution's Tomb helpers perform the conversion, and the key still requires its passphrase.
 
+## Failed vault creation
+
+Read the specific error and failed stage before retrying. OctoVault checks OpenPGP authentication before allocating a new container: a missing public key, unavailable token, failed PIN prompt, or unsuccessful decryption challenge must be resolved first. **Software OpenPGP key** uses your local OpenPGP private key; **YubiKey / OpenPGP security key** requires the matching OpenPGP encryption key on the connected token. Having used a YubiKey for web sign-in does not by itself configure its OpenPGP application.
+
+For a new vault, leave **Reuse an existing vault key file** unchecked even if you already own the token. That checkbox means that you are supplying an existing encrypted vault key file or carrier, not an existing OpenPGP identity. A token's private key decrypts the vault key file; both are needed to open the vault.
+
+Use **Technical details** or **Copy diagnostic report** in the error dialog. Backend failure summaries are stored privately under `/var/lib/octovault/users/UID/diagnostics/`, where `UID` is your account's numeric user ID. The most recent 100 reports are available through **Activity → Saved diagnostic reports**. The application exposes them through the service; run the following as your regular user to review them and the registered vaults:
+
+```bash
+octovault diagnostic list
+octovault --json vault list
+```
+
+A summary records the error code, readable explanation, failed stage when available, and any known retained-file paths. It does not contain the PIN, passphrase, private key, decrypted vault key, or raw engine output. Its location is a diagnostic report, not a replacement recovery key. Service logs in the system journal can help with service startup or authorization problems, but are not an archive of raw Tomb or GnuPG errors.
+
+If authentication failed before allocation, correct the reported problem and retry. If creation already allocated files, keep the reported container and key until you have checked their state. The container is in the folder selected during setup; automatically managed encrypted keys are under `~/.local/share/octovault/keys/`. A vault marked incomplete has not completed initialization. Retrying the same name will not overwrite an existing container, and importing an uninitialized container cannot make it a usable vault. Do not delete or rename files as a blind retry procedure.
+
+Older versions displayed “Existing recovery material has been retained” for unrelated validation errors, even when no recovery files had been created. That message alone does not establish that any files exist or that a diagnostic report was saved. Inspect the selected storage folder, the managed key folder, and the vault list before deciding how to recover an earlier attempt.
+
 ## Restore on another computer
 
 Install OctoVault and its dependencies. Recreate the destination using the saved remote credentials, then import the existing repository with its saved repository password. List snapshots, choose files, and restore into a new empty directory. Check the restored contents and ownership before replacing existing files. This process does not require the original machine's encrypted credential store.

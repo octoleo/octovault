@@ -1,4 +1,4 @@
-.TH OCTOVAULT 1 "October 2026" "OctoVault 1.1.1" "User Commands"
+.TH OCTOVAULT 1 "October 2026" "OctoVault 1.1.2" "User Commands"
 .SH NAME
 octovault \- manage encrypted local vaults and independent backups
 .SH SYNOPSIS
@@ -26,7 +26,7 @@ selects the root account's configuration.
 .TP
 .B vault
 list, get, create, import, open, close, update, remove, resize, passwd,
-setkey, key-export, index, and search.
+setkey, key-export, index, search, and auth-check.
 .TP
 .B migration
 add, list, and recover.
@@ -43,6 +43,9 @@ list, save, remove, run, and history.
 .TP
 .B schedule
 sync.
+.TP
+.B diagnostic
+list and get. Private failure summaries are scoped to your account.
 .SH OPTIONS
 Use --id to select an existing record. Option names use hyphens. Repeat
 --source, --exclude, --include, or --close-on to supply multiple array entries.
@@ -56,6 +59,9 @@ directory unless --use-existing-key selects an existing --key-file.
 For a new image key, --image-source supplies a cover image whose original is
 preserved. Text keys are generated automatically. --auth gpg supports software
 OpenPGP keys and compatible tokens; a new key requires --recipient.
+Add --require-token to require the matching card-backed encryption key.
+The auth-check action verifies the recipient and PIN or passphrase before
+creating any vault. Creation performs this check automatically.
 The unlock folder is managed automatically. Key paths are remembered;
 vault passphrases are never saved.
 .PP
@@ -77,6 +83,10 @@ Show the application version.
 .TP
 .B /var/lib/octovault/users/UID
 Root-owned account state and encrypted credentials. Retained on package removal.
+.TP
+.B /var/lib/octovault/users/UID/diagnostics
+The most recent 100 private failure summaries. Read them with diagnostic list
+or diagnostic get --id ID, or through Activity in the desktop application.
 .TP
 .B /usr/libexec/octovault
 Fixed privileged workers; not a public invocation interface.

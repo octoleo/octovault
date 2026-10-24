@@ -375,7 +375,8 @@ static gboolean config_read(const gchar *op)
 {
     const gchar *allowed[] = { "vault.list", "vault.get", "destination.list", "destination.get",
         "repository.list", "repository.snapshots", "repository.files", "repository.find", "repository.diff",
-        "repository.stats", "vault.search", "backup.list", "backup.history", "migration.list", "system.info", NULL };
+        "repository.stats", "vault.search", "backup.list", "backup.history", "migration.list", "system.info",
+        "diagnostic.list", "diagnostic.get", "vault.auth-check", NULL };
     for (guint i = 0; allowed[i]; i++) if (g_str_equal(op, allowed[i])) return TRUE;
     return FALSE;
 }
@@ -506,7 +507,8 @@ static gboolean parse_request(Pending *p)
         if (JSON_NODE_HOLDS_OBJECT(node)) {
             JsonObject *obj = json_node_get_object(node);
             JsonNode *op = json_object_get_member(obj, "op"), *params = json_object_get_member(obj, "params");
-            if (op && JSON_NODE_HOLDS_VALUE(op) && json_node_get_value_type(op) == G_TYPE_STRING && params && JSON_NODE_HOLDS_OBJECT(params)) {
+            if (op && JSON_NODE_HOLDS_VALUE(op) && json_node_get_value_type(op) == G_TYPE_STRING && params && JSON_NODE_HOLDS_OBJECT(params) &&
+                ov_session_valid(json_object_get_member(obj, "session"))) {
                 const gchar *name = json_node_get_string(op);
                 if (strlen(name) <= 64 && g_regex_match_simple("^[a-z]+\\.[a-z][a-z-]*$", name, 0, 0)) {
                     JsonObject *par = json_node_get_object(params);

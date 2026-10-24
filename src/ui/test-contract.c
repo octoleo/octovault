@@ -162,15 +162,15 @@ static void test_guided_creation_fields(void)
     g_assert_cmpstr(find_spec(import,"file")->kind,==,"file");
     g_assert_cmpstr(find_spec(import,"key_file")->kind,==,"file");
     g_assert_null(find_spec(import,"password"));
-    const char *methods[]={"key","image","text","gpg"};
+    const char *methods[]={"key","image","text","gpg","token"};
     for(guint i=0;i<G_N_ELEMENTS(methods);i++)for(guint existing=0;existing<2;existing++){
         const char *auth=methods[i];
         g_assert_cmpint(vault_create_field_visible("key_file",auth,existing),==,(gboolean)existing);
         g_assert_cmpint(vault_create_field_visible("image_source",auth,existing),==,!existing&&!strcmp(auth,"image"));
-        g_assert_cmpint(vault_create_field_visible("recipient",auth,existing),==,!existing&&!strcmp(auth,"gpg"));
+        g_assert_cmpint(vault_create_field_visible("recipient",auth,existing),==,!existing&&openpgp_auth(auth));
         g_assert_cmpint(vault_create_field_visible("cipher_file",auth,existing),==,existing&&!strcmp(auth,"text"));
-        g_assert_cmpint(vault_create_field_visible("password",auth,existing),==,strcmp(auth,"gpg")!=0);
-        g_assert_cmpint(vault_create_field_visible("_confirm_password",auth,existing),==,!existing&&strcmp(auth,"gpg")!=0);
+        g_assert_cmpint(vault_create_field_visible("password",auth,existing),==,!openpgp_auth(auth));
+        g_assert_cmpint(vault_create_field_visible("_confirm_password",auth,existing),==,!existing&&!openpgp_auth(auth));
         g_assert_nonnull(vault_create_guidance(auth,existing));
     }
 }
@@ -207,6 +207,58 @@ static void test_guided_creation_validation(void)
     json_object_set_string_member(params,"recipient","1111111111111111111111111111111111111111!");
     g_assert_null(vault_creation_error(params));
     json_object_unref(params);
+}
+
+static void test_decimal_size_serialization(void)
+{
+    const double sizes[]={0.05,0.1,0.2,0.3,1.1,10,100.01};
+    const char *expected[]={"0.050","0.100","0.200","0.300","1.100","10.000","100.010"};
+    for(guint i=0;i<G_N_ELEMENTS(sizes);i++){
+        JsonObject *params=json_object_new();JsonNode *size=json_node_new(JSON_NODE_VALUE);
+        set_decimal_size(size,sizes[i]);json_object_set_member(params,"size_gb",size);
+        char *request=serialize_request("vault.create",params);GError *error=NULL;
+        JsonNode *parsed=parse_json(request,&error);g_assert_no_error(error);
+        JsonObject *received=json_object_get_object_member(json_node_get_object(parsed),"params");
+        g_assert_cmpstr(str(received,"size_gb"),==,expected[i]);
+        g_assert_true(g_regex_match_simple("^[0-9]+([.][0-9]{1,6})?$",str(received,"size_gb"),0,0));
+        g_assert_cmpfloat(decimal_size(received),==,sizes[i]);
+        g_free(request);json_node_free(parsed);json_object_unref(params);
+    }
+}
+
+static void test_token_authentication_contract(void)
+{
+    JsonObject *params=json_object_new();
+    json_object_set_string_member(params,"auth","token");
+    normalize_vault_auth(params);
+    g_assert_cmpstr(str(params,"auth"),==,"gpg");g_assert_true(boolean(params,"require_token"));
+    json_object_set_string_member(params,"auth","gpg");normalize_vault_auth(params);
+    g_assert_false(boolean(params,"require_token"));
+    json_object_set_string_member(params,"auth","key");normalize_vault_auth(params);
+    g_assert_cmpstr(str(params,"auth"),==,"key");g_assert_false(boolean(params,"require_token"));
+    json_object_unref(params);
+}
+
+static void test_safe_error_details(void)
+{
+    Operation operation={.id="job-test",.stage="queued"};JsonObject *error=json_object_new();
+    json_object_set_string_member(error,"code","authentication_failed");
+    json_object_set_string_member(error,"stage","authentication");
+    json_object_set_string_member(error,"diagnostic_id","report-test");
+    json_object_set_string_member(error,"diagnostic_file","/var/lib/octovault/report-test.json");
+    json_object_set_string_member(error,"password","never-display-this");
+    json_object_set_string_member(error,"stderr","raw-engine-secret");
+    JsonArray *retained=json_array_new();json_array_add_string_element(retained,"/home/person/Personal.tomb");
+    json_object_set_array_member(error,"retained_paths",retained);
+    char *details=operation_error_details(&operation,error);
+    g_assert_nonnull(strstr(details,"Error: authentication_failed"));
+    g_assert_nonnull(strstr(details,"Stage: authentication"));g_assert_null(strstr(details,"queued"));
+    g_assert_nonnull(strstr(details,"Job: job-test"));g_assert_nonnull(strstr(details,"Report: report-test"));
+    g_assert_nonnull(strstr(details,"Retained file: /home/person/Personal.tomb"));
+    g_assert_null(strstr(details,"never-display-this"));g_assert_null(strstr(details,"raw-engine-secret"));
+    g_free(details);json_object_unref(error);
+    details=operation_error_details(&operation,NULL);
+    g_assert_nonnull(strstr(details,"Stage: queued"));g_assert_null(strstr(details,"Retained"));g_free(details);
 }
 
 static void test_advanced_defaults_and_preservation(void)
@@ -272,6 +324,9 @@ int main(int argc, char **argv)
     g_test_add_func("/ui/usable-encryption-keys", test_usable_encryption_keys);
     g_test_add_func("/ui/guided-creation-fields", test_guided_creation_fields);
     g_test_add_func("/ui/guided-creation-validation", test_guided_creation_validation);
+    g_test_add_func("/ui/decimal-size-serialization", test_decimal_size_serialization);
+    g_test_add_func("/ui/token-authentication-contract", test_token_authentication_contract);
+    g_test_add_func("/ui/safe-error-details", test_safe_error_details);
     g_test_add_func("/ui/advanced-defaults-preservation", test_advanced_defaults_and_preservation);
     g_test_add_func("/ui/destination-guidance", test_destination_guidance);
     return g_test_run();
