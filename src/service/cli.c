@@ -13,21 +13,28 @@
 #include <sys/resource.h>
 #include <sys/prctl.h>
 #include <poll.h>
+#include <stdatomic.h>
+#include <fcntl.h>
 
 #ifndef OCTOVAULT_VERSION
 #define OCTOVAULT_VERSION "1.0.0"
 #endif
-static volatile sig_atomic_t interrupted;
+/* The handler only stores a lock-free flag. Cancellation is performed by an
+ * ordinary thread because GCancellable is not an async-signal-safe API. */
+_Static_assert(ATOMIC_INT_LOCK_FREE == 2, "Signal interruption requires lock-free integer atomics");
+static _Atomic int interrupted;
+static gint cancellation_monitor_stop;
+static GCancellable *request_cancellation;
 static void signal_handler(int signo) { (void) signo; interrupted = 1; }
 static void wipe(gchar *data) { if (data) { volatile gchar *p = data; gsize n = strlen(data); while (n--) *p++ = 0; } }
 
 static void usage(void)
 {
     puts("OctoVault " OCTOVAULT_VERSION " — encrypted vaults and independent backups\n"
-         "Usage: octovault [--json] GROUP ACTION [--option VALUE ...]\n"
+         "Usage: octovault [--json] [--system] GROUP ACTION [--option VALUE ...]\n"
          "       octovault [--json] request [FILE|-]\n"
          "       octovault [--json] job get|cancel ID\n\n"
-         "Groups: vault, migration, destination, repository, backup, schedule, event, system, diagnostic\n"
+         "Groups: vault, migration, destination, repository, backup, schedule, event, system, diagnostic, access\n"
          "Use --id ID to select a registered item. Use --size-gb 10 for vault capacity.\n"
          "Create with --directory FOLDER and --name NAME; a new encrypted key is managed automatically.\n"
          "Use --use-existing-key --key-file FILE to reuse a key or protected carrier.\n"
@@ -35,6 +42,9 @@ static void usage(void)
          "For a YubiKey use --auth gpg --recipient FINGERPRINT --require-token.\n"
          "Use vault auth-check with --recipient and --require-token to test authentication before creation.\n"
          "Use diagnostic list or diagnostic get --id ID to inspect saved failure details.\n"
+         "Use access status to inspect permissions; access grant|revoke --user LOGIN changes personal access.\n"
+         "Approved personal access is used automatically. Use --system for administrator-managed resources.\n"
+         "Authorization belongs to this command's connection and ends when it exits.\n"
          "Repeat --source, --exclude, --include or --close-on for array values.\n"
          "Boolean options accept true/false, a bare --flag, or --no-flag.\n"
          "Secrets (for example --password or --secret-key) take NO value: they prompt\n"
@@ -123,11 +133,11 @@ static gchar *make_request(int argc, char **argv, GError **error)
         return read_request(argc == 2 ? argv[1] : "-", error);
     }
     if (argc < 2) { g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT, "Specify a group and action; see --help."); return NULL; }
-    const gchar *groups[] = { "vault", "migration", "destination", "repository", "backup", "schedule", "event", "system", "diagnostic", NULL };
+    const gchar *groups[] = { "vault", "migration", "destination", "repository", "backup", "schedule", "event", "system", "diagnostic", "access", NULL };
     if (!in_list(argv[0], groups)) { g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT, "Unknown operation group."); return NULL; }
     JsonObject *params = json_object_new();
     const gchar *boolean_keys[] = { "force", "force_close", "read_data", "dry_run", "one_file_system", "on_battery", "metered", "use_existing_key", "require_token", NULL };
-    const gchar *number_keys[] = { "size_gb", "port", "keep_daily", "keep_weekly", "keep_monthly", "keep_yearly", "keep_last", "boot_delay_sec", "idle_sec", "idle_seconds", "upload_limit", "download_limit", NULL };
+    const gchar *number_keys[] = { "size_gb", "port", "keep_daily", "keep_weekly", "keep_monthly", "keep_yearly", "keep_last", "boot_delay_sec", "idle_sec", "idle_seconds", "upload_limit", "download_limit", "duration_seconds", NULL };
     const gchar *array_keys[] = { "sources", "excludes", "include", "close_on", NULL };
     for (int i = 2; i < argc; i++) {
         if (!g_str_has_prefix(argv[i], "--") || strchr(argv[i], '=')) {
@@ -197,21 +207,28 @@ static gchar *make_request(int argc, char **argv, GError **error)
 
 static GPid start_agent(void)
 {
-    if (!isatty(STDIN_FILENO) || g_getenv("DISPLAY") || g_getenv("WAYLAND_DISPLAY")) return 0;
+    if (g_getenv("DISPLAY") || g_getenv("WAYLAND_DISPLAY")) return 0;
     gchar *program = g_find_program_in_path("pkttyagent");
     if (!program) return 0;
+    /* Structured requests may arrive on a pipe while an SSH controlling
+     * terminal remains available for trusted PolicyKit authentication. */
+    int terminal = open("/dev/tty", O_RDWR | O_CLOEXEC);
+    if (terminal < 0) { g_free(program); return 0; }
     int ready[2];
-    if (pipe(ready) < 0) { g_free(program); return 0; }
+    if (pipe(ready) < 0) { close(terminal); g_free(program); return 0; }
     pid_t pid = fork();
     if (pid == 0) {
         close(ready[0]);
+        if (dup2(terminal, STDIN_FILENO) < 0 || dup2(terminal, STDOUT_FILENO) < 0 || dup2(terminal, STDERR_FILENO) < 0) _exit(127);
+        if (terminal > STDERR_FILENO) close(terminal);
+        for (int fd = STDIN_FILENO; fd <= STDERR_FILENO; fd++) (void)fcntl(fd, F_SETFD, 0);
         gchar process[32], fd[32];
         g_snprintf(process, sizeof(process), "%ld", (long)getppid());
         g_snprintf(fd, sizeof(fd), "%d", ready[1]);
         execl(program, program, "--process", process, "--notify-fd", fd, "--fallback", (char *)NULL);
         _exit(127);
     }
-    close(ready[1]); g_free(program);
+    close(terminal); close(ready[1]); g_free(program);
     if (pid > 0) { struct pollfd descriptor = { .fd = ready[0], .events = POLLIN | POLLHUP }; poll(&descriptor, 1, 3000); }
     close(ready[0]); return pid > 0 ? pid : 0;
 }
@@ -260,15 +277,145 @@ static void print_response(JsonNode *node, gboolean json)
     } else print_value(node, 0);
 }
 
+static gpointer monitor_cancellation(gpointer data)
+{
+    GCancellable *cancellable = data;
+    while (!g_atomic_int_get(&cancellation_monitor_stop)) {
+        if (interrupted) { g_cancellable_cancel(cancellable); break; }
+        g_usleep(10000);
+    }
+    return NULL;
+}
+
+static gchar *submit_command(GDBusConnection *bus, const gchar *request, GError **error)
+{
+    if (interrupted) {
+        g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_CANCELLED, "Command cancelled before submission.");
+        return NULL;
+    }
+    return ov_client_submit_cancellable(bus, request, request_cancellation, error);
+}
+
+static gboolean completed_without_result(JsonObject *job, GError **error)
+{
+    JsonNode *node = json_object_has_member(job, "state") ? json_object_get_member(job, "state") : NULL;
+    if (!node || !JSON_NODE_HOLDS_VALUE(node) || json_node_get_value_type(node) != G_TYPE_STRING) return FALSE;
+    const gchar *state = json_node_get_string(node);
+    if (strcmp(state, "succeeded") && strcmp(state, "failed") && strcmp(state, "cancelled")) return FALSE;
+    g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_PERMISSION_DENIED,
+        "The operation finished, but its result is unavailable under this authorization. Check Activity before retrying; the operation may already have completed.");
+    return TRUE;
+}
+
+static gboolean status_requires_lease(JsonObject *status)
+{
+    JsonNode *available = json_object_has_member(status, "available") ? json_object_get_member(status, "available") : NULL;
+    return available && JSON_NODE_HOLDS_VALUE(available) && json_node_get_value_type(available) == G_TYPE_BOOLEAN && json_node_get_boolean(available);
+}
+
+/* Authorization jobs use the same connection as the subsequent operation.
+ * An application permission is never shared with another shell process. */
+static JsonNode *access_result(GDBusConnection *bus, const gchar *request, GError **error)
+{
+    gchar *id = submit_command(bus, request, error);
+    if (!id) return NULL;
+    JsonNode *result = NULL;
+    for (;;) {
+        if (interrupted) {
+            ov_client_cancel(bus, id, NULL);
+            g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_CANCELLED, "Authorization cancelled.");
+            break;
+        }
+        JsonNode *job = ov_client_get_job(bus, id, error);
+        if (!job) break;
+        if (!JSON_NODE_HOLDS_OBJECT(job)) {
+            json_node_unref(job);
+            g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA, "Invalid authorization response.");
+            break;
+        }
+        JsonObject *object = json_node_get_object(job);
+        JsonNode *payload = json_object_has_member(object, "result") ? json_object_get_member(object, "result") : NULL;
+        if (payload && !JSON_NODE_HOLDS_NULL(payload)) {
+            if (JSON_NODE_HOLDS_OBJECT(payload)) {
+                JsonObject *response = json_node_get_object(payload);
+                JsonNode *ok = json_object_has_member(response, "ok") ? json_object_get_member(response, "ok") : NULL;
+                if (ok && JSON_NODE_HOLDS_VALUE(ok) && json_node_get_value_type(ok) == G_TYPE_BOOLEAN && json_node_get_boolean(ok)) {
+                    JsonNode *data = json_object_has_member(response, "data") ? json_object_get_member(response, "data") : NULL;
+                    if (data && JSON_NODE_HOLDS_OBJECT(data)) result = json_node_copy(data);
+                } else {
+                    const gchar *message = "Authorization was not granted.";
+                    JsonNode *detail = json_object_has_member(response, "error") ? json_object_get_member(response, "error") : NULL;
+                    if (detail && JSON_NODE_HOLDS_OBJECT(detail)) {
+                        JsonObject *failure = json_node_get_object(detail);
+                        JsonNode *value = json_object_has_member(failure, "message") ? json_object_get_member(failure, "message") : NULL;
+                        if (value && JSON_NODE_HOLDS_VALUE(value) && json_node_get_value_type(value) == G_TYPE_STRING)
+                            message = json_node_get_string(value);
+                    }
+                    g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_PERMISSION_DENIED, message);
+                }
+            }
+            if (!result && !*error) g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA, "Invalid authorization result.");
+            json_node_unref(job);
+            break;
+        }
+        if (completed_without_result(object, error)) { json_node_unref(job); break; }
+        json_node_unref(job);
+        g_usleep(100000);
+    }
+    g_free(id);
+    return result;
+}
+
+static gboolean authorization_required(const GError *error)
+{
+    if (!error || !g_dbus_error_is_remote_error(error)) return FALSE;
+    gchar *name = g_dbus_error_get_remote_error(error);
+    gboolean required = name && (g_str_equal(name, OV_INTERFACE ".AuthorizationRequired") ||
+                                  g_str_equal(name, OV_INTERFACE ".AuthorizationExpired"));
+    g_free(name);
+    return required;
+}
+
+static gboolean authorize_command(GDBusConnection *bus, gboolean system, GError **error)
+{
+    gboolean personal = FALSE;
+    JsonNode *status = access_result(bus, "{\"op\":\"access.status\",\"params\":{}}", error);
+    if (!status) return FALSE;
+    JsonObject *object = json_node_get_object(status);
+    if (!status_requires_lease(object)) {
+        /* SSH/headless callers use the service's fixed per-operation policy.
+         * A locked local desktop is still rejected by that same service. */
+        json_node_unref(status); return TRUE;
+    }
+    if (!system) {
+        JsonNode *delegated = json_object_has_member(object, "delegated_personal") ? json_object_get_member(object, "delegated_personal") : NULL;
+        personal = delegated && JSON_NODE_HOLDS_VALUE(delegated) &&
+            json_node_get_value_type(delegated) == G_TYPE_BOOLEAN && json_node_get_boolean(delegated);
+    }
+    json_node_unref(status);
+    const gchar *request = personal ? "{\"op\":\"access.unlock\",\"params\":{\"scope\":\"personal\"}}" :
+                                      "{\"op\":\"access.unlock\",\"params\":{\"scope\":\"system\"}}";
+    status = access_result(bus, request, error);
+    if (!status) return FALSE;
+    object = json_node_get_object(status);
+    JsonNode *authorized = json_object_has_member(object, "authorized") ? json_object_get_member(object, "authorized") : NULL;
+    gboolean granted = authorized && JSON_NODE_HOLDS_VALUE(authorized) &&
+        json_node_get_value_type(authorized) == G_TYPE_BOOLEAN && json_node_get_boolean(authorized);
+    if (!granted) g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_PERMISSION_DENIED, "Management authorization is unavailable for this session.");
+    json_node_unref(status);
+    return granted;
+}
+
 int main(int argc, char **argv)
 {
     const struct rlimit no_core = { 0, 0 };
     (void)setrlimit(RLIMIT_CORE, &no_core);
     (void)prctl(PR_SET_DUMPABLE, 0);
-    gboolean json = FALSE;
+    gboolean json = FALSE, system = FALSE;
     GPtrArray *args = g_ptr_array_new();
     for (int i = 1; i < argc; i++) {
         if (g_str_equal(argv[i], "--json")) json = TRUE;
+        else if (g_str_equal(argv[i], "--system")) system = TRUE;
         else if (g_str_equal(argv[i], "--help") || g_str_equal(argv[i], "-h")) { usage(); g_ptr_array_unref(args); return 0; }
         else if (g_str_equal(argv[i], "--version")) { puts("OctoVault " OCTOVAULT_VERSION); g_ptr_array_unref(args); return 0; }
         else g_ptr_array_add(args, argv[i]);
@@ -297,7 +444,20 @@ int main(int argc, char **argv)
         if (error) goto failed;
         g_ptr_array_unref(args); return 0;
     }
-    gchar *id = ov_client_submit(bus, request, &error);
+    gchar *id = NULL;
+    request_cancellation = g_cancellable_new();
+    g_atomic_int_set(&cancellation_monitor_stop, 0);
+    GThread *cancellation_thread = g_thread_new("authorization-cancel", monitor_cancellation, request_cancellation);
+    if (!system || authorize_command(bus, TRUE, &error)) id = submit_command(bus, request, &error);
+    if (!id && !system && authorization_required(error)) {
+        /* The service rejected this request before allocating a job. Only
+         * this precise condition permits one automatic authorization retry. */
+        g_clear_error(&error);
+        if (authorize_command(bus, FALSE, &error)) id = submit_command(bus, request, &error);
+    }
+    if (!id && interrupted) (void)g_dbus_connection_close_sync(bus, NULL, NULL);
+    g_atomic_int_set(&cancellation_monitor_stop, 1);
+    g_thread_join(cancellation_thread); g_clear_object(&request_cancellation);
     wipe(request); g_clear_pointer(&request, g_free);
     if (agent) { kill(agent, SIGTERM); waitpid(agent, NULL, 0); }
     if (!id) { g_object_unref(bus); goto failed; }
@@ -310,12 +470,16 @@ int main(int argc, char **argv)
         if (!JSON_NODE_HOLDS_OBJECT(job)) { json_node_unref(job); g_set_error_literal(&error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA, "Invalid job response."); break; }
         JsonObject *obj = json_node_get_object(job);
         JsonNode *result = json_object_get_member(obj, "result");
-        if (result) {
+        if (result && !JSON_NODE_HOLDS_NULL(result)) {
+            if (!JSON_NODE_HOLDS_OBJECT(result)) {
+                json_node_unref(job); g_set_error_literal(&error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA, "Invalid operation result."); break;
+            }
             print_response(result, json);
             JsonObject *result_obj = json_node_get_object(result);
             exit_code = json_object_get_boolean_member(result_obj, "ok") ? 0 : cancellation_sent ? 130 : 1;
             json_node_unref(job); break;
         }
+        if (completed_without_result(obj, &error)) { json_node_unref(job); break; }
         if (!json && isatty(STDERR_FILENO) && json_object_has_member(obj, "progress")) {
             JsonObject *progress = json_object_get_object_member(obj, "progress");
             const gchar *message = json_object_get_string_member(progress, "message");
@@ -330,7 +494,11 @@ failed:
     wipe(request); g_free(request);
     if (json) {
         JsonObject *obj = json_object_new(); json_object_set_boolean_member(obj, "ok", FALSE);
-        JsonObject *detail = json_object_new(); json_object_set_string_member(detail, "code", "CLIENT_ERROR");
+        JsonObject *detail = json_object_new();
+        const gchar *code = interrupted ? "CANCELLED" :
+            g_error_matches(error, G_IO_ERROR, G_IO_ERROR_PERMISSION_DENIED) ? "AUTHORIZATION_REQUIRED" :
+            g_error_matches(error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA) ? "INVALID_SERVICE_RESPONSE" : "CLIENT_ERROR";
+        json_object_set_string_member(detail, "code", code);
         json_object_set_string_member(detail, "message", error ? error->message : "Operation failed.");
         json_object_set_object_member(obj, "error", detail);
         JsonNode *root = json_node_new(JSON_NODE_OBJECT); json_node_take_object(root, obj);

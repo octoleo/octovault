@@ -3,7 +3,7 @@
 set -Eeuo pipefail
 umask 077
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C.UTF-8
-unset BASH_ENV ENV CDPATH GLOBIGNORE OV_SECRET_FD OV_OLD_SECRET_FD OV_OLD_KEY_PATH OV_RESOURCE_FD OV_ERROR_FILE OV_STAGE OV_RETAINED_PATHS OV_USER_ENV
+unset BASH_ENV ENV CDPATH GLOBIGNORE OV_SECRET_FD OV_OLD_SECRET_FD OV_OLD_KEY_PATH OV_RESOURCE_FD OV_ERROR_FILE OV_STAGE OV_RETAINED_PATHS OV_USER_ENV OV_EXECUTION_SCOPE OV_BACKUP_SCOPE OV_BACKUP_IO OV_BACKUP_TMP OV_BACKUP_WORKSPACE_SCOPE OV_ACCESS_FILE
 cd /
 readonly OV_LIB=/usr/lib/octovault
 source "$OV_LIB/common.sh"
@@ -11,12 +11,19 @@ trap 'ov_secret_close; ov_resource_unlock; if declare -F ov_vault_cleanup >/dev/
 trap 'ov_abort' ERR
 ov_init "${1-}"
 ov_error_init
+[[ $# -ge 1 && $# -le 2 ]] || ov_fail invalid_request 'The service supplied invalid worker arguments.'
+# Only the privileged service or an internal root worker can supply this value.
+# It is never read from JSON parameters or inherited environment variables.
+# shellcheck disable=SC2034 # Consumed by sourced adapters, never exported to children.
+OV_EXECUTION_SCOPE=$(ov_execution_scope "${2-system}")
 request=$(head -c 1048577)
 ((${#request} <= 1048576)) || ov_fail request_too_large 'Request exceeds the supported size.'
 jq -e 'type=="object" and (.op|type=="string") and ((.params // {})|type=="object")' <<<"$request" >/dev/null || ov_fail invalid_request 'Invalid operation request.'
 OV_OP=$(jq -r .op <<<"$request")
 # shellcheck disable=SC2034 # Shared request consumed by sourced adapters.
 OV_PARAMS=$(jq -c '.params // {}' <<<"$request")
+jq -e 'has("execution_scope") or has("scope")' <<< "$OV_PARAMS" >/dev/null &&
+    ov_fail invalid_request 'Execution permissions cannot be selected in operation parameters.'
 session=$(jq -c '.session // {}' <<< "$request")
 # Read-only pages and backup operations do not need a GPG session. A stale
 # terminal setting must never prevent the user from reading failure reports.

@@ -27,6 +27,8 @@ typedef struct { const char *key, *label, *kind, *options, *hint; gboolean requi
 typedef struct { const Spec *spec; GtkWidget *widget, *row, *picker, *detect_key, *choose_key; GtkLabel *name, *hint; GPtrArray *values; gboolean context_visible; } Field;
 struct App {
   AdwApplication *application;
+  GDBusConnection *service_bus;
+  GMutex service_bus_mutex;
   GtkWindow *window;
   GtkBox *body;
   GtkLabel *title, *job_label;
@@ -48,6 +50,17 @@ struct App {
   gboolean smoke;
   gboolean show_notifications;
   guint preferred_theme;
+  JsonObject *access_state;
+  GtkLabel *access_label, *access_hint;
+  GtkWidget *access_button;
+  GtkWindow *access_window;
+  gboolean access_status_pending, access_busy, access_startup_pending;
+  gboolean access_startup_attempted, access_background_launch, access_started;
+  gboolean access_open_users;
+  guint access_timer;
+  guint access_generation;
+  guint access_poll_ticks;
+  char *access_notice;
 };
 struct Operation {
   App *app;
@@ -57,6 +70,7 @@ struct Operation {
   gint cancelled;
   gint collection;
   gboolean background, reveal, acknowledge;
+  guint access_generation;
 };
 struct Form {
   App *app;
@@ -70,7 +84,8 @@ struct Form {
   GtkCheckButton *advanced;
   gboolean acknowledge;
   gboolean automatic;
-  gboolean submitted, guided_backup;
+  gboolean submitted, guided_backup, access_blocked, needs_system;
+  GtkWidget *authorize;
 };
 
 typedef struct { App *app; char *operation, *title; JsonObject *record; } Action;
@@ -91,6 +106,14 @@ static void open_backup_setup(App*app);
 static gboolean backup_setup_handle_result(App*app,const char*operation,JsonNode*payload,const GError*error);
 static void backup_setup_form_closed(App*app,const char*operation,gboolean submitted);
 static void backup_setup_recovery_closed(App*app,gboolean saved);
+static void access_request_status(App *app,gboolean startup);
+static void access_update_header(App *app);
+static gboolean access_can(App *app,const char *operation);
+static gboolean access_require(App *app,const char *operation);
+static void access_authorize_clicked(GtkButton *button,gpointer data);
+static void access_manage_clicked(GtkButton *button,gpointer data);
+static gboolean access_handle_result(Operation *operation,JsonNode *payload,JsonObject *failure,GError *error);
+static void update_form_visibility(GObject *object,GParamSpec *pspec,gpointer data);
 
 static const char *str(JsonObject *o, const char *key) {
   if (!o || !json_object_has_member(o, key)) return "";
@@ -101,6 +124,75 @@ static gboolean boolean(JsonObject *o, const char *key) {
   if (!o || !json_object_has_member(o, key)) return FALSE;
   JsonNode *n = json_object_get_member(o,key);
   return n && JSON_NODE_HOLDS_VALUE(n) && json_node_get_value_type(n) == G_TYPE_BOOLEAN && json_node_get_boolean(n);
+}
+static gboolean access_expired(App *app){
+  JsonObject *state=app->access_state;
+  if(!state||!json_object_has_member(state,"expires_at"))return FALSE;
+  JsonNode *expiry=json_object_get_member(state,"expires_at");
+  return JSON_NODE_HOLDS_VALUE(expiry)&&json_node_get_value_type(expiry)==G_TYPE_INT64&&
+      json_node_get_int(expiry)>0&&json_node_get_int(expiry)<=g_get_real_time()/G_USEC_PER_SEC;
+}
+static gboolean access_authorized(App *app){return boolean(app->access_state,"authorized")&&!access_expired(app);}
+static gboolean access_system(App *app){return access_authorized(app)&&!strcmp(str(app->access_state,"scope"),"system");}
+static const char *access_startup_scope(App *app){
+  if(app->access_startup_attempted||access_authorized(app)||!boolean(app->access_state,"available"))return NULL;
+  if(boolean(app->access_state,"delegated_personal"))return "personal";
+  return !app->access_background_launch&&boolean(app->access_state,"can_request_system")?"system":NULL;
+}
+static gboolean access_read_operation(const char *operation){
+  const char *reads[]={"vault.list","vault.get","vault.auth-check","destination.list","destination.get",
+    "repository.list","repository.get","backup.list","backup.get","backup.history","migration.list",
+    "system.info","diagnostic.list","diagnostic.get","access.users",NULL};
+  for(guint i=0;reads[i];i++)if(!strcmp(operation,reads[i]))return TRUE;
+  return FALSE;
+}
+static gboolean access_can(App *app,const char *operation){
+  if(app->smoke||access_read_operation(operation)||!strcmp(operation,"access.status")||
+      !strcmp(operation,"access.unlock")||!strcmp(operation,"access.lock"))return TRUE;
+  if(!access_authorized(app)||!app->access_state||!json_object_has_member(app->access_state,"capabilities"))return FALSE;
+  JsonNode *node=json_object_get_member(app->access_state,"capabilities");
+  if(!JSON_NODE_HOLDS_ARRAY(node))return FALSE;
+  JsonArray *capabilities=json_node_get_array(node);
+  for(guint i=0;i<json_array_get_length(capabilities);i++){
+    JsonNode *capability=json_array_get_element(capabilities,i);
+    if(JSON_NODE_HOLDS_VALUE(capability)&&json_node_get_value_type(capability)==G_TYPE_STRING&&
+        !strcmp(json_node_get_string(capability),operation))return TRUE;
+  }
+  return FALSE;
+}
+static gboolean access_record_requires_system(App *app,const char *operation,JsonObject *record){
+  if(app->smoke||!access_authorized(app)||access_system(app)||!*str(record,"id"))return FALSE;
+  const char *metadata[]={"vault.get","destination.get","repository.get","backup.get","backup.history","migration.list",NULL};
+  for(guint i=0;metadata[i];i++)if(!strcmp(operation,metadata[i]))return FALSE;
+  gint collection=g_str_has_prefix(operation,"vault.")||g_str_has_prefix(operation,"migration.")?0:
+    g_str_has_prefix(operation,"destination.")?1:g_str_has_prefix(operation,"repository.")?2:g_str_has_prefix(operation,"backup.")?3:-1;
+  if(collection<0)return FALSE;
+  const char *scope=str(record,"execution_scope");
+  if(!*scope&&app->collections[collection]&&JSON_NODE_HOLDS_ARRAY(app->collections[collection])){
+    JsonArray *items=json_node_get_array(app->collections[collection]);
+    for(guint i=0;i<json_array_get_length(items);i++){
+      JsonNode *item=json_array_get_element(items,i);
+      if(JSON_NODE_HOLDS_OBJECT(item)){JsonObject *candidate=json_node_get_object(item);if(!strcmp(str(candidate,"id"),str(record,"id"))){scope=str(candidate,"execution_scope");break;}}
+    }
+  }
+  return strcmp(scope,"personal")!=0;
+}
+static const char *access_error_message(const char *code){
+  if(!g_ascii_strcasecmp(code,"AUTH_EXPIRED")||!g_ascii_strcasecmp(code,"authorization_expired")||g_str_has_suffix(code,".AuthorizationExpired"))return "Your management authorization expired. Your form has been kept. Authorize again to continue.";
+  if(!g_ascii_strcasecmp(code,"AUTH_CANCELLED")||!g_ascii_strcasecmp(code,"authorization_cancelled")||!g_ascii_strcasecmp(code,"cancelled"))return "Authorization was cancelled. This action was not authorized; try again when you are ready.";
+  if(!g_ascii_strcasecmp(code,"AUTH_AGENT_UNAVAILABLE")||!g_ascii_strcasecmp(code,"authentication_agent_unavailable"))return "The desktop authentication agent is unavailable. Start your session's PolicyKit agent, then choose Authorize again.";
+  if(!g_ascii_strcasecmp(code,"AUTH_DENIED")||!g_ascii_strcasecmp(code,"authorization_denied")||!g_ascii_strcasecmp(code,"NotAuthorized"))return "Management authorization was denied. An administrator can authorize this session or grant personal access in Settings.";
+  if(!g_ascii_strcasecmp(code,"AUTH_REQUIRED")||!g_ascii_strcasecmp(code,"authorization_required")||g_str_has_suffix(code,".AuthorizationRequired"))return "Management authorization is required. Authorize this session to continue; your form has been kept.";
+  if(!strcmp(code,"AUTH_SERVICE_UNAVAILABLE"))return "The system authorization service is unavailable. Check the PolicyKit service, then choose Authorize again.";
+  if(!strcmp(code,"AUTH_SESSION_UNAVAILABLE"))return "An active local desktop session is required for management authorization. Sign in locally, then try again.";
+  if(!strcmp(code,"AUTH_REVOKED"))return "Authorization ended because the session or access settings changed. Authorize again to continue, or ask an administrator to review your personal access.";
+  if(!strcmp(code,"PERSONAL_ACCESS_REQUIRED"))return "An administrator must grant personal access to your account before you can start a personal session.";
+  if(!strcmp(code,"PERSONAL_OPERATION_DENIED")||!strcmp(code,"admin_required"))return "This operation is outside personal access. Authorize management to continue.";
+  return NULL;
+}
+static const char *access_unavailable_reason(App *app){
+  if(*str(app->access_state,"reason"))return str(app->access_state,"reason");
+  return "Authorization requires an active, unlocked local desktop session. Sign in locally, then refresh.";
 }
 static gboolean openpgp_auth(const char *auth){return !strcmp(auth,"gpg")||!strcmp(auth,"token");}
 static void normalize_vault_auth(JsonObject *params){
@@ -233,10 +325,19 @@ static GVariant *bus_call(GDBusConnection *bus,const char *method,GVariant *args
   return g_dbus_connection_call_sync(bus,BUS_NAME,BUS_PATH,BUS_IFACE,method,args,NULL,
         G_DBUS_CALL_FLAGS_ALLOW_INTERACTIVE_AUTHORIZATION,180000,NULL,error);
 }
+/* Authorization is bound to this connection's unique sender. Keep one owned
+ * reference between jobs instead of depending on GLib's shared-bus cache. */
+static GDBusConnection *app_service_bus(App *app,GError **error){
+  g_mutex_lock(&app->service_bus_mutex);
+  if(app->service_bus&&g_dbus_connection_is_closed(app->service_bus))g_clear_object(&app->service_bus);
+  if(!app->service_bus)app->service_bus=ov_client_connect(error);
+  GDBusConnection *bus=app->service_bus?g_object_ref(app->service_bus):NULL;
+  g_mutex_unlock(&app->service_bus_mutex);return bus;
+}
 static void operation_thread(GTask *task,gpointer source,gpointer data,GCancellable *cancel) {
   (void)source;(void)cancel;
   Operation *o=data;GError *error=NULL;
-  GDBusConnection *bus=g_bus_get_sync(G_BUS_TYPE_SYSTEM,NULL,&error);
+  GDBusConnection *bus=app_service_bus(o->app,&error);
   if(!bus){g_task_return_error(task,error);return;}
   char *id=ov_client_submit(bus,o->request,&error);
   /* Remove the serialized secret-bearing request as soon as submission completes. */
@@ -286,6 +387,170 @@ static void error_window(App *app,const char *title,const char *message) {
   GtkWidget *close=gtk_button_new_with_mnemonic("_Close");gtk_widget_set_halign(close,GTK_ALIGN_END);
   g_signal_connect(close,"clicked",G_CALLBACK(close_window),w);gtk_box_append(box,close);
   gtk_window_set_child(w,GTK_WIDGET(box));gtk_window_present(w);
+}
+static void access_update_header(App *app){
+  if(!app->access_label)return;
+  gboolean authorized=access_authorized(app);
+  gtk_label_set_text(app->access_label,authorized?(access_system(app)?"Management authorized":"Personal access"):"Read-only");
+  gtk_button_set_label(GTK_BUTTON(app->access_button),authorized?"End authorization":boolean(app->access_state,"delegated_personal")?"Use personal access":"Authorize management");
+  gtk_widget_set_sensitive(app->access_button,!app->access_busy&&!app->active);
+  const char *hint=authorized?(access_system(app)?"Management is authorized for this desktop session. Vault PINs and passphrases are requested separately.":"You can manage your own vaults and backups. Administrator settings need management authorization."):
+    access_expired(app)?"Authorization expired. Authorize again to make changes. Your vaults keep their current locked or unlocked state.":
+    app->access_state&&(!boolean(app->access_state,"available")||*str(app->access_state,"reason"))?access_unavailable_reason(app):
+    "View your data in read-only mode, or authorize this session to make changes.";
+  char *timed_hint=NULL;
+  if(authorized&&json_object_has_member(app->access_state,"expires_at")){
+    JsonNode *expiry=json_object_get_member(app->access_state,"expires_at");
+    if(JSON_NODE_HOLDS_VALUE(expiry)&&json_node_get_value_type(expiry)==G_TYPE_INT64){
+      GDateTime *until=g_date_time_new_from_unix_local(json_node_get_int(expiry));
+      if(until){char *time=g_date_time_format(until,"%H:%M");timed_hint=g_strdup_printf("%s Authorization ends at %s or when this desktop session ends.",hint,time);g_free(time);g_date_time_unref(until);}
+    }
+  }
+  gtk_label_set_text(app->access_hint,app->access_notice?app->access_notice:timed_hint?timed_hint:hint);g_free(timed_hint);
+  GListModel *windows=gtk_window_get_toplevels();
+  for(guint i=0;i<g_list_model_get_n_items(windows);i++){
+    GtkWindow *window=g_list_model_get_item(windows,i);Form *form=g_object_get_data(G_OBJECT(window),"form");
+    if(form&&form->app==app&&form->authorize){
+      update_form_visibility(NULL,NULL,form);
+      gboolean permitted=access_can(app,form->operation)&&(!form->needs_system||access_system(app))&&!access_record_requires_system(app,form->operation,form->original);gtk_widget_set_visible(form->authorize,!permitted);
+      if(permitted&&form->access_blocked){form->access_blocked=FALSE;gtk_label_set_text(form->error,"");}
+    }
+    g_object_unref(window);
+  }
+}
+static void access_apply(App *app,JsonObject *state){
+  if(app->access_state)json_object_unref(app->access_state);
+  app->access_state=copy_object(state);if(access_authorized(app))g_clear_pointer(&app->access_notice,g_free);access_update_header(app);
+}
+static void access_request_unlock(App *app,const char *scope){
+  if(app->access_busy||app->active){error_window(app,"Operation in progress","Wait for the current operation to finish before changing authorization.");return;}
+  app->access_busy=TRUE;app->access_startup_attempted=TRUE;app->access_generation++;access_update_header(app);
+  JsonObject *params=json_object_new();json_object_set_string_member(params,"scope",scope);
+  start_operation(app,"access.unlock",params,!strcmp(scope,"system")?"Authorize management":"Start personal access",-1,FALSE);json_object_unref(params);
+}
+static void access_authorize_clicked(GtkButton *button,gpointer data){
+  (void)button;App *app=data;
+  access_request_unlock(app,boolean(app->access_state,"delegated_personal")&&!access_authorized(app)?"personal":"system");
+}
+static void access_header_clicked(GtkButton *button,gpointer data){
+  App *app=data;
+  if(!access_authorized(app)){access_authorize_clicked(button,data);return;}
+  if(app->access_busy||app->active)return;
+  app->access_busy=TRUE;app->access_generation++;access_update_header(app);JsonObject *params=json_object_new();
+  start_operation(app,"access.lock",params,"End authorization",-1,FALSE);json_object_unref(params);
+}
+static void access_gate_authorize(GtkButton *button,gpointer data){
+  App *app=data;GtkRoot *root=gtk_widget_get_root(GTK_WIDGET(button));
+  if(GTK_IS_WINDOW(root))gtk_window_destroy(GTK_WINDOW(root));
+  access_request_unlock(app,boolean(app->access_state,"delegated_personal")&&!access_authorized(app)?"personal":"system");
+}
+static gboolean access_require(App *app,const char *operation){
+  if(access_can(app,operation))return TRUE;
+  access_update_header(app);
+  GtkWindow *window=dialog_window(app,"Authorization required",560,280);
+  GtkBox *box=GTK_BOX(gtk_box_new(GTK_ORIENTATION_VERTICAL,16));margin(GTK_WIDGET(box),24);
+  append_text(box,access_expired(app)?"Authorization expired":"Authorization required","title-2");
+  append_text(box,access_authorized(app)?"This action needs management authorization. Personal access covers only your own supported vault and backup operations.":"Authorize this desktop session before making changes. Cancelling keeps OctoVault read-only.",NULL);
+  GtkBox *buttons=GTK_BOX(gtk_box_new(GTK_ORIENTATION_HORIZONTAL,10));gtk_widget_set_halign(GTK_WIDGET(buttons),GTK_ALIGN_END);
+  GtkWidget *close=gtk_button_new_with_label(access_authorized(app)?"Keep personal access":"Stay read-only");g_signal_connect(close,"clicked",G_CALLBACK(close_window),window);gtk_box_append(buttons,close);
+  GtkWidget *authorize=gtk_button_new_with_label("Authorize");gtk_widget_add_css_class(authorize,"suggested-action");g_signal_connect(authorize,"clicked",G_CALLBACK(access_gate_authorize),app);gtk_box_append(buttons,authorize);gtk_box_append(box,GTK_WIDGET(buttons));
+  gtk_window_set_child(window,GTK_WIDGET(box));gtk_window_present(window);return FALSE;
+}
+static void access_request_status(App *app,gboolean startup){
+  if(app->smoke)return;
+  if(startup)app->access_startup_pending=TRUE;
+  if(app->access_status_pending||app->access_busy)return;
+  app->access_status_pending=TRUE;JsonObject *params=json_object_new();
+  start_operation(app,"access.status",params,"Check authorization",-2,FALSE);json_object_unref(params);
+}
+static gboolean access_poll(gpointer data){App *app=data;access_update_header(app);if(++app->access_poll_ticks>=30){app->access_poll_ticks=0;access_request_status(app,FALSE);}return G_SOURCE_CONTINUE;}
+static void access_load_users(App *app){
+  JsonObject *params=json_object_new();start_operation(app,"access.users",params,"Manage personal access",-1,FALSE);json_object_unref(params);
+}
+static void access_manage_clicked(GtkButton *button,gpointer data){
+  (void)button;App *app=data;
+  if(!access_system(app)){app->access_open_users=TRUE;access_request_unlock(app,"system");return;}
+  access_load_users(app);
+}
+typedef struct {App *app;GtkWindow *window;char *user;gboolean granted;} AccessAccount;
+static void access_account_free(gpointer data,GClosure *closure){(void)closure;AccessAccount *account=data;g_free(account->user);g_free(account);}
+static void access_change_confirmed(GtkButton *button,gpointer data){
+  (void)button;AccessAccount *account=data;App *app=account->app;
+  if(!access_system(app)){error_window(app,"Management authorization expired","Authorize management again before changing another account's access.");return;}
+  JsonObject *params=json_object_new();json_object_set_string_member(params,"user",account->user);
+  start_operation(app,account->granted?"access.revoke":"access.grant",params,account->granted?"Revoke personal access":"Grant personal access",-1,FALSE);
+  json_object_unref(params);gtk_window_destroy(account->window);
+}
+static void access_change_clicked(GtkButton *button,gpointer data){
+  (void)button;AccessAccount *selected=data;GtkWindow *window=dialog_window(selected->app,selected->granted?"Revoke personal access":"Grant personal access",580,320);
+  GtkBox *box=GTK_BOX(gtk_box_new(GTK_ORIENTATION_VERTICAL,16));margin(GTK_WIDGET(box),24);
+  char *heading=g_strdup_printf("%s personal access for %s?",selected->granted?"Revoke":"Grant",selected->user);append_text(box,heading,"title-2");g_free(heading);
+  append_text(box,selected->granted?"This removes the account's delegated access to manage its own vaults and backups. It does not delete data or close currently open vaults.":"This account will be able to manage its own supported vaults and backups without an administrator password for each operation. System-wide management remains restricted.",NULL);
+  append_text(box,"Changing a persistent access grant requires a fresh administrator confirmation.","dim-label");
+  GtkBox *buttons=GTK_BOX(gtk_box_new(GTK_ORIENTATION_HORIZONTAL,10));gtk_widget_set_halign(GTK_WIDGET(buttons),GTK_ALIGN_END);
+  GtkWidget *cancel=gtk_button_new_with_label("Cancel");g_signal_connect(cancel,"clicked",G_CALLBACK(close_window),window);gtk_box_append(buttons,cancel);
+  GtkWidget *confirm=gtk_button_new_with_label(selected->granted?"Revoke access":"Grant access");gtk_widget_add_css_class(confirm,selected->granted?"destructive-action":"suggested-action");
+  AccessAccount *account=g_new0(AccessAccount,1);account->app=selected->app;account->window=window;account->user=g_strdup(selected->user);account->granted=selected->granted;
+  g_signal_connect_data(confirm,"clicked",G_CALLBACK(access_change_confirmed),account,access_account_free,0);gtk_box_append(buttons,confirm);gtk_box_append(box,GTK_WIDGET(buttons));
+  gtk_window_set_child(window,GTK_WIDGET(box));gtk_window_present(window);
+}
+static void access_users_window(App *app,JsonObject *payload){
+  JsonNode *node=payload&&json_object_has_member(payload,"users")?json_object_get_member(payload,"users"):NULL;
+  if(!node||!JSON_NODE_HOLDS_ARRAY(node)){error_window(app,"Accounts unavailable","The service did not return a valid local account list.");return;}
+  if(app->access_window){g_object_remove_weak_pointer(G_OBJECT(app->access_window),(gpointer *)&app->access_window);gtk_window_destroy(app->access_window);app->access_window=NULL;}
+  GtkWindow *window=dialog_window(app,"Manage personal access",680,560);app->access_window=window;g_object_add_weak_pointer(G_OBJECT(window),(gpointer *)&app->access_window);
+  GtkBox *root=GTK_BOX(gtk_box_new(GTK_ORIENTATION_VERTICAL,16));margin(GTK_WIDGET(root),24);append_text(root,"Personal access","title-2");
+  append_text(root,"Choose a local account verified by the system service. Personal access covers that account's own data; it does not make the account an administrator.","dim-label");
+  GtkWidget *scroll=gtk_scrolled_window_new();gtk_widget_set_vexpand(scroll,TRUE);GtkBox *list=GTK_BOX(gtk_box_new(GTK_ORIENTATION_VERTICAL,14));gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroll),GTK_WIDGET(list));gtk_box_append(root,scroll);
+  JsonArray *users=json_node_get_array(node);
+  if(!json_array_get_length(users))append_text(list,"No eligible local accounts were found.",NULL);
+  for(guint i=0;i<json_array_get_length(users);i++){
+    JsonNode *item=json_array_get_element(users,i);if(!JSON_NODE_HOLDS_OBJECT(item))continue;JsonObject *user=json_node_get_object(item);if(!*str(user,"user"))continue;
+    GtkBox *row=GTK_BOX(gtk_box_new(GTK_ORIENTATION_HORIZONTAL,12));GtkBox *description=GTK_BOX(gtk_box_new(GTK_ORIENTATION_VERTICAL,4));gtk_widget_set_hexpand(GTK_WIDGET(description),TRUE);
+    char *name=*str(user,"display_name")?g_strdup_printf("%s (%s)",str(user,"display_name"),str(user,"user")):g_strdup(str(user,"user"));append_text(description,name,"heading");g_free(name);
+    gboolean granted=boolean(user,"delegated_personal");append_text(description,granted?"Personal access granted":"No personal access grant","dim-label");gtk_box_append(row,GTK_WIDGET(description));
+    GtkWidget *change=gtk_button_new_with_label(granted?"Revoke…":"Grant access…");gtk_widget_set_valign(change,GTK_ALIGN_CENTER);gtk_widget_set_sensitive(change,access_system(app));
+    AccessAccount *account=g_new0(AccessAccount,1);account->app=app;account->user=g_strdup(str(user,"user"));account->granted=granted;g_signal_connect_data(change,"clicked",G_CALLBACK(access_change_clicked),account,access_account_free,0);gtk_box_append(row,change);gtk_box_append(list,GTK_WIDGET(row));
+  }
+  GtkWidget *close=gtk_button_new_with_label("Close");gtk_widget_set_halign(close,GTK_ALIGN_END);g_signal_connect(close,"clicked",G_CALLBACK(close_window),window);gtk_box_append(root,close);gtk_window_set_child(window,GTK_WIDGET(root));gtk_window_present(window);
+}
+static gboolean access_handle_result(Operation *operation,JsonNode *payload,JsonObject *failure,GError *error){
+  if(!g_str_has_prefix(operation->op,"access."))return FALSE;
+  App *app=operation->app;gboolean status=!strcmp(operation->op,"access.status");
+  if(status)app->access_status_pending=FALSE;else app->access_busy=FALSE;
+  if(status&&operation->access_generation!=app->access_generation)return TRUE;
+  if(error){
+    char *remote=g_dbus_error_get_remote_error(error);const char *code=*str(failure,"code")?str(failure,"code"):remote?remote:"";
+    const char *message=access_error_message(code);if(!message)message=error->message;
+    g_free(app->access_notice);app->access_notice=g_strdup(message);
+    if(status||!strcmp(operation->op,"access.lock")||!strcmp(code,"AUTH_REVOKED")||!strcmp(code,"AUTH_SESSION_UNAVAILABLE")||g_str_has_suffix(code,".AuthorizationRequired")||g_str_has_suffix(code,".AuthorizationExpired")){
+      JsonObject *state=copy_object(app->access_state);json_object_set_boolean_member(state,"authorized",FALSE);json_object_set_string_member(state,"scope","none");json_object_set_boolean_member(state,"available",!status);access_apply(app,state);json_object_unref(state);
+    }
+    app->access_startup_pending=FALSE;app->access_open_users=FALSE;
+    if(!status){add_activity(app,message);error_window(app,"Authorization needs attention",message);}
+    g_free(remote);if(!status)access_request_status(app,FALSE);
+  }else if(payload&&JSON_NODE_HOLDS_OBJECT(payload)){
+    JsonObject *data=json_node_get_object(payload);
+    if(status||!strcmp(operation->op,"access.unlock")||!strcmp(operation->op,"access.lock")){
+      access_apply(app,data);
+      if(!strcmp(operation->op,"access.lock")){g_free(app->access_notice);app->access_notice=g_strdup("Authorization ended. Vaults retain their actual locked or unlocked state; use Lock vault to close one.");add_activity(app,app->access_notice);}
+      if(!status)refresh_all(app);
+      if(app->access_open_users&&access_system(app)){app->access_open_users=FALSE;access_load_users(app);}
+    }else if(!strcmp(operation->op,"access.users"))access_users_window(app,data);
+    else if(!strcmp(operation->op,"access.grant")||!strcmp(operation->op,"access.revoke")){
+      const char *message=*str(data,"message")?str(data,"message"):"Personal access changed. Authorize again to continue administration.";
+      add_activity(app,message);app->access_generation++;
+      JsonObject *state=copy_object(app->access_state);json_object_set_boolean_member(state,"authorized",FALSE);json_object_set_string_member(state,"scope","none");access_apply(app,state);json_object_unref(state);
+      g_free(app->access_notice);app->access_notice=g_strdup(message);access_load_users(app);access_request_status(app,FALSE);
+    }
+  }
+  access_update_header(app);
+  if(status&&app->access_startup_pending){
+    app->access_startup_pending=FALSE;
+    const char *scope=access_startup_scope(app);
+    if(scope){app->access_startup_attempted=TRUE;access_request_unlock(app,scope);}
+  }
+  return TRUE;
 }
 /* Copy only the backend's explicit nonsecret fields, never the original
  * secret-bearing request or raw engine output. */
@@ -352,10 +617,28 @@ static void operation_done(GObject *source,GAsyncResult *result,gpointer data) {
       g_set_error_literal(&error,G_IO_ERROR,G_IO_ERROR_FAILED,*message?message:"The operation could not be completed.");
     }else if(json_object_has_member(root,"data"))payload=json_object_get_member(root,"data");
   }else if(response)g_set_error_literal(&error,G_IO_ERROR,G_IO_ERROR_INVALID_DATA,"The service returned an invalid operation response.");
+  if(error&&!g_str_has_prefix(o->op,"access.")){
+    char *remote=g_dbus_error_get_remote_error(error);
+    const char *code=*str(failure,"code")?str(failure,"code"):remote?remote:"";
+    const char *message=access_error_message(code);
+    if(message){
+      g_clear_error(&error);g_set_error_literal(&error,G_IO_ERROR,G_IO_ERROR_PERMISSION_DENIED,message);
+      gboolean lease_ended=g_str_has_suffix(code,".AuthorizationRequired")||g_str_has_suffix(code,".AuthorizationExpired")||
+        !strcmp(code,"AUTH_EXPIRED")||!strcmp(code,"AUTH_REVOKED")||!strcmp(code,"AUTH_SESSION_UNAVAILABLE");
+      if(lease_ended){
+        JsonObject *state=copy_object(app->access_state);json_object_set_boolean_member(state,"authorized",FALSE);json_object_set_string_member(state,"scope","none");access_apply(app,state);json_object_unref(state);
+      }
+      g_free(app->access_notice);app->access_notice=g_strdup(message);
+      if(o->setup_window){Form *form=g_object_get_data(G_OBJECT(o->setup_window),"form");if(form){form->needs_system=!strcmp(code,"PERSONAL_OPERATION_DENIED")||!strcmp(code,"admin_required");form->access_blocked=lease_ended||form->needs_system;}}
+    }
+    g_free(remote);
+  }
   if(!o->background){app->active=NULL;gtk_widget_set_visible(app->job_box,FALSE);}
   finish_creation_form(o,error?error->message:NULL);
-  gboolean guided=!o->background&&backup_setup_handle_result(app,o->op,payload,error);
-  if(guided){if(!error)refresh_all(app);g_clear_error(&error);}
+  gboolean access=access_handle_result(o,payload,failure,error);
+  gboolean guided=!access&&!o->background&&!(error&&o->setup_window)&&backup_setup_handle_result(app,o->op,payload,error);
+  if(access){g_clear_error(&error);}
+  else if(guided){if(!error)refresh_all(app);g_clear_error(&error);}
   else if(error){
     if(o->background){
       if(o->collection==0){add_activity(app,error->message);if(!strcmp(app->page,"Dashboard")||!strcmp(app->page,"Vaults")){render_page(app);append_text(app->body,"The system service is unavailable or did not complete this request. Install OctoVault's system package, then use Refresh. See Activity for details.","error");}}
@@ -388,11 +671,15 @@ static void operation_done(GObject *source,GAsyncResult *result,gpointer data) {
   }
   if(response)json_node_free(response);
   operation_free(o);
+  access_update_header(app);
   if(app->priority_lock&&!app->active){JsonObject*params=g_steal_pointer(&app->priority_lock);start_operation(app,"vault.close",params,"Lock vault",-1,FALSE);json_object_unref(params);}
   g_idle_add(drain_unlocks,app);
 }
 static void start_operation(App *app,const char *op,JsonObject *params,const char *title,gint collection,gboolean acknowledge) {
-  if(collection<0&&app->active){
+  gboolean background=collection>=0||!strcmp(op,"access.status");
+  if(!background&&access_record_requires_system(app,op,params)){access_require(app,"access.grant");return;}
+  if(!background&&!g_str_has_prefix(op,"access.")&&!access_require(app,op))return;
+  if(!background&&app->active){
     if(!strcmp(op,"vault.close")&&!strcmp(app->active->op,"backup.run")){
       if(app->priority_lock)json_object_unref(app->priority_lock);
       app->priority_lock=copy_object(params);g_atomic_int_set(&app->active->cancelled,1);gtk_label_set_text(app->job_label,"Stopping the backup before locking the vault…");return;
@@ -400,9 +687,11 @@ static void start_operation(App *app,const char *op,JsonObject *params,const cha
     error_window(app,"An operation is already running","Wait for the current operation to finish, or cancel it, before starting another.");return;
   }
   Operation *o=g_new0(Operation,1);o->app=app;o->op=g_strdup(op);o->title=g_strdup(title);o->collection=collection;
-  o->background=collection>=0;o->record_id=g_strdup(str(params,"id"));o->snapshot=g_strdup(*str(params,"snapshot")?str(params,"snapshot"):"latest");o->request=serialize_request(op,params);o->acknowledge=acknowledge;
+  o->access_generation=app->access_generation;
+  o->background=background;o->record_id=g_strdup(str(params,"id"));o->snapshot=g_strdup(*str(params,"snapshot")?str(params,"snapshot"):"latest");o->request=serialize_request(op,params);o->acknowledge=acknowledge;
   o->reveal=!strcmp(op,"repository.recovery");g_mutex_init(&o->mutex);
   if(!o->background){app->active=o;gtk_label_set_text(app->job_label,title);gtk_progress_bar_set_fraction(app->progress,0);gtk_widget_set_visible(app->job_box,TRUE);add_activity(app,title);}
+  access_update_header(app);
   GTask *task=g_task_new(NULL,NULL,operation_done,o);g_task_set_task_data(task,o,NULL);g_task_run_in_thread(task,operation_thread);g_object_unref(task);
 }
 static void cancel_job(GtkButton *button,gpointer data) {
@@ -412,7 +701,7 @@ static void refresh_all(App *app) {
   if(app->smoke)return;
   for(gint i=0;i<4;i++){char *op=g_strconcat(collection_names[i],".list",NULL);JsonObject *p=json_object_new();start_operation(app,op,p,"Refresh",i,FALSE);json_object_unref(p);g_free(op);}
 }
-static void refresh_clicked(GtkButton *b,gpointer data){(void)b;refresh_all(data);}
+static void refresh_clicked(GtkButton *b,gpointer data){(void)b;refresh_all(data);access_request_status(data,FALSE);}
 
 /* Human-readable data display. Backend dictionaries are never shown as JSON. */
 static void detail_nodes(GtkBox *box,const char *name,JsonNode *node,int depth) {
@@ -766,6 +1055,10 @@ static void update_form_visibility(GObject *object,GParamSpec *pspec,gpointer da
     f->context_visible=visible;
     if(advanced_field(form->operation,k)&&form->advanced&&!gtk_check_button_get_active(form->advanced))visible=FALSE;
     gtk_widget_set_visible(f->row,visible);
+    if(!strcmp(k,"force")||!strcmp(k,"force_close")){
+      gboolean personal=access_authorized(form->app)&&!access_system(form->app);
+      gtk_widget_set_sensitive(f->widget,!personal);gtk_widget_set_tooltip_text(f->widget,personal?"Force locking requires management authorization because it can terminate processes.":NULL);
+    }
     if(!strcmp(k,"recipient")){
       if(f->detect_key)gtk_widget_set_visible(f->detect_key,!strcmp(auth,"token"));
       if(f->choose_key)gtk_widget_set_visible(f->choose_key,strcmp(auth,"token")!=0);
@@ -1101,15 +1394,17 @@ static JsonObject *form_parameters(Form*f,gboolean*accepted){
   *accepted=valid;return params;
 }
 static void clear_form_secrets(Form *form){
-  for(guint i=0;i<form->fields->len;i++){Field*field=g_ptr_array_index(form->fields,i);if(!strcmp(field->spec->kind,"password"))gtk_editable_set_text(GTK_EDITABLE(field->widget),"");}
+  for(guint i=0;i<form->fields->len;i++){Field*field=g_ptr_array_index(form->fields,i);if(!strcmp(field->spec->kind,"password"))gtk_editable_set_text(GTK_EDITABLE(field->widget),"");else if(!strcmp(field->spec->kind,"secret-file"))gtk_text_buffer_set_text(gtk_text_view_get_buffer(GTK_TEXT_VIEW(field->widget)),"",-1);}
 }
 static void submit_form(GtkButton*button,gpointer data){
-  (void)button;Form*f=data;gboolean valid;JsonObject*params=form_parameters(f,&valid);
+  (void)button;Form*f=data;
+  if(!access_can(f->app,f->operation)||(f->needs_system&&!access_system(f->app))||access_record_requires_system(f->app,f->operation,f->original)){f->access_blocked=TRUE;gtk_label_set_text(f->error,"Authorization is required to continue. Your entries have been kept; choose Authorize below.");gtk_widget_set_visible(f->authorize,TRUE);access_update_header(f->app);return;}
+  gboolean valid;JsonObject*params=form_parameters(f,&valid);
   if(valid&&f->app->active){gtk_label_set_text(f->error,"Wait for the current operation to finish before continuing.");valid=FALSE;}
   if(valid){
     f->submitted=TRUE;gtk_label_set_text(f->error,"");
     start_operation(f->app,f->operation,params,gtk_window_get_title(f->window),-1,f->acknowledge);
-    if(!strcmp(f->operation,"vault.create")&&f->app->active){
+    if(f->app->active&&!strcmp(f->app->active->op,f->operation)){
       f->app->active->setup_window=g_object_ref(f->window);
       clear_form_secrets(f);
       gtk_widget_set_visible(GTK_WIDGET(f->window),FALSE);
@@ -1118,6 +1413,8 @@ static void submit_form(GtkButton*button,gpointer data){
   json_object_unref(params);
 }
 static void open_form(App*app,const char*operation,const char*title,JsonObject*record){
+  if(access_record_requires_system(app,operation,record)){access_require(app,"access.grant");return;}
+  if(!access_require(app,operation))return;
   if(app->active&&!( !strcmp(operation,"vault.close")&&!strcmp(app->active->op,"backup.run"))){error_window(app,"An operation is already running","Wait for the current operation to complete or cancel it first.");return;}
   Form*f=g_new0(Form,1);f->app=app;f->operation=g_strdup(operation);f->base=json_object_new();f->original=copy_object(record);f->fields=g_ptr_array_new_with_free_func(field_free);f->acknowledge=!strcmp(operation,"repository.create");f->automatic=app->automatic_prompt&&!strcmp(operation,"vault.open");
   if(record&&*str(record,"id"))json_object_set_string_member(f->base,"id",str(record,"id"));
@@ -1150,6 +1447,7 @@ static void open_form(App*app,const char*operation,const char*title,JsonObject*r
   update_form_visibility(NULL,NULL,f);
   if(creating)update_location_preview(NULL,f);
   f->error=GTK_LABEL(label("","error"));gtk_box_append(root,GTK_WIDGET(f->error));
+  f->authorize=gtk_button_new_with_label("Authorize");gtk_widget_set_halign(f->authorize,GTK_ALIGN_START);gtk_widget_set_visible(f->authorize,FALSE);g_signal_connect(f->authorize,"clicked",G_CALLBACK(access_authorize_clicked),app);gtk_box_append(root,f->authorize);
   GtkBox*buttons=GTK_BOX(gtk_box_new(GTK_ORIENTATION_HORIZONTAL,10));gtk_widget_set_halign(GTK_WIDGET(buttons),GTK_ALIGN_END);gtk_box_append(root,GTK_WIDGET(buttons));
   GtkWidget*cancel=gtk_button_new_with_mnemonic("_Cancel");gtk_box_append(buttons,cancel);g_signal_connect(cancel,"clicked",G_CALLBACK(close_window),w);
   GtkWidget*submit=gtk_button_new_with_mnemonic(creating?"_Create vault":"_Continue");gtk_widget_add_css_class(submit,strstr(operation,".remove")||!strcmp(operation,"repository.prune")?"destructive-action":"suggested-action");gtk_box_append(buttons,submit);g_signal_connect(submit,"clicked",G_CALLBACK(submit_form),f);
@@ -1170,7 +1468,7 @@ static void browse_vault(App*app,JsonObject*record){
 }
 static void action_clicked(GtkButton*button,gpointer data){
   Action*a=data;GtkWidget*ancestor=gtk_widget_get_ancestor(GTK_WIDGET(button),GTK_TYPE_POPOVER);if(ancestor)gtk_popover_popdown(GTK_POPOVER(ancestor));
-  if(!strcmp(a->operation,"ui.backup-setup")){open_backup_setup(a->app);return;}
+  if(!strcmp(a->operation,"ui.backup-setup")){if(access_require(a->app,"backup.save"))open_backup_setup(a->app);return;}
   if(!strcmp(a->operation,"ui.browse-vault")){browse_vault(a->app,a->record);return;}
   if(!strcmp(a->operation,"diagnostic.list")){JsonObject*params=json_object_new();start_operation(a->app,a->operation,params,a->title,-1,FALSE);json_object_unref(params);return;}
   open_form(a->app,a->operation,a->title,a->record);
@@ -1260,6 +1558,7 @@ static void show_record(App*app,JsonObject*record,gint collection){
   else if(collection==2)summary=g_strdup(str(record,"repository"));
   else{char*trigger=choice_label(str(record,"trigger"));summary=g_strdup_printf("%s%s%s",trigger,*str(record,"calendar")?" · ":"",str(record,"calendar"));g_free(trigger);}
   append_text(titles,summary,"dim-label");g_free(summary);
+  if(*str(record,"id"))append_text(titles,!strcmp(str(record,"execution_scope"),"personal")?"Personal access resource":"Management authorization required","dim-label");
   if(collection==0){
     if(*str(record,"last_opened_at")){char*last=g_strdup_printf("Last opened %s by %s",str(record,"last_opened_at"),str(record,"last_opened_by"));append_text(inside,last,"dim-label");g_free(last);}
     if(json_object_has_member(record,"usage")&&JSON_NODE_HOLDS_OBJECT(json_object_get_member(record,"usage"))){
@@ -1357,6 +1656,9 @@ static void render_page(App*app){
     append_text(app->body,"This session","title-2");if(!app->activity->len)append_text(app->body,"No operations yet.","dim-label");for(guint i=0;i<app->activity->len;i++)append_text(app->body,g_ptr_array_index(app->activity,i),NULL);
     append_text(app->body,"Each backup plan also provides its persistent Backup history in its actions menu.","dim-label");
   }else{
+    append_text(app->body,"Access","title-2");
+    append_text(app->body,"Management authorization applies to this desktop session. Ending authorization does not lock a vault. Vault PINs, passphrases and sensitive recovery prompts are separate.",NULL);
+    GtkWidget *manage=gtk_button_new_with_label("Manage personal access…");gtk_widget_set_halign(manage,GTK_ALIGN_START);g_signal_connect(manage,"clicked",G_CALLBACK(access_manage_clicked),app);gtk_box_append(app->body,manage);
     append_text(app->body,"Appearance","title-2");const char*themes[]={"Follow system","Light","Dark",NULL};GtkWidget*drop=gtk_drop_down_new_from_strings(themes);AdwColorScheme scheme=adw_style_manager_get_color_scheme(adw_style_manager_get_default());gtk_drop_down_set_selected(GTK_DROP_DOWN(drop),scheme==ADW_COLOR_SCHEME_FORCE_LIGHT?1:scheme==ADW_COLOR_SCHEME_FORCE_DARK?2:0);g_signal_connect(drop,"notify::selected",G_CALLBACK(theme_changed),app);gtk_box_append(app->body,drop);
     GtkWidget*notify_button=gtk_check_button_new_with_label("Show operation notifications");gtk_check_button_set_active(GTK_CHECK_BUTTON(notify_button),app->show_notifications);g_signal_connect(notify_button,"toggled",G_CALLBACK(notifications_changed),app);gtk_box_append(app->body,notify_button);
     append_text(app->body,"Automation","title-2");append_text(app->body,"Unlock and lock events belong to each vault. Backup timing, power and network preferences belong to each backup plan. Services continue working after this window closes.",NULL);gtk_box_append(app->body,action_button(app,"Synchronize schedules","schedule.sync",NULL,NULL));
@@ -1378,8 +1680,10 @@ static void activate(GApplication*application,gpointer data){
   app->window=GTK_WINDOW(adw_application_window_new(GTK_APPLICATION(application)));gtk_window_set_title(app->window,"OctoVault");gtk_window_set_default_size(app->window,1100,780);
   GtkBox*root=GTK_BOX(gtk_box_new(GTK_ORIENTATION_VERTICAL,0));adw_application_window_set_content(ADW_APPLICATION_WINDOW(app->window),GTK_WIDGET(root));
   GtkWidget*header=adw_header_bar_new();GtkWidget*window_title=adw_window_title_new("OctoVault","OctoLeo Suite");adw_header_bar_set_title_widget(ADW_HEADER_BAR(header),window_title);gtk_box_append(root,header);
+  GtkBox *access_box=GTK_BOX(gtk_box_new(GTK_ORIENTATION_HORIZONTAL,8));app->access_label=GTK_LABEL(label("Read-only","dim-label"));gtk_box_append(access_box,GTK_WIDGET(app->access_label));app->access_button=gtk_button_new_with_label("Authorize management");g_signal_connect(app->access_button,"clicked",G_CALLBACK(access_header_clicked),app);gtk_box_append(access_box,app->access_button);adw_header_bar_pack_start(ADW_HEADER_BAR(header),GTK_WIDGET(access_box));
   app->refresh=gtk_button_new_from_icon_name("view-refresh-symbolic");gtk_widget_set_tooltip_text(app->refresh,"Refresh vaults and backups");g_signal_connect(app->refresh,"clicked",G_CALLBACK(refresh_clicked),app);adw_header_bar_pack_end(ADW_HEADER_BAR(header),app->refresh);
   GtkWidget*about=gtk_button_new_from_icon_name("help-about-symbolic");gtk_widget_set_tooltip_text(about,"About OctoVault");g_signal_connect(about,"clicked",G_CALLBACK(about_clicked),app);adw_header_bar_pack_end(ADW_HEADER_BAR(header),about);
+  app->access_hint=GTK_LABEL(label("Checking management authorization…","dim-label"));margin(GTK_WIDGET(app->access_hint),12);gtk_box_append(root,GTK_WIDGET(app->access_hint));
   GtkBox*layout=GTK_BOX(gtk_box_new(GTK_ORIENTATION_HORIZONTAL,0));gtk_widget_set_vexpand(GTK_WIDGET(layout),TRUE);gtk_box_append(root,GTK_WIDGET(layout));
   GtkBox*sidebar=GTK_BOX(gtk_box_new(GTK_ORIENTATION_VERTICAL,6));margin(GTK_WIDGET(sidebar),12);gtk_widget_set_size_request(GTK_WIDGET(sidebar),172,-1);gtk_box_append(layout,GTK_WIDGET(sidebar));
   GtkWidget*icon=gtk_image_new_from_icon_name("io.vdm.OctoVault");gtk_image_set_pixel_size(GTK_IMAGE(icon),72);gtk_widget_set_margin_top(icon,12);gtk_widget_set_margin_bottom(icon,20);gtk_box_append(sidebar,icon);
@@ -1393,7 +1697,7 @@ static void activate(GApplication*application,gpointer data){
   app->job_box=gtk_box_new(GTK_ORIENTATION_VERTICAL,8);margin(app->job_box,16);gtk_box_append(root,app->job_box);gtk_widget_set_visible(app->job_box,FALSE);
   GtkBox*job_row=GTK_BOX(gtk_box_new(GTK_ORIENTATION_HORIZONTAL,12));gtk_box_append(GTK_BOX(app->job_box),GTK_WIDGET(job_row));app->job_label=GTK_LABEL(label("","heading"));gtk_widget_set_hexpand(GTK_WIDGET(app->job_label),TRUE);gtk_box_append(job_row,GTK_WIDGET(app->job_label));app->cancel=gtk_button_new_with_label("Cancel operation");gtk_box_append(job_row,app->cancel);g_signal_connect(app->cancel,"clicked",G_CALLBACK(cancel_job),app);
   app->progress=GTK_PROGRESS_BAR(gtk_progress_bar_new());gtk_box_append(GTK_BOX(app->job_box),GTK_WIDGET(app->progress));
-  gtk_toggle_button_set_active(app->navigation[0],TRUE);gtk_window_present(app->window);refresh_all(app);
+  gtk_toggle_button_set_active(app->navigation[0],TRUE);gtk_window_present(app->window);access_update_header(app);refresh_all(app);
 }
 static gboolean smoke_finished(gpointer data){
   App*app=data;
@@ -1411,6 +1715,7 @@ static gboolean unlock_registered(App*app,const char*id){
   for(guint i=0;i<json_array_get_length(a);i++){
     JsonNode*v=json_array_get_element(a,i);if(!JSON_NODE_HOLDS_OBJECT(v))continue;
     JsonObject*record=json_node_get_object(v);if(strcmp(str(record,"id"),id))continue;
+    if(access_record_requires_system(app,"vault.open",record)){add_activity(app,"An automatic unlock was skipped because this vault requires management authorization.");return TRUE;}
     if(!strcmp(str(record,"auth"),"gpg")){JsonObject*p=json_object_new();json_object_set_string_member(p,"id",id);start_operation(app,"vault.open",p,"Unlock vault",-1,FALSE);json_object_unref(p);}
     else {app->automatic_prompt=TRUE;open_form(app,"vault.open","Unlock vault",record);}
     return TRUE;
@@ -1419,7 +1724,7 @@ static gboolean unlock_registered(App*app,const char*id){
 }
 static gboolean drain_unlocks(gpointer data){
   App*app=data;
-  if(app->active||app->automatic_prompt||!app->collections[0]||g_queue_is_empty(app->pending_unlocks))return G_SOURCE_REMOVE;
+  if(app->active||app->automatic_prompt||!app->collections[0]||g_queue_is_empty(app->pending_unlocks)||!access_can(app,"vault.open"))return G_SOURCE_REMOVE;
   char*id=g_queue_pop_head(app->pending_unlocks);
   if(!unlock_registered(app,id)){error_window(app,"Vault is unavailable","The automatically requested vault is no longer registered. Refresh the vault list and check its settings.");g_idle_add(drain_unlocks,app);}
   g_free(id);return G_SOURCE_REMOVE;
@@ -1476,6 +1781,29 @@ static void smoke_advanced_defaults(App*app){
     gtk_window_destroy(window);g_object_unref(window);
   }
 }
+static void smoke_access_lifecycle(App *app){
+  JsonObject *saved=app->access_state?json_object_ref(app->access_state):NULL;
+  JsonObject *state=json_object_new();json_object_set_boolean_member(state,"available",TRUE);json_object_set_boolean_member(state,"authorized",FALSE);json_object_set_boolean_member(state,"can_request_system",TRUE);json_object_set_string_member(state,"scope","none");
+  access_apply(app,state);g_assert_cmpstr(gtk_label_get_text(app->access_label),==,"Read-only");
+  g_assert_cmpstr(gtk_button_get_label(GTK_BUTTON(app->access_button)),==,"Authorize management");
+  JsonArray *capabilities=json_array_new();json_array_add_string_element(capabilities,"vault.create");json_array_add_string_element(capabilities,"vault.open");json_array_add_string_element(capabilities,"access.grant");json_object_set_array_member(state,"capabilities",capabilities);
+  json_object_set_boolean_member(state,"authorized",TRUE);json_object_set_string_member(state,"scope","system");json_object_set_int_member(state,"expires_at",g_get_real_time()/G_USEC_PER_SEC+600);
+  access_apply(app,state);g_assert_cmpstr(gtk_label_get_text(app->access_label),==,"Management authorized");g_assert_cmpstr(gtk_button_get_label(GTK_BUTTON(app->access_button)),==,"End authorization");
+  open_form(app,"vault.create","Authorization lifecycle test",NULL);GListModel *windows=gtk_window_get_toplevels();GtkWindow *window=g_list_model_get_item(windows,g_list_model_get_n_items(windows)-1);Form *form=g_object_get_data(G_OBJECT(window),"form");
+  gtk_editable_set_text(GTK_EDITABLE(find_field(form,"name")->widget),"Preserved after authorization expiry");
+  json_object_set_int_member(state,"expires_at",g_get_real_time()/G_USEC_PER_SEC-1);app->smoke=FALSE;access_apply(app,state);submit_form(NULL,form);
+  g_assert_false(form->submitted);g_assert_true(form->access_blocked);g_assert_true(gtk_widget_get_visible(form->authorize));
+  g_assert_cmpstr(gtk_editable_get_text(GTK_EDITABLE(find_field(form,"name")->widget)),==,"Preserved after authorization expiry");
+  g_assert_cmpstr(gtk_label_get_text(app->access_label),==,"Read-only");
+  json_object_set_int_member(state,"expires_at",g_get_real_time()/G_USEC_PER_SEC+600);access_apply(app,state);g_assert_false(form->access_blocked);g_assert_false(gtk_widget_get_visible(form->authorize));
+  json_object_set_string_member(state,"scope","personal");JsonArray *personal=json_array_new();json_array_add_string_element(personal,"vault.create");json_object_set_array_member(state,"capabilities",personal);access_apply(app,state);
+  g_assert_cmpstr(gtk_label_get_text(app->access_label),==,"Personal access");g_assert_true(access_can(app,"vault.create"));g_assert_false(access_can(app,"access.grant"));
+  app->smoke=TRUE;gtk_window_destroy(window);g_object_unref(window);
+  JsonNode *vaults=app->collections[0];json_object_set_boolean_member(state,"authorized",FALSE);json_object_set_string_member(state,"scope","none");
+  JsonNode *payload=json_node_new(JSON_NODE_OBJECT);json_node_set_object(payload,state);Operation ended={.app=app,.op="access.lock"};g_assert_true(access_handle_result(&ended,payload,NULL,NULL));
+  g_assert_true(app->collections[0]==vaults);g_assert_nonnull(strstr(gtk_label_get_text(app->access_hint),"Vaults retain their actual"));json_node_free(payload);
+  access_apply(app,saved);g_clear_pointer(&app->access_notice,g_free);access_update_header(app);if(saved)json_object_unref(saved);json_object_unref(state);
+}
 static int command_line(GApplication*application,GApplicationCommandLine*command,gpointer data){
   App*app=data;GVariantDict*options=g_application_command_line_get_options_dict(command);
   if(g_variant_dict_contains(options,"smoke-test"))app->smoke=TRUE;
@@ -1485,7 +1813,13 @@ static int command_line(GApplication*application,GApplicationCommandLine*command
   if(g_variant_dict_lookup(options,"screenshot-backup-files","&s",&screenshot)){g_free(app->screenshot);app->screenshot=g_strdup(screenshot);app->smoke=TRUE;app->screenshot_backup_files=TRUE;}
   if(g_variant_dict_lookup(options,"screenshot-destination","&s",&screenshot)){g_free(app->screenshot);app->screenshot=g_strdup(screenshot);app->smoke=TRUE;app->screenshot_destination=TRUE;}
   app->screenshot_advanced=g_variant_dict_contains(options,"screenshot-advanced");
+  gboolean background_launch=g_variant_dict_contains(options,"background")||g_variant_dict_contains(options,"unlock");
+  if(!app->access_started||!background_launch)app->access_background_launch=background_launch;
   g_application_activate(application);
+  if(!app->smoke){
+    if(!app->access_started||(!background_launch&&!app->access_startup_attempted))access_request_status(app,TRUE);
+    app->access_started=TRUE;if(!app->access_timer)app->access_timer=g_timeout_add_seconds(1,access_poll,app);
+  }
   const char*unlock=NULL;if(g_variant_dict_lookup(options,"unlock","&s",&unlock)){
     if(!g_queue_find_custom(app->pending_unlocks,unlock,(GCompareFunc)g_strcmp0))g_queue_push_tail(app->pending_unlocks,g_strdup(unlock));
     g_idle_add(drain_unlocks,app);
@@ -1494,7 +1828,7 @@ static int command_line(GApplication*application,GApplicationCommandLine*command
     for(guint i=0;i<6;i++)gtk_toggle_button_set_active(app->navigation[i],TRUE);
     const char *ops[]={"vault.create","vault.import","vault.update","vault.open","vault.close","vault.resize","vault.passwd","vault.setkey","vault.key-export","vault.search","migration.add","migration.recover","destination.save","repository.create","repository.import","repository.check","repository.files","repository.find","repository.diff","repository.restore","repository.forget","repository.password","repository.copy","backup.save"};
     for(guint i=0;i<G_N_ELEMENTS(ops);i++){open_form(app,ops[i],ops[i],NULL);GListModel*windows=gtk_window_get_toplevels();guint count=g_list_model_get_n_items(windows);if(count>1){GtkWindow*w=g_list_model_get_item(windows,count-1);if(w!=app->window){if(!strcmp(ops[i],"vault.create"))smoke_vault_creation(g_object_get_data(G_OBJECT(w),"form"));gtk_window_destroy(w);}g_object_unref(w);}}
-    smoke_advanced_defaults(app);backup_setup_smoke(app);
+    smoke_advanced_defaults(app);backup_setup_smoke(app);smoke_access_lifecycle(app);
     gtk_toggle_button_set_active(app->navigation[0],TRUE);
     if(app->screenshot_create){open_form(app,"vault.create","Create vault",NULL);GListModel*windows=gtk_window_get_toplevels();app->screenshot_window=g_list_model_get_item(windows,g_list_model_get_n_items(windows)-1);Form*f=g_object_get_data(G_OBJECT(app->screenshot_window),"form");gtk_editable_set_text(GTK_EDITABLE(find_field(f,"name")->widget),"Personal");}
     if(app->screenshot_backup){open_backup_setup(app);app->screenshot_window=app->backup_setup->window;}
@@ -1514,6 +1848,7 @@ int main(int argc,char**argv){
   load_preferences(app);
   app->application=adw_application_new("io.vdm.OctoVault",G_APPLICATION_HANDLES_COMMAND_LINE);
   g_application_add_main_option(G_APPLICATION(app->application),"smoke-test",0,G_OPTION_FLAG_NONE,G_OPTION_ARG_NONE,"Construct all pages and dialogs, then exit",NULL);
+  g_application_add_main_option(G_APPLICATION(app->application),"background",0,G_OPTION_FLAG_NONE,G_OPTION_ARG_NONE,"Start without requesting administrator authorization",NULL);
   g_application_add_main_option(G_APPLICATION(app->application),"unlock",0,G_OPTION_FLAG_NONE,G_OPTION_ARG_STRING,"Offer to unlock a registered vault","ID");
   g_application_add_main_option(G_APPLICATION(app->application),"screenshot",0,G_OPTION_FLAG_NONE,G_OPTION_ARG_STRING,"Save a smoke-test screenshot","FILE");
   g_application_add_main_option(G_APPLICATION(app->application),"screenshot-create",0,G_OPTION_FLAG_NONE,G_OPTION_ARG_STRING,"Save the guided vault creation form after native UI checks","FILE");

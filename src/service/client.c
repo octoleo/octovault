@@ -103,9 +103,17 @@ static GVariant *call(GDBusConnection *bus, const gchar *method, GVariant *param
 
 gchar *ov_client_submit(GDBusConnection *bus, const gchar *request, GError **error)
 {
+    return ov_client_submit_cancellable(bus, request, NULL, error);
+}
+
+gchar *ov_client_submit_cancellable(GDBusConnection *bus, const gchar *request, GCancellable *cancellable, GError **error)
+{
+    if (cancellable && g_cancellable_set_error_if_cancelled(cancellable, error)) return NULL;
     gchar *prepared = ov_client_prepare_request(request, error);
     if (!prepared) return NULL;
-    GVariant *reply = call(bus, "Submit", g_variant_new("(s)", prepared), G_VARIANT_TYPE("(s)"), error);
+    GVariant *reply = g_dbus_connection_call_sync(bus, OV_BUS_NAME, OV_OBJECT_PATH, OV_INTERFACE,
+        "Submit", g_variant_new("(s)", prepared), G_VARIANT_TYPE("(s)"),
+        G_DBUS_CALL_FLAGS_ALLOW_INTERACTIVE_AUTHORIZATION, 180000, cancellable, error);
     volatile gchar *p = prepared;
     for (gsize n = strlen(prepared); n; n--) *p++ = 0;
     g_free(prepared);

@@ -117,6 +117,37 @@ static void decimal_capacity(void)
     g_object_unref(parser); g_free(encoded);
 }
 
+static void access_options(void)
+{
+    gchar *args[] = { "access", "grant", "--user", "ordinary-user" };
+    GError *error = NULL;
+    gchar *encoded = make_request(G_N_ELEMENTS(args), args, &error);
+    g_assert_no_error(error);
+    JsonParser *parser = json_parser_new();
+    g_assert_true(json_parser_load_from_data(parser, encoded, -1, &error));
+    JsonObject *root = json_node_get_object(json_parser_get_root(parser));
+    g_assert_cmpstr(json_object_get_string_member(root, "op"), ==, "access.grant");
+    g_assert_cmpstr(json_object_get_string_member(json_object_get_object_member(root, "params"), "user"), ==, "ordinary-user");
+    g_object_unref(parser); g_free(encoded);
+}
+
+static void authorization_retry_policy(void)
+{
+    const gchar *retry[] = { OV_INTERFACE ".AuthorizationRequired", OV_INTERFACE ".AuthorizationExpired" };
+    const gchar *deny[] = { OV_INTERFACE ".NotAuthorized", OV_INTERFACE ".Cancelled", "org.freedesktop.DBus.Error.ServiceUnknown", "other.service.AuthorizationRequired" };
+    for (guint i = 0; i < G_N_ELEMENTS(retry); i++) {
+        GError *error = g_dbus_error_new_for_dbus_error(retry[i], "Authorization is needed.");
+        g_assert_true(authorization_required(error)); g_error_free(error);
+    }
+    for (guint i = 0; i < G_N_ELEMENTS(deny); i++) {
+        GError *error = g_dbus_error_new_for_dbus_error(deny[i], "The request was refused.");
+        g_assert_false(authorization_required(error)); g_error_free(error);
+    }
+    GError *local = g_error_new_literal(G_IO_ERROR, G_IO_ERROR_FAILED, "AuthorizationRequired");
+    g_assert_false(authorization_required(local)); g_error_free(local);
+    g_assert_false(authorization_required(NULL));
+}
+
 static void client_session_context(void)
 {
     const gchar *names[] = { "DISPLAY", "XAUTHORITY", "WAYLAND_DISPLAY", "GPG_TTY", "GNUPGHOME" };
@@ -166,6 +197,55 @@ static void client_session_context(void)
     }
 }
 
+static void terminal_result_visibility(void)
+{
+    JsonObject *job = json_object_new(); GError *error = NULL;
+    json_object_set_string_member(job, "state", "running");
+    g_assert_false(completed_without_result(job, &error)); g_assert_no_error(error);
+    const gchar *states[] = { "succeeded", "failed", "cancelled" };
+    for (guint i = 0; i < G_N_ELEMENTS(states); i++) {
+        json_object_set_string_member(job, "state", states[i]);
+        g_assert_true(completed_without_result(job, &error));
+        g_assert_error(error, G_IO_ERROR, G_IO_ERROR_PERMISSION_DENIED); g_clear_error(&error);
+    }
+    json_object_unref(job);
+}
+
+static void headless_authorization_route(void)
+{
+    JsonObject *status = json_object_new();
+    json_object_set_boolean_member(status, "available", FALSE);
+    g_assert_false(status_requires_lease(status));
+    json_object_set_boolean_member(status, "available", TRUE);
+    g_assert_true(status_requires_lease(status));
+    json_object_unref(status);
+}
+
+static void cancelled_submission(void)
+{
+    GError *error = NULL;
+    interrupted = 1;
+    g_assert_null(submit_command(NULL, "{\"op\":\"vault.open\",\"params\":{}}", &error));
+    g_assert_error(error, G_IO_ERROR, G_IO_ERROR_CANCELLED); g_clear_error(&error);
+    interrupted = 0;
+    GCancellable *cancel = g_cancellable_new(); g_cancellable_cancel(cancel);
+    g_assert_null(ov_client_submit_cancellable(NULL, "{}", cancel, &error));
+    g_assert_error(error, G_IO_ERROR, G_IO_ERROR_CANCELLED); g_clear_error(&error); g_object_unref(cancel);
+}
+
+static void signal_cancels_pending_authorization(void)
+{
+    GCancellable *cancel = g_cancellable_new();
+    interrupted = 0; g_atomic_int_set(&cancellation_monitor_stop, 0);
+    GThread *thread = g_thread_new("test-auth-cancel", monitor_cancellation, cancel);
+    signal_handler(SIGINT);
+    gint64 deadline = g_get_monotonic_time() + G_USEC_PER_SEC;
+    while (!g_cancellable_is_cancelled(cancel) && g_get_monotonic_time() < deadline) g_usleep(1000);
+    g_atomic_int_set(&cancellation_monitor_stop, 1); g_thread_join(thread);
+    g_assert_true(g_cancellable_is_cancelled(cancel));
+    interrupted = 0; g_object_unref(cancel);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -176,6 +256,12 @@ int main(int argc, char **argv)
     g_test_add_func("/cli/guided-vault-options", guided_vault_options);
     g_test_add_func("/cli/yubikey-and-diagnostic-options", yubikey_and_diagnostic_options);
     g_test_add_func("/cli/decimal-capacity", decimal_capacity);
+    g_test_add_func("/cli/access-options", access_options);
+    g_test_add_func("/cli/authorization-retry-policy", authorization_retry_policy);
     g_test_add_func("/client/session-context", client_session_context);
+    g_test_add_func("/cli/terminal-result-visibility", terminal_result_visibility);
+    g_test_add_func("/cli/headless-authorization-route", headless_authorization_route);
+    g_test_add_func("/cli/cancelled-submission", cancelled_submission);
+    g_test_add_func("/cli/signal-cancels-authorization", signal_cancels_pending_authorization);
     return g_test_run();
 }

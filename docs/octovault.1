@@ -1,14 +1,16 @@
-.TH OCTOVAULT 1 "October 2026" "OctoVault 1.1.2" "User Commands"
+.TH OCTOVAULT 1 "October 2026" "OctoVault 1.2.0" "User Commands"
 .SH NAME
 octovault \- manage encrypted local vaults and independent backups
 .SH SYNOPSIS
 .B octovault
 .RB [ --json ]
+.RB [ --system ]
 .I GROUP ACTION
 .RI [ --option " VALUE" ...]
 .br
 .B octovault
 .RB [ --json ]
+.RB [ --system ]
 .B request
 .RI [ FILE | - ]
 .br
@@ -19,10 +21,17 @@ octovault \- manage encrypted local vaults and independent backups
 .I ID
 .SH DESCRIPTION
 OctoVault provides a terminal client for the same authorized service used by
-its native GNOME application. Run as your regular account. Privileged actions
-request administrator authentication through PolicyKit. Running with sudo
-selects the root account's configuration.
+its native GNOME application. Run as your regular account. The client starts
+authorization when a protected operation requires it, using approved personal
+access when available or administrator authentication through PolicyKit.
+Running with sudo selects the root account's configuration. An administrator
+approving a request does not become the owner of the caller's data.
 .SH GROUPS
+.TP
+.B access
+status, unlock, lock, list, users, grant, and revoke. Use --user LOGIN to
+select the local account for grant or revoke. Changing another account's
+personal access requires fresh administrator approval.
 .TP
 .B vault
 list, get, create, import, open, close, update, remove, resize, passwd,
@@ -46,6 +55,38 @@ sync.
 .TP
 .B diagnostic
 list and get. Private failure summaries are scoped to your account.
+.SH AUTHORIZATION
+Saved metadata and diagnostic reports can be inspected without management
+authorization. Repository data access, record changes, and vault operations
+require authorization even when an operation does not modify data.
+.PP
+A reusable authorization session belongs to the caller UID, its unique bus
+connection, and its actual active, local, unlocked login session. It lasts
+at most eight hours. Explicit lock, connection loss, desktop lock, logout,
+suspension, loss of the active session, service restart, policy change,
+revocation, or expiry ends it. Ending authorization does not close an open
+vault or cancel work already running.
+.PP
+Each CLI invocation has its own bus connection. A standalone access unlock
+command exits and does not authorize subsequent commands or the desktop.
+Normally run the required operation and let the CLI authorize that connection.
+Supported headless or remote operations require fresh administrator approval
+per operation; they do not create a reusable local-session authorization.
+The CLI starts a PolicyKit terminal agent when needed.
+.PP
+An administrator can enroll a local account for personal access without
+adding it to sudo. Personal backup and restore processes run as the owner,
+so filesystem permissions still restrict their sources, repositories, and
+restore targets. Personal access cannot operate system-scope records or
+request forced vault closure. Older records without execution_scope remain
+system-scope; grants do not silently convert them. Administrator management
+of a personal record does not change the record's scope.
+.PP
+Saved schedules do not require an open management session. Personal schedules
+require a valid personal grant when they start. Revocation stops future
+personal scheduled backups; running jobs finish safely, and saved vault
+safety-close policies remain in effect. Vault passphrases and YubiKey
+PIN or touch requirements remain independent of management authorization.
 .SH OPTIONS
 Use --id to select an existing record. Option names use hyphens. Repeat
 --source, --exclude, --include, or --close-on to supply multiple array entries.
@@ -74,12 +115,20 @@ secret requests in shell history or unprotected files.
 .B --json
 Emit machine-readable results.
 .TP
+.B --system
+Request administrator authorization instead of automatically selecting
+approved personal access. Use this for administrator-managed resources.
+.TP
 .B --help
 Show command usage.
 .TP
 .B --version
 Show the application version.
 .SH FILES
+.TP
+.B /var/lib/octovault/access.json
+Root-owned personal access policy, mode 0600. Grants match local account
+names and numeric user IDs. Manage grants through access grant or access revoke.
 .TP
 .B /var/lib/octovault/users/UID
 Root-owned account state and encrypted credentials. Retained on package removal.
@@ -95,7 +144,10 @@ Zero indicates success. Failed, rejected, or cancelled operations return nonzero
 .SH RECOVERY
 Save repository addresses, remote credentials, and repository passwords outside
 the computer. Host-bound encrypted credentials alone are not portable recovery
-information. The explicit repository recovery action requires authorization.
+information. The explicit repository recovery action requires fresh owner
+authentication when using personal access to a personal repository, or fresh
+administrator authentication when using management access. Personal restore cannot preserve arbitrary
+system ownership or write paths the owner cannot access.
 .SH AUTHORS
 Vast Development Method, part of the OctoLeo Suite.
 .SH SEE ALSO

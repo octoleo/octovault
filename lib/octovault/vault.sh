@@ -41,9 +41,19 @@ ov_vault_active_mount() {
     ov_vault_field "$1" mountpoint
 }
 
+# Container filesystems can be prepared on another machine with root-owned
+# setuid programs, file capabilities or device nodes. Their ownership is not
+# evidence of trust. Verify the effective kernel flags before exposing them.
+ov_vault_mount_safe() {
+    local options
+    options=$(findmnt -rn --mountpoint "$1" --output VFS-OPTIONS) || return 1
+    [[ -n $options && $options != *$'\n'* && ,$options, == *,nosuid,* && ,$options, == *,nodev,* ]]
+}
+
 ov_vault_expose() {
     local record=$1 mountpoint engine descriptor resolved rc=0
     mountpoint=$(ov_vault_field "$record" mountpoint); engine=$(ov_vault_engine_mount "$record")
+    ov_vault_mount_safe "$engine" || return 1
     exec {descriptor}< "$mountpoint" || return 1
     resolved=$(readlink -f -- "/proc/self/fd/$descriptor") || { exec {descriptor}<&-; return 1; }
     if [[ ! -d /proc/self/fd/$descriptor || $resolved != "$mountpoint" ||
@@ -58,7 +68,8 @@ ov_vault_expose() {
     mount --no-canonicalize --bind "$engine" "/proc/self/fd/$descriptor" >&2 || rc=$?
     exec {descriptor}<&-
     ((rc==0)) || return "$rc"
-    [[ $(stat -Lc '%d:%i' -- "$mountpoint") == $(stat -Lc '%d:%i' -- "$engine") ]]
+    [[ $(stat -Lc '%d:%i' -- "$mountpoint") == $(stat -Lc '%d:%i' -- "$engine") ]] &&
+        ov_vault_mount_safe "$mountpoint"
 }
 
 ov_vault_backing() {
@@ -535,6 +546,10 @@ ov_vault_status() {
 
 ov_vault_validate_record() {
     local record=$1
+    ov_record_scope "$record" >/dev/null
+    if [[ ${OV_EXECUTION_SCOPE:-system} == personal && $(ov_vault_field "$record" force_close) == true ]]; then
+        ov_fail admin_required 'Force locking can terminate other processes. Unlock administrator access to enable this policy.'
+    fi
     jq -e '(.name|type=="string" and length>0 and length<=200) and
       (.file|type=="string") and (.key_file|type=="string") and
       (.auth|IN("key","gpg","image","text")) and
@@ -735,6 +750,7 @@ ov_vault_read_binds() {
 ov_vault_bind_hooks() {
     local record=$1 mountpoint hook src dst src_path dst_path src_fd dst_fd
     mountpoint=$(ov_vault_field "$record" mountpoint)
+    ov_vault_mount_safe "$mountpoint" || return 1
     hook="$mountpoint/bind-hooks"
     [[ -f $hook ]] || return 0
     local parsed
@@ -760,6 +776,7 @@ ov_vault_bind_hooks() {
             exec {src_fd}<&-; exec {dst_fd}<&-; rm -f "$parsed"; return 1;
         }
         exec {src_fd}<&-; exec {dst_fd}<&-
+        ov_vault_mount_safe "$dst_path" || { rm -f "$parsed"; return 1; }
     done < "$parsed"
     rm -f -- "$parsed"
 }
@@ -768,7 +785,12 @@ ov_vault_open_record() {
     local record=$1 id mountpoint engine
     id=$(ov_vault_field "$record" id)
     mountpoint=$(ov_vault_field "$record" mountpoint)
-    ov_vault_is_open "$record" && return 0
+    if ov_vault_is_open "$record"; then
+        if ! ov_vault_mount_safe "$(ov_vault_active_mount "$record")" || ! ov_vault_mount_safe "$mountpoint"; then
+            ov_fail unsafe_mount "This vault was opened without required filesystem protections. Close it and reopen it before use."
+        fi
+        return 0
+    fi
     ov_vault_require_closed "$record"
     [[ -d $mountpoint && ! -L $mountpoint ]] || ov_fail invalid_mount "The registered mountpoint is missing."
     findmnt -rn --mountpoint "$mountpoint" >/dev/null 2>&1 && ov_fail occupied "The vault mountpoint is already in use."
@@ -778,9 +800,13 @@ ov_vault_open_record() {
     OV_VAULT_ENGINE_MOUNT=$engine
     install -d -m 0700 /run/octovault/mounts "/run/octovault/mounts/$OV_UID" "$engine"
     ov_progress unlock "Unlocking the vault" 20
-    ov_vault_tomb_keyed "$record" open "$(ov_vault_field "$record" file)" "$engine" -n -p ||
+    ov_vault_tomb_keyed "$record" open "$(ov_vault_field "$record" file)" "$engine" -n -p -o rw,noatime,nodev,nosuid ||
         ov_fail unlock_failed "The vault could not be unlocked. Check the key and passphrase."
     ov_vault_is_open "$record" || ov_fail verification_failed "The unlocked device could not be verified."
+    if ! ov_vault_mount_safe "$engine"; then
+        ov_vault_tomb close "$(ov_vault_selector "$record")" || true
+        ov_fail unsafe_mount "Required filesystem protections could not be verified. The vault has not been exposed."
+    fi
     if [[ $(ov_vault_field "$record" created_by_octovault) == true && -z $(ov_vault_field "$record" last_opened_at) ]]; then
         # Newly formatted ext4 starts root-owned. Preserve all content ownership
         # and initialize only this new filesystem's top-level directory.
@@ -807,6 +833,9 @@ ov_vault_open_record() {
 
 ov_vault_close_record() {
     local record=$1 force=${2:-false} id name
+    if [[ ${OV_EXECUTION_SCOPE:-system} == personal && $force == true ]]; then
+        ov_fail admin_required 'Force locking can terminate other processes. Unlock administrator access, or close applications and use normal locking.'
+    fi
     id=$(ov_vault_field "$record" id)
     OV_VAULT_ENGINE_MOUNT=$(ov_vault_active_mount "$record")
     if ! ov_vault_is_open "$record"; then
@@ -851,8 +880,8 @@ ov_vault_new_record() {
         ov_fail invalid_mount "Choose a mountpoint without spaces, semicolons or brackets; mapped user locations may contain spaces."
     [[ $file != "$key" && $file != "$mountpoint" && $key != "$mountpoint" ]] || ov_fail invalid_path "Container, key and mountpoint must be separate paths."
     OV_RECORD=$(jq --arg id "$id" --arg name "$name" --arg file "$file" --arg key "$key" --arg mount "$mountpoint" \
-        --arg auth "$auth" --arg time "$(ov_now)" \
-        '. as $p | {schema_version:1,id:$id,name:$name,file:$file,key_file:$key,mountpoint:$mount,auth:$auth,
+        --arg auth "$auth" --arg time "$(ov_now)" --arg scope "${OV_EXECUTION_SCOPE:-system}" \
+        '. as $p | {schema_version:1,id:$id,name:$name,file:$file,key_file:$key,mountpoint:$mount,auth:$auth,execution_scope:$scope,
         recipient:($p.recipient//""),require_token:($p.require_token//false),cipher_file:(if ($p.cipher_file//"")=="" then "/usr/share/octovault/cloak-ciphers/words" else $p.cipher_file end),size_gb:($p.size_gb//null),
         open_on:($p.open_on//"login"),drive_uuid:($p.drive_uuid//""),close_on:($p.close_on//["shutdown"]),
         force_close:($p.force_close//false),trust_native_hooks:($p.trust_native_hooks//false),hooks:($p.hooks//{}),created_at:$time,updated_at:$time}' <<< "$OV_PARAMS")
@@ -1332,6 +1361,15 @@ ov_migration_recover() {
 
 ov_vault_dispatch() {
     local id record items result size
+    if [[ $OV_OP == vault.close ]]; then
+        jq -e 'has("force") | not' <<< "$OV_PARAMS" >/dev/null ||
+            jq -e '.force | type == "boolean"' <<< "$OV_PARAMS" >/dev/null ||
+            ov_fail invalid_request 'Force locking must be a true or false choice.'
+    fi
+    case $OV_OP in
+        vault.list|vault.get|vault.auth-check|vault.create|vault.import|migration.list) ;;
+        *) ov_load vaults "$(ov_require id)"; ov_scope_require_record "$OV_RECORD" ;;
+    esac
     case $OV_OP in
         vault.list|vault.get|vault.auth-check|migration.list|vault.search) ;;
         vault.create) ov_vault_create_path; ov_resource_lock "$(ov_require file)" ;;

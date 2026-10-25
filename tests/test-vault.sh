@@ -158,6 +158,40 @@ test_device_identity() (
     printf 'ok - an unrelated mount is never reported as this vault\n'
 )
 
+test_mount_protections() (
+    local MOCK_MOUNT_OPTIONS='rw,nosuid,nodev,noatime' record
+    local mountpoint="$WORK/protected-mount" engine="$WORK/protected-engine"
+    mkdir -p "$mountpoint" "$engine"
+    record=$(jq -n --arg mount "$mountpoint" '{id:"protections",file:"/fixture.tomb",mountpoint:$mount}')
+    findmnt() {
+        [[ $* == *'--output VFS-OPTIONS'* ]] || return 1
+        printf '%s\n' "$MOCK_MOUNT_OPTIONS"
+    }
+    ov_vault_mount_safe "$engine"
+    for MOCK_MOUNT_OPTIONS in 'rw,nodev' 'rw,nosuid' 'rw,suid,dev' '' $'rw,nosuid,nodev\nrw,nodev'; do
+        assert_fails ov_vault_mount_safe "$engine"
+    done
+    MOCK_MOUNT_OPTIONS='rw,nodev'
+    MOCK_OPEN=false
+    ov_vault_is_open() { [[ $MOCK_OPEN == true ]]; }
+    ov_vault_engine_mount() { printf '%s\n' "$engine"; }
+    ov_vault_require_closed() { :; }
+    ov_vault_tomb_keyed() {
+        printf '%s\n' "$@" > "$WORK/protection-engine-args"
+        MOCK_OPEN=true
+    }
+    ov_vault_tomb() { [[ $1 == close ]] && touch "$WORK/protection-closed"; }
+    ov_vault_selector() { printf 'protections\n'; }
+    ov_vault_expose() { touch "$WORK/protection-exposed"; }
+    assert_fails ov_vault_open_record "$record"
+    [[ -f $WORK/protection-closed && ! -e $WORK/protection-exposed ]]
+    [[ $(tail -n 2 "$WORK/protection-engine-args") == $'-o\nrw,noatime,nodev,nosuid' ]]
+    # A legacy mount must not bypass checking through the already-open shortcut.
+    MOCK_OPEN=true
+    assert_fails ov_vault_open_record "$record"
+    printf 'ok - unsafe or ambiguous mount flags prevent vault exposure, including already-open mounts\n'
+)
+
 test_unknown_state() (
     local record='{"file":"/correct.tomb","mountpoint":"/mount"}'
     ov_vault_is_open() { return 1; }
@@ -372,11 +406,28 @@ integration() {
     assert_equal "$(stat -c %a "$(dirname "$key")")" 700
     OV_PARAMS=$(jq -n --arg id "$id" '{id:$id,password:"OctoVault-CI-only-passphrase"}')
     OV_OP=vault.open; ov_vault_dispatch >/dev/null
+    local protected_mount protected_engine
+    ov_load vaults "$id"
+    protected_mount=$(ov_vault_field "$OV_RECORD" mountpoint)
+    protected_engine=$(ov_vault_engine_mount "$OV_RECORD")
+    ov_vault_mount_safe "$protected_engine"
+    ov_vault_mount_safe "$protected_mount"
+    # Prepared/imported images can contain root-owned setuid files and device
+    # nodes. Neither may confer privileges to the ordinary vault owner.
+    cp /usr/bin/id "$protected_engine/setuid-probe"
+    chown 0:0 "$protected_engine/setuid-probe"
+    chmod 4755 "$protected_engine/setuid-probe"
+    assert_equal "$(ov_as_user "$protected_mount/setuid-probe" -u)" "$OV_UID"
+    mknod "$protected_engine/device-probe" c 1 3
+    chmod 0666 "$protected_engine/device-probe"
+    assert_fails ov_as_user head -c 1 "$protected_mount/device-probe"
+    rm -- "$protected_engine/setuid-probe" "$protected_engine/device-probe"
     ov_as_user mkdir "$source"
     printf 'important\n' | ov_as_user tee "$source/data" >/dev/null
     OV_PARAMS=$(jq -n --arg id "$id" --arg source "$source" '{id:$id,source:$source,relative:"Documents",password:"OctoVault-CI-only-passphrase"}')
     OV_OP=migration.add; ov_vault_dispatch >/dev/null
     [[ -f $source/data ]]
+    ov_vault_mount_safe "$source"
     OV_PARAMS=$(jq -n --arg id "$id" '{id:$id}'); OV_OP=vault.close; ov_vault_dispatch >/dev/null
     [[ ! -e $source/data ]]
     printf 'independent\n' | ov_as_user tee "$source/local" >/dev/null
@@ -403,7 +454,7 @@ integration() {
     [[ ! -e $OV_HOME/untrusted-hook-ran ]]
     OV_OP=vault.close; ov_vault_dispatch >/dev/null
     assert_equal "$(cat "$guard")" 'must stay unchanged'
-    printf 'ok - real nonroot-owner lifecycle, migration, independent closed locations, metadata symlinks and untrusted hooks\n'
+    printf 'ok - real nonroot-owner lifecycle, protected mounts and binds, setuid/device rejection, migration, metadata symlinks and untrusted hooks\n'
     # Exercise the released engine's passphrase descriptions and carrier/key
     # interfaces, not mocks: percent signs must survive unchanged.
     OV_PARAMS=$(jq -n --arg id "$id" '{id:$id,old_password:"OctoVault-CI-only-passphrase",password:"OctoVault-rotated-50%-pass"}')
@@ -536,5 +587,5 @@ PINENTRY
 }
 
 if [[ ${1:-} == --integration ]]; then integration
-else test_validation; test_native_binds; test_compare; test_migration; test_interrupted_migration; test_device_identity; test_unknown_state; test_secret_arguments; test_container_pin; test_guided_creation
+else test_validation; test_native_binds; test_compare; test_migration; test_interrupted_migration; test_device_identity; test_mount_protections; test_unknown_state; test_secret_arguments; test_container_pin; test_guided_creation
 fi
