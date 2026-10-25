@@ -3,6 +3,10 @@
 set -Eeuo pipefail
 umask 077
 cd "$(dirname "$0")/.."
+test_stage=setup
+# Do not print the failed command or request: either could contain credentials.
+trap 'status=$?; printf "Personal scope failure: stage=%s file=%s line=%s status=%s\n" "$test_stage" "${BASH_SOURCE[0]}" "$LINENO" "$status" >&2' ERR
+stage() { test_stage=$1; printf 'Personal scope stage: %s\n' "$test_stage"; }
 work=$(mktemp -d)
 trap 'rm -rf -- "$work"' EXIT
 source lib/octovault/common.sh
@@ -38,6 +42,7 @@ vault_request() ( OV_OP=$1 OV_PARAMS=$2; ov_vault_dispatch; )
 ov_credential_set() { ov_id "$1"; mkdir -p "$OV_ROOT/credentials"; printf '%s' "$2" > "$OV_ROOT/credentials/$1"; }
 ov_credential_get() { ov_id "$1"; cat "$OV_ROOT/credentials/$1"; }
 
+stage resource-scope
 expect_failure admin_required ov_scope_require_record '{}'
 expect_failure admin_required ov_scope_require_record '{"execution_scope":"system"}'
 expect_failure invalid_state ov_record_scope '{"execution_scope":"untrusted"}'
@@ -64,6 +69,7 @@ ov_save plans revoked-plan '{"execution_scope":"personal","repository_id":"mixed
 expect_failure access_revoked request backup.run '{"id":"revoked-plan"}'
 
 # Personal schedule refresh must preserve all existing system units.
+stage schedule-separation
 OV_SYSTEMD_DIR="$work/units"
 mkdir -p "$OV_SYSTEMD_DIR"
 printf 'system timer must stay unchanged\n' > "$OV_SYSTEMD_DIR/octovault-backup-$OV_UID-system-plan.timer"
@@ -86,6 +92,7 @@ if [[ $EUID != 0 ]] || ! runuser -u nobody -- /usr/bin/true 2>/dev/null; then
     exit 0
 fi
 command -v restic >/dev/null
+stage ordinary-user-fixture
 OV_USER=nobody
 OV_UID=$(id -u "$OV_USER")
 OV_HOME="$work/ordinary-home"
@@ -103,6 +110,7 @@ systemctl() { :; }
 ov_resource_lock() { :; }
 ov_resource_unlock() { :; }
 
+stage owner-repository-and-backup
 destination=$(request destination.save "$(jq -nc --arg path "$OV_HOME/storage" '{name:"Personal destination",type:"local",path:$path}')")
 assert_json "$destination" '.ok and .data.execution_scope == "personal"'
 destination_id=$(jq -r .data.id <<< "$destination")
@@ -119,34 +127,61 @@ expect_failure permission_denied request backup.save "$(jq -nc --arg id "$reposi
 
 # Replacing an approved source with a link cannot make the root service read
 # its protected target. Runtime checks and the owner process both enforce it.
+stage protected-source-symlink
 mv "$OV_HOME/source" "$OV_HOME/original-source"
 ln -s "$work/root-private" "$OV_HOME/source"
 expect_failure permission_denied request backup.run "{\"id\":\"$plan_id\"}"
 rm "$OV_HOME/source"
 mv "$OV_HOME/original-source" "$OV_HOME/source"
 
+stage owner-restore
 restore="$OV_HOME/restored"
 assert_json "$(request repository.restore "$(jq -nc --arg id "$repository_id" --arg target "$restore" '{id:$id,target:$target,snapshot:"latest",overwrite:"never"}')")" '.ok'
 cmp "$OV_HOME/source/document.txt" "$restore$OV_HOME/source/document.txt"
 [[ $(stat -c %u "$restore$OV_HOME/source/document.txt") == "$OV_UID" ]]
 
-# Direct protected targets and user symlinks to them are inaccessible to the
-# actual restore process; nothing is written into the protected directory.
-for target in "$work/root-private" "$OV_HOME/restore-link"; do
-    [[ $target != "$OV_HOME/restore-link" ]] || ln -s "$work/root-private" "$target"
+# Direct protected targets and an intermediate symlink to them are inaccessible
+# to the actual restore process; neither can be replaced by an ordinary UID.
+stage protected-restore-targets
+ln -s "$work/root-private" "$OV_HOME/restore-parent"
+for target in "$work/root-private" "$OV_HOME/restore-parent/blocked-restore"; do
     result=''; status=0
     result=$(request repository.restore "$(jq -nc --arg id "$repository_id" --arg target "$target" '{id:$id,target:$target,snapshot:"latest",overwrite:"always"}')") || status=$?
     [[ $status != 0 ]]
     assert_json "$result" '.ok == false'
 done
+
+# Restic 0.18 replaces a final symlink in a caller-writable directory;
+# older engines follow it and fail on the protected target. Both must preserve
+# the protected directory. A successful restore must exist under a real,
+# ordinary-user-owned directory, never through the link into protected data.
+stage final-symlink-restore
+target="$OV_HOME/restore-link"
+ln -s "$work/root-private" "$target"
+result=''; status=0
+result=$(request repository.restore "$(jq -nc --arg id "$repository_id" --arg target "$target" '{id:$id,target:$target,snapshot:"latest",overwrite:"always"}')") || status=$?
+if [[ $status == 0 ]]; then
+    assert_json "$result" '.ok == true'
+    [[ ! -L $target && -d $target ]]
+    [[ $(stat -c %u "$target") == "$OV_UID" ]]
+    cmp "$OV_HOME/source/document.txt" "$target$OV_HOME/source/document.txt"
+    [[ $(stat -c %u "$target$OV_HOME/source/document.txt") == "$OV_UID" ]]
+else
+    assert_json "$result" '.ok == false'
+fi
+stage protected-restore-integrity
 [[ $(cat "$work/root-private/private.txt") == administrator-only-data ]]
 [[ $(find "$work/root-private" -mindepth 1 -maxdepth 1 | wc -l) == 1 ]]
+[[ $(stat -c '%u:%a' "$work/root-private") == 0:700 ]]
+[[ $(stat -c '%u:%a' "$work/root-private/private.txt") == 0:600 ]]
 
 # A root internal worker still executes personal I/O as the recorded owner.
+stage scheduled-personal-scope
 OV_EXECUTION_SCOPE=system
 assert_json "$(request backup.run "{\"id\":\"$plan_id\"}")" '.ok and .data.status == "success"'
 [[ $(stat -c %u "$OV_HOME/storage/repository/config") == "$OV_UID" ]]
 # Revoking enrollment blocks the next run, including a system timer invocation.
+stage enrollment-revocation
 printf '{"schema_version":1,"grants":[]}\n' > "$OV_ACCESS_FILE"
 expect_failure access_revoked request backup.run "{\"id\":\"$plan_id\"}"
 printf 'Personal filesystem integration: real owner-UID Restic, protected sources, symlink restore targets, ownership and scheduled scope passed.\n'

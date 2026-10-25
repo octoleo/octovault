@@ -414,10 +414,20 @@ integration() {
     ov_vault_mount_safe "$protected_mount"
     # Prepared/imported images can contain root-owned setuid files and device
     # nodes. Neither may confer privileges to the ordinary vault owner.
-    cp /usr/bin/id "$protected_engine/setuid-probe"
+    # A dedicated probe also works on systems whose id command is a multicall
+    # binary that chooses its behavior from its executable name.
+    cc -std=c11 -O2 -Wall -Wextra -Werror -x c -o "$protected_engine/setuid-probe" - <<'PROBE'
+#include <stdio.h>
+#include <unistd.h>
+int main(void)
+{
+    return printf("%lu:%lu\n", (unsigned long)getuid(), (unsigned long)geteuid()) < 0;
+}
+PROBE
     chown 0:0 "$protected_engine/setuid-probe"
     chmod 4755 "$protected_engine/setuid-probe"
-    assert_equal "$(ov_as_user "$protected_mount/setuid-probe" -u)" "$OV_UID"
+    assert_equal "$(stat -c '%u:%a' "$protected_engine/setuid-probe")" 0:4755
+    assert_equal "$(ov_as_user "$protected_mount/setuid-probe")" "$OV_UID:$OV_UID"
     mknod "$protected_engine/device-probe" c 1 3
     chmod 0666 "$protected_engine/device-probe"
     assert_fails ov_as_user head -c 1 "$protected_mount/device-probe"
