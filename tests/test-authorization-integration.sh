@@ -173,6 +173,10 @@ systemctl reload dbus.service
 systemctl start octovault.service
 gdbus introspect --system --dest io.vdm.OctoVault1 --object-path /io/vdm/OctoVault1 >/dev/null
 step 'starting a real local user login session'
+[[ $(loginctl show-seat seat0 --property=CanTTY --value) == no ]] || {
+    printf 'This fixture requires the disposable runner\047s non-VT container seat.\n' >&2
+    exit 2
+}
 start_client "$ordinary"
 start_client "$other"
 activate_client "$ordinary"

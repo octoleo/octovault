@@ -33,7 +33,10 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-
     pinentry-gnome3 rsync lsof ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 STOPSIGNAL SIGRTMIN+3
-CMD ["/sbin/init"]
+# --privileged exposes host virtual-console device nodes in Docker's private
+# /dev. Remove this one node before logind starts so its real container seat
+# has no VTs; the test must never switch the hosted runner's virtual consoles.
+CMD ["/bin/sh", "-c", "rm -f /dev/tty0; exec /sbin/init"]
 DOCKERFILE
 docker build --tag "$image" "$context"
 # This writable cgroup mount belongs to the disposable hosted runner. It lets
