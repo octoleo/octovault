@@ -3,6 +3,7 @@ octovault (1.2.0) unstable; urgency=medium
   * Add management sessions bound to the caller and active local login session.
   * Let administrators grant and revoke personal access for local accounts.
   * Run personal backups and restores with the owner's filesystem permissions.
+  * Preserve owner-identity workers with systemd 259 service hardening enabled.
   * Preserve execution scope for existing records and scheduled operations.
   * End authorization on lock, disconnect, expiry, and access-policy changes.
   * Keep recovery disclosure separately authenticated and vault mounts restricted.
