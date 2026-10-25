@@ -226,6 +226,8 @@ check ".response.ok and .challenges == $prompts"
 [[ ! -e /var/lib/octovault/users/$(id -u "$administrator")/destinations/$system_destination.json ]]
 
 step 'authorizing an application launched by the real systemd user manager'
+query "$ordinary" '{"test":"manager-cli","arguments":["--json","access","status"]}'
+check ".response.ok and .response.data.available and .response.data.can_request_system and (.response.data.authorized|not) and .challenges == $prompts"
 query "$ordinary" "$(jq -cn --arg path "/home/$ordinary/backups" '{test:"manager-cli",arguments:["--json","destination","save","--name","User manager application","--type","local","--path",$path]}')"
 check ".response.ok and .challenges == ($prompts + 1)"
 prompts=$(jq -r .challenges <<< "$last")
