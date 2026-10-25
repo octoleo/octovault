@@ -7,7 +7,9 @@ After=dbus.service
 Type=dbus
 BusName=io.vdm.OctoVault1
 ExecStart=/usr/libexec/octovault/daemon
-User=root
+# System services already default to root. Explicit User=root makes systemd
+# 259's seccomp setup drop CAP_SETUID; NoNewPrivileges then prevents restoring
+# it at exec. Workers need this capability to drop to the vault owner's UID.
 Group=root
 UMask=0077
 LimitCORE=0
