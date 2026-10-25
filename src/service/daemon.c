@@ -28,9 +28,9 @@
 
 typedef struct {
     gchar *id, *op, *request, *state, *stage, *message;
-    gchar *sender, *scope, *session_path;
+    gchar *sender, *scope, *session_path, *display_user_path;
     guint32 uid;
-    guint64 policy_revision, sender_revision, session_revision;
+    guint64 policy_revision, sender_revision, session_revision, display_revision;
     gint percent;
     gint64 created, created_at, finished, expires;
     GSubprocess *process;
@@ -46,12 +46,14 @@ typedef struct {
     GDBusMethodInvocation *invocation;
     gchar *sender, *request, *op, *id, *method;
     gchar *scope, *session_path, *session_id, *auth_session_path, *auth_action, *availability_reason;
+    gchar *display_user_path, *display_session_id;
     guint32 uid;
     guint32 pid;
     guint duration;
-    guint64 policy_revision, sender_revision, session_revision, transition_revision;
+    guint64 policy_revision, sender_revision, session_revision, display_revision, transition_revision;
     JsonNode *immediate_result;
-    gboolean session_active, session_remote, auth_completed, requires_session, one_shot, can_request_system;
+    gboolean session_active, session_remote, session_user_class, auth_completed, requires_session, one_shot, can_request_system;
+    gboolean session_manager_class, resolving_display;
     gboolean counted;
 } Pending;
 
@@ -87,6 +89,7 @@ static void pending_free(Pending *p)
     wipe(p->request);
     g_free(p->scope); g_free(p->session_path); g_free(p->session_id); g_free(p->auth_session_path);
     g_free(p->auth_action); g_free(p->availability_reason);
+    g_free(p->display_user_path); g_free(p->display_session_id);
     if (p->immediate_result) json_node_unref(p->immediate_result);
     g_free(p->request); g_free(p->sender); g_free(p->op); g_free(p->id); g_free(p->method); g_free(p);
 }
@@ -99,7 +102,7 @@ static void job_free(gpointer pointer)
     if (j->output) { wipe(j->output->str); g_string_free(j->output, TRUE); }
     if (j->errors) { wipe(j->errors->str); g_string_free(j->errors, TRUE); }
     if (j->result) json_node_unref(j->result);
-    g_free(j->sender); g_free(j->scope); g_free(j->session_path);
+    g_free(j->sender); g_free(j->scope); g_free(j->session_path); g_free(j->display_user_path);
     g_clear_object(&j->process);
     g_free(j->id); g_free(j->op); g_free(j->state); g_free(j->stage); g_free(j->message); g_free(j);
 }
@@ -376,6 +379,7 @@ static void submit_authorized(Pending *p)
     j->id = g_uuid_string_random(); j->uid = p->uid; j->op = g_strdup(p->op);
     j->sender = g_strdup(p->sender); j->scope = g_strdup(p->scope ? p->scope : "personal");
     j->session_path = g_strdup(p->session_path); j->requires_session = p->requires_session;
+    j->display_user_path = g_strdup(p->display_user_path); j->display_revision = p->display_revision;
     j->one_shot = p->one_shot;
     j->policy_revision = p->policy_revision; j->sender_revision = p->sender_revision; j->session_revision = p->session_revision;
     j->request = g_steal_pointer(&p->request); j->state = g_strdup("queued");

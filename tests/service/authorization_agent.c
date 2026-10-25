@@ -201,9 +201,12 @@ static JsonNode *cli_request(JsonObject *command)
 {
     JsonArray *arguments = json_object_get_array_member(command, "arguments");
     guint count = json_array_get_length(arguments);
-    gchar **argv = g_new0(gchar *, count + 2);
-    argv[0] = g_strdup("/usr/bin/octovault");
-    for (guint i = 0; i < count; i++) argv[i + 1] = g_strdup(json_array_get_string_element(arguments, i));
+    gboolean manager = !g_strcmp0(json_object_get_string_member(command, "test"), "manager-cli");
+    const gchar *manager_prefix[] = { "/usr/bin/systemd-run", "--user", "--quiet", "--wait", "--pipe", "--collect", "/usr/bin/octovault" };
+    guint prefix = manager ? G_N_ELEMENTS(manager_prefix) : 1;
+    gchar **argv = g_new0(gchar *, count + prefix + 1);
+    for (guint i = 0; i < prefix; i++) argv[i] = g_strdup(manager ? manager_prefix[i] : "/usr/bin/octovault");
+    for (guint i = 0; i < count; i++) argv[i + prefix] = g_strdup(json_array_get_string_element(arguments, i));
     gchar *stdout_data = NULL, *stderr_data = NULL;
     gint status;
     GError *error = NULL;
@@ -302,7 +305,7 @@ int main(int argc, char **argv)
             output(agent, json_node_copy(json_parser_get_root(parser)));
         } else if (control && !strcmp(control, "set-locked")) {
             output(agent, set_locked(bus, json_object_get_boolean_member(command, "value")));
-        } else if (control && !strcmp(control, "cli")) {
+        } else if (control && (!strcmp(control, "cli") || !strcmp(control, "manager-cli"))) {
             output(agent, cli_request(command));
         } else {
             output(agent, request(bus, line));

@@ -5,15 +5,15 @@
 
 typedef struct {
     guint32 uid;
-    gchar *scope, *session_path, *session_id;
+    gchar *scope, *session_path, *session_id, *display_user_path;
     gint64 expires, expires_at;
-    guint64 policy_revision, sender_revision, session_revision;
+    guint64 policy_revision, sender_revision, session_revision, display_revision;
 } AccessLease;
 static GHashTable *access_leases, *access_sender_revisions, *access_session_revisions;
 static guint64 access_policy_revision = 1;
 static guint64 access_transition_revision;
 static GFileMonitor *access_monitor;
-static guint access_subscriptions[5];
+static guint access_subscriptions[6];
 static const gchar *access_managed_operations[] = {
     "vault.create", "vault.import", "vault.open", "vault.close", "vault.update", "vault.resize",
     "vault.passwd", "vault.setkey", "vault.key-export", "vault.index", "vault.search", "vault.remove",
@@ -36,7 +36,7 @@ static gboolean access_contains(const gchar *op, const gchar *const *list)
 static void access_lease_free(gpointer data)
 {
     AccessLease *lease = data;
-    g_free(lease->scope); g_free(lease->session_path); g_free(lease->session_id); g_free(lease);
+    g_free(lease->scope); g_free(lease->session_path); g_free(lease->session_id); g_free(lease->display_user_path); g_free(lease);
 }
 static void access_runtime_init(void)
 {
@@ -64,7 +64,8 @@ static AccessLease *access_lease_for(const gchar *sender, guint32 uid)
     if (!lease || lease->uid != uid || lease->expires <= g_get_monotonic_time() ||
         lease->policy_revision != access_policy_revision ||
         lease->sender_revision != access_revision(access_sender_revisions, sender) ||
-        lease->session_revision != access_revision(access_session_revisions, lease->session_path)) return NULL;
+        lease->session_revision != access_revision(access_session_revisions, lease->session_path) ||
+        lease->display_revision != access_revision(access_session_revisions, lease->display_user_path)) return NULL;
     GError *error = NULL;
     JsonObject *store = access_store_load(&error);
     gboolean entitled = store && (g_str_equal(lease->scope, "system") || access_store_granted(store, uid));
@@ -77,13 +78,15 @@ static gboolean access_job_valid(Job *j)
     if (j->auth_invalidated && (j->requires_session || j->one_shot)) return FALSE;
     if (j->one_shot) return j->policy_revision == access_policy_revision &&
         j->sender_revision == access_revision(access_sender_revisions, j->sender) &&
-        j->session_revision == access_revision(access_session_revisions, j->session_path);
+        j->session_revision == access_revision(access_session_revisions, j->session_path) &&
+        j->display_revision == access_revision(access_session_revisions, j->display_user_path);
     if (!j->requires_session) return TRUE;
     AccessLease *lease = access_lease_for(j->sender, j->uid);
     return lease && g_str_equal(lease->scope, j->scope) && !g_strcmp0(lease->session_path, j->session_path) &&
         j->policy_revision == access_policy_revision &&
         j->sender_revision == access_revision(access_sender_revisions, j->sender) &&
-        j->session_revision == access_revision(access_session_revisions, j->session_path);
+        j->session_revision == access_revision(access_session_revisions, j->session_path) &&
+        j->display_revision == access_revision(access_session_revisions, j->display_user_path);
 }
 static gboolean access_result_visible(Job *j, Pending *p)
 {
@@ -127,12 +130,15 @@ static void access_revoke_session(const gchar *path)
     if (g_hash_table_contains(access_session_revisions, path)) access_bump(access_session_revisions, path);
     GHashTableIter iter; gpointer value;
     g_hash_table_iter_init(&iter, access_leases);
-    while (g_hash_table_iter_next(&iter, NULL, &value))
-        if (!g_strcmp0(((AccessLease *)value)->session_path, path)) g_hash_table_iter_remove(&iter);
+    while (g_hash_table_iter_next(&iter, NULL, &value)) {
+        AccessLease *lease = value;
+        if (!g_strcmp0(lease->session_path, path) || !g_strcmp0(lease->display_user_path, path)) g_hash_table_iter_remove(&iter);
+    }
     if (jobs) {
         g_hash_table_iter_init(&iter, jobs);
         while (g_hash_table_iter_next(&iter, NULL, &value)) {
-            Job *j = value; if (!g_strcmp0(j->session_path, path)) j->auth_invalidated = TRUE;
+            Job *j = value;
+            if (!g_strcmp0(j->session_path, path) || !g_strcmp0(j->display_user_path, path)) j->auth_invalidated = TRUE;
         }
     }
     access_clear_recovery();
@@ -176,6 +182,8 @@ static gboolean access_pending_current(Pending *p)
     return g_hash_table_contains(access_sender_revisions, p->sender) &&
         p->transition_revision == access_transition_revision && p->policy_revision == access_policy_revision &&
         p->sender_revision == access_revision(access_sender_revisions, p->sender) &&
+        (!p->display_user_path || (g_hash_table_contains(access_session_revisions, p->display_user_path) &&
+         p->display_revision == access_revision(access_session_revisions, p->display_user_path))) &&
         (!p->auth_session_path || (g_hash_table_contains(access_session_revisions, p->auth_session_path) &&
          p->session_revision == access_revision(access_session_revisions, p->auth_session_path)));
 }
@@ -304,34 +312,153 @@ static gboolean access_closing_event(Pending *p)
 }
 static gboolean access_session_properties(Pending *p, GVariant *properties)
 {
+    p->session_active = FALSE;
     GVariant *user = g_variant_lookup_value(properties, "User", G_VARIANT_TYPE("(uo)"));
-    const gchar *id = NULL, *state = NULL; gboolean active = FALSE, locked = TRUE; guint32 uid = G_MAXUINT32;
+    const gchar *id = NULL, *state = NULL, *session_class = NULL;
+    gboolean active = FALSE, locked = TRUE; guint32 uid = G_MAXUINT32;
     if (user) { const gchar *path; g_variant_get(user, "(u&o)", &uid, &path); g_variant_unref(user); }
     gboolean valid = uid == p->uid && g_variant_lookup(properties, "Id", "&s", &id) && id && *id &&
         g_variant_lookup(properties, "Active", "b", &active) &&
         g_variant_lookup(properties, "LockedHint", "b", &locked) &&
         g_variant_lookup(properties, "State", "&s", &state) &&
-        g_variant_lookup(properties, "Remote", "b", &p->session_remote);
+        g_variant_lookup(properties, "Remote", "b", &p->session_remote) &&
+        g_variant_lookup(properties, "Class", "&s", &session_class);
+    /* A lingering user manager is active even after its desktop logs out.
+     * Only genuine user login classes can hold reusable authorization. */
+    p->session_user_class = session_class && (!strcmp(session_class, "user") ||
+        !strcmp(session_class, "user-early") || !strcmp(session_class, "user-light"));
+    p->session_manager_class = session_class && (!strcmp(session_class, "manager") || !strcmp(session_class, "manager-early"));
     gboolean closing_event = valid && access_closing_event(p);
     if (!valid || ((!active || locked || strcmp(state, "active")) && !closing_event)) return FALSE;
     g_free(p->session_id); p->session_id = g_strdup(id); p->session_active = TRUE;
     return TRUE;
 }
+static gboolean access_session_reusable(Pending *p)
+{
+    return p->session_active && !p->session_remote && p->session_user_class;
+}
+static gboolean access_can_resolve_display(Pending *p)
+{
+    return p->session_active && p->session_manager_class && !p->session_remote && !p->resolving_display;
+}
+static void access_resolve_display(Pending *p);
 static void access_properties_done(GObject *bus, GAsyncResult *result, gpointer user_data)
 {
     Pending *p = user_data;
     GVariant *reply = g_dbus_connection_call_finish(G_DBUS_CONNECTION(bus), result, NULL), *properties = NULL;
     gboolean valid = FALSE;
     if (reply) { g_variant_get(reply, "(@a{sv})", &properties); valid = access_session_properties(p, properties); g_variant_unref(properties); g_variant_unref(reply); }
-    if (!valid) { access_session_failed(p, "OctoVault authorization requires your active, unlocked login session."); return; }
+    if (!valid) {
+        if (p->resolving_display && access_closing_event(p)) { access_session_ready(p); return; }
+        access_session_failed(p, "OctoVault authorization requires your active, unlocked login session."); return;
+    }
     /* Saved-policy closing events remain useful when the very lock/sleep
      * transition they report invalidates in-flight authorization requests. */
-    if ((!access_pending_current(p) && !access_closing_event(p)) ||
-        (p->auth_session_path && g_strcmp0(p->auth_session_path, p->session_path))) {
+    if (!access_pending_current(p) && !access_closing_event(p)) {
         access_error(p, "AUTH_REVOKED", "Your login session changed during authentication. Unlock OctoVault again."); return;
     }
-    if (p->session_remote) { access_one_shot(p); return; }
+    if (access_can_resolve_display(p)) { access_resolve_display(p); return; }
+    if ((p->auth_session_path && g_strcmp0(p->auth_session_path, p->session_path)) ||
+        (p->resolving_display && (g_strcmp0(p->display_session_id, p->session_id) || !access_session_reusable(p)))) {
+        access_session_failed(p, "The application's primary login session is no longer available. Unlock OctoVault again from your active desktop."); return;
+    }
+    if (!access_session_reusable(p)) { access_one_shot(p); return; }
     access_session_ready(p);
+}
+static void access_load_session_properties(Pending *p, const gchar *path)
+{
+    g_free(p->session_path); p->session_path = g_strdup(path);
+    if (!g_hash_table_contains(access_session_revisions, path))
+        g_hash_table_insert(access_session_revisions, g_strdup(path), g_new0(guint64, 1));
+    /* Resolve a provisional manager path before authentication, then keep
+     * the actual login session and its revision fixed across authentication. */
+    if (!p->auth_session_path || (!p->auth_action && !p->auth_completed)) {
+        g_free(p->auth_session_path); p->auth_session_path = g_strdup(path);
+        p->session_revision = access_revision(access_session_revisions, path);
+    }
+    g_dbus_connection_call(connection, "org.freedesktop.login1", path, "org.freedesktop.DBus.Properties", "GetAll",
+        g_variant_new("(s)", "org.freedesktop.login1.Session"), G_VARIANT_TYPE("(a{sv})"), G_DBUS_CALL_FLAGS_NONE,
+        5000, NULL, access_properties_done, p);
+}
+static gboolean access_display_properties(Pending *p, GVariant *properties, gchar **session, gchar **id)
+{
+    guint32 uid;
+    if (!g_variant_lookup(properties, "UID", "u", &uid) || uid != p->uid) return FALSE;
+    GVariant *display = g_variant_lookup_value(properties, "Display", G_VARIANT_TYPE("(so)"));
+    if (!display) return FALSE;
+    const gchar *display_id, *display_path;
+    g_variant_get(display, "(&s&o)", &display_id, &display_path);
+    gboolean valid = *display_id && g_str_has_prefix(display_path, "/org/freedesktop/login1/session/");
+    if (valid) { *session = g_strdup(display_path); *id = g_strdup(display_id); }
+    g_variant_unref(display); return valid;
+}
+static void access_display_unavailable(Pending *p)
+{
+    if (p->auth_completed && p->display_session_id) {
+        access_session_failed(p, "The primary desktop session ended during authentication."); return;
+    }
+    access_one_shot(p);
+}
+static void access_display_properties_done(GObject *bus, GAsyncResult *result, gpointer user_data)
+{
+    Pending *p = user_data;
+    GVariant *reply = g_dbus_connection_call_finish(G_DBUS_CONNECTION(bus), result, NULL), *properties = NULL;
+    gchar *session = NULL, *id = NULL; gboolean valid = FALSE, owner_verified = FALSE;
+    if (reply) {
+        guint32 uid;
+        g_variant_get(reply, "(@a{sv})", &properties);
+        owner_verified = g_variant_lookup(properties, "UID", "u", &uid) && uid == p->uid;
+        valid = access_display_properties(p, properties, &session, &id);
+        g_variant_unref(properties); g_variant_unref(reply);
+    }
+    if (!owner_verified) { access_session_failed(p, "The application's logind user identity could not be verified."); return; }
+    if (!access_pending_current(p) && !access_closing_event(p)) {
+        g_free(session); g_free(id); access_error(p, "AUTH_REVOKED", "Your primary desktop session changed while the request was pending."); return;
+    }
+    /* The desktop observer is a user service. Its saved-policy logout close
+     * remains safe after logind clears Display, without granting a lease. */
+    if (!valid && owner_verified && access_closing_event(p) && !p->session_remote) { access_session_ready(p); return; }
+    if (!valid) { access_display_unavailable(p); return; }
+    if (p->auth_action && p->display_session_id && strcmp(p->display_session_id, id)) {
+        g_free(session); g_free(id); access_error(p, "AUTH_REVOKED", "Your primary desktop session changed during authentication."); return;
+    }
+    g_free(p->display_session_id); p->display_session_id = id; p->resolving_display = TRUE;
+    access_load_session_properties(p, session); g_free(session);
+}
+static void access_display_user_done(GObject *bus, GAsyncResult *result, gpointer user_data)
+{
+    Pending *p = user_data;
+    GError *error = NULL;
+    GVariant *reply = g_dbus_connection_call_finish(G_DBUS_CONNECTION(bus), result, &error);
+    if (!reply) {
+        gchar *remote = error ? g_dbus_error_get_remote_error(error) : NULL;
+        gboolean no_owner = remote && g_str_has_suffix(remote, ".NoUserForPID");
+        g_free(remote); g_clear_error(&error);
+        if (no_owner) access_display_unavailable(p);
+        else access_session_failed(p, "The application's logind user identity is unavailable.");
+        return;
+    }
+    const gchar *path; g_variant_get(reply, "(&o)", &path);
+    if (p->display_user_path && strcmp(p->display_user_path, path)) {
+        g_variant_unref(reply); access_error(p, "AUTH_REVOKED", "The login owner changed during authentication."); return;
+    }
+    if (!p->display_user_path) {
+        p->display_user_path = g_strdup(path);
+        if (!g_hash_table_contains(access_session_revisions, path))
+            g_hash_table_insert(access_session_revisions, g_strdup(path), g_new0(guint64, 1));
+        p->display_revision = access_revision(access_session_revisions, path);
+    }
+    g_dbus_connection_call(connection, "org.freedesktop.login1", path, "org.freedesktop.DBus.Properties", "GetAll",
+        g_variant_new("(s)", "org.freedesktop.login1.User"), G_VARIANT_TYPE("(a{sv})"), G_DBUS_CALL_FLAGS_NONE,
+        5000, NULL, access_display_properties_done, p);
+    g_variant_unref(reply);
+}
+static void access_resolve_display(Pending *p)
+{
+    /* Verify ownership of the caller's systemd user scope before consulting
+     * its primary display. Direct remote sessions never take this path. */
+    g_dbus_connection_call(connection, "org.freedesktop.login1", "/org/freedesktop/login1", "org.freedesktop.login1.Manager", "GetUserByPID",
+        g_variant_new("(u)", p->pid), G_VARIANT_TYPE("(o)"), G_DBUS_CALL_FLAGS_NONE, 5000, NULL, access_display_user_done, p);
 }
 static void access_session_path_done(GObject *bus, GAsyncResult *result, gpointer user_data)
 {
@@ -342,21 +469,12 @@ static void access_session_path_done(GObject *bus, GAsyncResult *result, gpointe
         gchar *remote = error ? g_dbus_error_get_remote_error(error) : NULL;
         gboolean no_session = remote && g_str_has_suffix(remote, ".NoSessionForPID");
         g_free(remote); g_clear_error(&error);
-        if (no_session && access_contains(p->op, access_managed_operations)) access_one_shot(p);
+        if (no_session) access_resolve_display(p);
         else access_session_failed(p, "The calling application is not attached to a login session recognized by logind.");
         return;
     }
     const gchar *path; g_variant_get(reply, "(&o)", &path);
-    g_free(p->session_path); p->session_path = g_strdup(path); g_variant_unref(reply);
-    if (!p->auth_session_path) {
-        p->auth_session_path = g_strdup(p->session_path);
-        if (!g_hash_table_contains(access_session_revisions, p->session_path))
-            g_hash_table_insert(access_session_revisions, g_strdup(p->session_path), g_new0(guint64, 1));
-        p->session_revision = access_revision(access_session_revisions, p->session_path);
-    }
-    g_dbus_connection_call(connection, "org.freedesktop.login1", p->session_path, "org.freedesktop.DBus.Properties", "GetAll",
-        g_variant_new("(s)", "org.freedesktop.login1.Session"), G_VARIANT_TYPE("(a{sv})"), G_DBUS_CALL_FLAGS_NONE,
-        5000, NULL, access_properties_done, p);
+    access_load_session_properties(p, path); g_variant_unref(reply);
 }
 static void access_pid_done(GObject *bus, GAsyncResult *result, gpointer user_data)
 {
@@ -369,6 +487,7 @@ static void access_pid_done(GObject *bus, GAsyncResult *result, gpointer user_da
 }
 static void access_resolve_session(Pending *p)
 {
+    p->resolving_display = FALSE;
     g_dbus_connection_call(connection, "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "GetConnectionUnixProcessID",
         g_variant_new("(s)", p->sender), G_VARIANT_TYPE("(u)"), G_DBUS_CALL_FLAGS_NONE, 5000, NULL, access_pid_done, p);
 }
@@ -384,6 +503,7 @@ static void access_create_lease(Pending *p, const gchar *scope)
     lease->policy_revision = access_policy_revision;
     lease->sender_revision = access_revision(access_sender_revisions, p->sender);
     lease->session_revision = access_revision(access_session_revisions, p->session_path);
+    lease->display_user_path = g_strdup(p->display_user_path); lease->display_revision = p->display_revision;
     g_hash_table_replace(access_leases, g_strdup(p->sender), lease);
 }
 
@@ -399,6 +519,8 @@ static void access_require_lease(Pending *p)
     }
     g_free(p->scope); p->scope = g_strdup(lease->scope); p->requires_session = TRUE;
     p->policy_revision = lease->policy_revision; p->sender_revision = lease->sender_revision; p->session_revision = lease->session_revision;
+    g_free(p->display_user_path); p->display_user_path = g_strdup(lease->display_user_path);
+    p->display_revision = lease->display_revision;
     if (!strcmp(p->op, "repository.recovery") && !strcmp(p->scope, "personal")) {
         JsonObject *params = access_params(p);
         gboolean allowed = access_personal_recovery_allowed(p->uid, access_string(params, "id"));
@@ -518,6 +640,10 @@ static void access_signal(GDBusConnection *bus, const gchar *sender, const gchar
         const gchar *id, *session; g_variant_get(parameters, "(&s&o)", &id, &session); access_revoke_session(session);
         g_hash_table_remove(access_session_revisions, session); return;
     }
+    if (!strcmp(signal, "UserRemoved")) {
+        guint32 uid; const gchar *user_path; g_variant_get(parameters, "(u&o)", &uid, &user_path);
+        access_revoke_session(user_path); g_hash_table_remove(access_session_revisions, user_path); return;
+    }
     if (!strcmp(signal, "PrepareForSleep") || !strcmp(signal, "PrepareForShutdown")) {
         gboolean preparing; g_variant_get(parameters, "(b)", &preparing); if (preparing) access_revoke_all(); return;
     }
@@ -530,14 +656,26 @@ static void access_signal(GDBusConnection *bus, const gchar *sender, const gchar
             if (g_variant_lookup(changed, "Active", "b", &active) && !active) revoke = TRUE;
             if (g_variant_lookup(changed, "LockedHint", "b", &locked) && locked) revoke = TRUE;
             if (g_variant_lookup(changed, "State", "&s", &state) && strcmp(state, "active")) revoke = TRUE;
-            const gchar *identity_keys[] = { "User", "Id", "Remote", NULL };
+            const gchar *identity_keys[] = { "User", "Id", "Remote", "Class", NULL };
             for (guint i = 0; identity_keys[i]; i++) {
                 GVariant *value = g_variant_lookup_value(changed, identity_keys[i], NULL);
                 if (value) { revoke = TRUE; g_variant_unref(value); }
             }
             GVariantIter iter; const gchar *key; g_variant_iter_init(&iter, invalidated);
             while (g_variant_iter_next(&iter, "&s", &key))
-                if (!strcmp(key, "Active") || !strcmp(key, "LockedHint") || !strcmp(key, "State") || !strcmp(key, "User") || !strcmp(key, "Id") || !strcmp(key, "Remote")) revoke = TRUE;
+                if (!strcmp(key, "Active") || !strcmp(key, "LockedHint") || !strcmp(key, "State") || !strcmp(key, "User") || !strcmp(key, "Id") || !strcmp(key, "Remote") || !strcmp(key, "Class")) revoke = TRUE;
+            if (revoke) access_revoke_session(path);
+        }
+        if (!strcmp(changed_interface, "org.freedesktop.login1.User")) {
+            gboolean revoke = FALSE;
+            const gchar *keys[] = { "UID", "Display", NULL };
+            for (guint i = 0; keys[i]; i++) {
+                GVariant *value = g_variant_lookup_value(changed, keys[i], NULL);
+                if (value) { revoke = TRUE; g_variant_unref(value); }
+            }
+            GVariantIter iter; const gchar *key; g_variant_iter_init(&iter, invalidated);
+            while (g_variant_iter_next(&iter, "&s", &key))
+                if (!strcmp(key, "UID") || !strcmp(key, "Display")) revoke = TRUE;
             if (revoke) access_revoke_session(path);
         }
         g_variant_unref(changed); g_variant_unref(invalidated);
@@ -563,6 +701,8 @@ static void access_initialize(void)
         "Lock", NULL, NULL, G_DBUS_SIGNAL_FLAGS_NONE, access_signal, NULL, NULL);
     access_subscriptions[4] = g_dbus_connection_signal_subscribe(connection, "org.freedesktop.PolicyKit1", "org.freedesktop.PolicyKit1.Authority",
         "Changed", "/org/freedesktop/PolicyKit1/Authority", NULL, G_DBUS_SIGNAL_FLAGS_NONE, access_signal, NULL, NULL);
+    access_subscriptions[5] = g_dbus_connection_signal_subscribe(connection, "org.freedesktop.login1", "org.freedesktop.DBus.Properties",
+        "PropertiesChanged", NULL, "org.freedesktop.login1.User", G_DBUS_SIGNAL_FLAGS_NONE, access_signal, NULL, NULL);
     gchar *directory = g_path_get_dirname(OV_ACCESS_PATH); GFile *parent = g_file_new_for_path(directory);
     access_monitor = g_file_monitor_directory(parent, G_FILE_MONITOR_WATCH_MOVES, NULL, NULL);
     if (access_monitor) g_signal_connect(access_monitor, "changed", G_CALLBACK(access_policy_changed), NULL);

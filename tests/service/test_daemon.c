@@ -112,6 +112,7 @@ static Job *access_test_job(Pending *p, const gchar *op)
     j->sender = g_strdup(p->sender); j->session_path = g_strdup(p->session_path); j->scope = g_strdup(lease->scope);
     j->requires_session = TRUE; j->policy_revision = lease->policy_revision;
     j->sender_revision = lease->sender_revision; j->session_revision = lease->session_revision;
+    j->display_user_path = g_strdup(lease->display_user_path); j->display_revision = lease->display_revision;
     g_hash_table_insert(jobs, j->id, j); return j;
 }
 static GVariant *session_properties(guint32 uid, gboolean active, gboolean locked, gboolean remote)
@@ -120,6 +121,7 @@ static GVariant *session_properties(guint32 uid, gboolean active, gboolean locke
     g_variant_builder_add(&b, "{sv}", "User", g_variant_new("(uo)", uid, "/org/freedesktop/login1/user/_1000"));
     g_variant_builder_add(&b, "{sv}", "Id", g_variant_new_string("c1"));
     g_variant_builder_add(&b, "{sv}", "State", g_variant_new_string(active ? "active" : "closing"));
+    g_variant_builder_add(&b, "{sv}", "Class", g_variant_new_string("user"));
     g_variant_builder_add(&b, "{sv}", "Active", g_variant_new_boolean(active));
     g_variant_builder_add(&b, "{sv}", "LockedHint", g_variant_new_boolean(locked));
     g_variant_builder_add(&b, "{sv}", "Remote", g_variant_new_boolean(remote));
@@ -145,6 +147,100 @@ static void session_binding_and_safety_events(void)
     p.request = "{\"params\":{\"event\":\"logout\"}}";
     g_assert_false(access_session_properties(&p, props)); g_variant_unref(props);
     g_free(p.session_id);
+}
+static void genuine_user_session_classes(void)
+{
+    reset_access();
+    const gchar *classes[] = { "user", "user-early", "user-light", "manager", "manager-early", "background", "background-light", "greeter", "lock-screen", "unknown", NULL };
+    for (guint i = 0; i < G_N_ELEMENTS(classes); i++) {
+        Pending p = { .uid = 1000, .op = "access.unlock" };
+        GVariant *base = session_properties(1000, TRUE, FALSE, FALSE);
+        GVariantDict dictionary; g_variant_dict_init(&dictionary, base);
+        if (classes[i]) g_variant_dict_insert(&dictionary, "Class", "s", classes[i]);
+        else g_variant_dict_remove(&dictionary, "Class");
+        GVariant *properties = g_variant_ref_sink(g_variant_dict_end(&dictionary));
+        gboolean valid = access_session_properties(&p, properties);
+        g_assert_cmpint(valid, ==, classes[i] != NULL);
+        g_assert_cmpint(access_session_reusable(&p), ==, i < 3);
+        g_variant_unref(properties); g_variant_unref(base); g_free(p.session_id);
+    }
+    Pending p = access_pending(":1.1");
+    GVariantBuilder changed, invalidated;
+    g_variant_builder_init(&changed, G_VARIANT_TYPE("a{sv}"));
+    g_variant_builder_add(&changed, "{sv}", "Class", g_variant_new_string("manager"));
+    g_variant_builder_init(&invalidated, G_VARIANT_TYPE("as"));
+    GVariant *signal = g_variant_ref_sink(g_variant_new("(s@a{sv}@as)", "org.freedesktop.login1.Session",
+        g_variant_builder_end(&changed), g_variant_builder_end(&invalidated)));
+    access_signal(NULL, NULL, p.session_path, "org.freedesktop.DBus.Properties", "PropertiesChanged", signal, NULL);
+    g_variant_unref(signal); g_assert_false(access_pending_current(&p));
+    p = access_pending(":1.1");
+    g_variant_builder_init(&changed, G_VARIANT_TYPE("a{sv}"));
+    g_variant_builder_init(&invalidated, G_VARIANT_TYPE("as"));
+    g_variant_builder_add(&invalidated, "s", "Class");
+    signal = g_variant_ref_sink(g_variant_new("(s@a{sv}@as)", "org.freedesktop.login1.Session",
+        g_variant_builder_end(&changed), g_variant_builder_end(&invalidated)));
+    access_signal(NULL, NULL, p.session_path, "org.freedesktop.DBus.Properties", "PropertiesChanged", signal, NULL);
+    g_variant_unref(signal); g_assert_false(access_pending_current(&p));
+}
+static void user_manager_display_mapping(void)
+{
+    reset_access();
+    Pending p = { .uid = 1000, .op = "access.unlock", .session_active = TRUE, .session_manager_class = TRUE };
+    g_assert_true(access_can_resolve_display(&p));
+    p.session_remote = TRUE; g_assert_false(access_can_resolve_display(&p));
+    p.session_remote = FALSE; p.resolving_display = TRUE; g_assert_false(access_can_resolve_display(&p));
+    p.resolving_display = FALSE; p.session_manager_class = FALSE; g_assert_false(access_can_resolve_display(&p));
+    const gchar *path = "/org/freedesktop/login1/session/c1";
+    for (guint i = 0; i < 3; i++) {
+        GVariantBuilder builder; g_variant_builder_init(&builder, G_VARIANT_TYPE("a{sv}"));
+        g_variant_builder_add(&builder, "{sv}", "UID", g_variant_new_uint32(i == 1 ? 1001 : 1000));
+        g_variant_builder_add(&builder, "{sv}", "Display", g_variant_new("(so)", i == 2 ? "" : "c1", i == 2 ? "/" : path));
+        GVariant *props = g_variant_ref_sink(g_variant_builder_end(&builder));
+        gchar *session = NULL, *id = NULL;
+        g_assert_cmpint(access_display_properties(&p, props, &session, &id), ==, i == 0);
+        if (i == 0) { g_assert_cmpstr(session, ==, path); g_assert_cmpstr(id, ==, "c1"); }
+        else { g_assert_null(session); g_assert_null(id); }
+        g_free(session); g_free(id); g_variant_unref(props);
+    }
+    /* Resolving a display never relaxes checks on the actual target session. */
+    p.resolving_display = TRUE;
+    GVariant *props = session_properties(1000, TRUE, FALSE, FALSE);
+    g_assert_true(access_session_properties(&p, props)); g_assert_true(access_session_reusable(&p)); g_variant_unref(props);
+    props = session_properties(1000, TRUE, FALSE, TRUE);
+    g_assert_true(access_session_properties(&p, props)); g_assert_false(access_session_reusable(&p)); g_variant_unref(props);
+    props = session_properties(1000, TRUE, TRUE, FALSE);
+    g_assert_false(access_session_properties(&p, props)); g_variant_unref(props);
+    props = session_properties(1001, TRUE, FALSE, FALSE);
+    g_assert_false(access_session_properties(&p, props)); g_variant_unref(props); g_free(p.session_id);
+}
+static void display_lease_revocation(void)
+{
+    reset_access(); if (!prepare_policy()) return;
+    Pending p = access_pending(":1.1");
+    const gchar *user = "/org/freedesktop/login1/user/_1000";
+    p.display_user_path = (gchar *)user;
+    g_hash_table_insert(access_session_revisions, g_strdup(user), g_new0(guint64, 1));
+    access_create_lease(&p, "personal"); Job *j = access_test_job(&p, "repository.recovery");
+    g_assert_true(access_job_valid(j));
+    /* A manager lease is revoked by the real desktop's lock. */
+    access_revoke_session(p.session_path); g_assert_false(access_job_valid(j));
+    p = access_pending(":1.1"); p.display_user_path = (gchar *)user;
+    access_create_lease(&p, "personal"); j = access_test_job(&p, "repository.recovery");
+    GVariantBuilder changed, invalidated;
+    g_variant_builder_init(&changed, G_VARIANT_TYPE("a{sv}"));
+    g_variant_builder_add(&changed, "{sv}", "Display", g_variant_new("(so)", "", "/"));
+    g_variant_builder_init(&invalidated, G_VARIANT_TYPE("as"));
+    GVariant *signal = g_variant_ref_sink(g_variant_new("(s@a{sv}@as)", "org.freedesktop.login1.User",
+        g_variant_builder_end(&changed), g_variant_builder_end(&invalidated)));
+    access_signal(NULL, NULL, user, "org.freedesktop.DBus.Properties", "PropertiesChanged", signal, NULL);
+    g_variant_unref(signal);
+    g_assert_null(access_lease_for(p.sender, p.uid)); g_assert_false(access_job_valid(j));
+    g_assert_false(access_pending_current(&p));
+    /* Neither a recreated display nor removal of the revision revives jobs. */
+    g_hash_table_remove(access_session_revisions, user);
+    g_hash_table_insert(access_session_revisions, g_strdup(user), g_new0(guint64, 1));
+    p = access_pending(":1.1"); p.display_user_path = (gchar *)user;
+    access_create_lease(&p, "personal"); g_assert_false(access_job_valid(j));
 }
 static void pending_revocation(void)
 {
@@ -264,6 +360,9 @@ int main(int argc, char **argv)
     g_test_add_func("/daemon/bounded-request", bounded_request);
     g_test_add_func("/daemon/session-allowlist", session_allowlist);
     g_test_add_func("/daemon/access/session-binding-and-safety-events", session_binding_and_safety_events);
+    g_test_add_func("/daemon/access/genuine-user-session-classes", genuine_user_session_classes);
+    g_test_add_func("/daemon/access/user-manager-display-mapping", user_manager_display_mapping);
+    g_test_add_func("/daemon/access/display-lease-revocation", display_lease_revocation);
     g_test_add_func("/daemon/access/pending-revocation", pending_revocation);
     g_test_add_func("/daemon/access/lease-scope-and-expiry", lease_scope_and_expiry);
     g_test_add_func("/daemon/access/recovery-result-lifetime", recovery_result_lifetime);
