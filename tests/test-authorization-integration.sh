@@ -25,10 +25,8 @@ other=ov-auth-other-$BASHPID
 declare -A inputs outputs units sessions drivers
 created_users=()
 last='{}'
-identity_trace_pid=
 cleanup() {
     local user unit
-    if [[ -n $identity_trace_pid ]]; then kill -INT "$identity_trace_pid" 2>/dev/null || true; wait "$identity_trace_pid" || true; fi
     for unit in "${units[@]}"; do systemctl stop "$unit" >/dev/null 2>&1 || true; done
     for user in "${created_users[@]}"; do userdel -r "$user" >/dev/null 2>&1 || true; done
     rm -f /etc/polkit-1/rules.d/00-octovault-authorization-ci.rules
@@ -40,9 +38,6 @@ failed() {
     printf 'Real authorization integration failed during: %s\n' "$stage" >&2
     jq -c '.response.error // empty | {code,message}' <<< "$last" >&2 || true
     jq -c '{challenges,authentications}' <<< "$last" >&2 || true
-    if [[ -f $work/identity.trace ]]; then cat "$work/identity.trace" >&2; fi
-    if [[ -f $work/identity-trace.err ]]; then cat "$work/identity-trace.err" >&2; fi
-    if [[ -f $work/daemon-identity.txt ]]; then cat "$work/daemon-identity.txt" >&2; fi
     journalctl --no-pager -n 80 -u octovault.service -u polkit.service -u systemd-logind.service >&2 || true
     loginctl show-seat seat0 --property=CanTTY --property=ActiveSession --property=Sessions >&2 || true
     systemctl list-jobs --no-pager >&2 || true
@@ -177,6 +172,19 @@ systemctl restart polkit.service
 systemctl reload dbus.service
 systemctl start octovault.service
 gdbus introspect --system --dest io.vdm.OctoVault1 --object-path /io/vdm/OctoVault1 >/dev/null
+step 'checking the real service can drop privileges to an ordinary account'
+daemon_pid=$(systemctl show octovault.service --property=MainPID --value)
+[[ $(awk '/^Uid:/ {print $2 ":" $3}' "/proc/$daemon_pid/status") == 0:0 ]] || {
+    printf 'The privileged service must run with real and effective UID 0.\n' >&2
+    exit 1
+}
+for capability_field in CapPrm CapEff; do
+    daemon_capabilities=$(awk -v field="$capability_field:" '$1 == field {print $2}' "/proc/$daemon_pid/status")
+    if [[ ! $daemon_capabilities =~ ^[0-9a-f]{1,16}$ ]] || (( (16#$daemon_capabilities & 0x80) == 0 )); then
+        printf 'The privileged service lacks CAP_SETUID in %s; it cannot run personal work as its owner.\n' "$capability_field" >&2
+        exit 1
+    fi
+done
 step 'starting a real local user login session'
 [[ $(loginctl show-seat seat0 --property=CanTTY --value) == no ]] || {
     printf 'This fixture requires the disposable runner\047s non-VT container seat.\n' >&2
@@ -285,26 +293,7 @@ query "$other" '{"op":"access.status","params":{}}'
 check '(.response.data.authorized|not) and .response.data.delegated_personal'
 query "$other" '{"op":"access.unlock","params":{"scope":"personal"}}'
 check '.response.ok and .response.data.scope == "personal"'
-# Trace only numeric credential changes in the actual daemon context. This
-# cannot record requests, arguments, file contents or passwords, and makes a
-# host-specific privilege-drop failure actionable without weakening its unit.
-install -m 0600 /dev/null "$work/identity.trace"
-daemon_pid=$(systemctl show octovault.service --property=MainPID --value)
-install -m 0600 /dev/null "$work/daemon-identity.txt"
-awk '/^(Name|Uid|Gid|Groups|CapInh|CapPrm|CapEff|CapBnd|CapAmb|NoNewPrivs|Seccomp|Seccomp_filters):/' \
-    "/proc/$daemon_pid/status" >"$work/daemon-identity.txt"
-strace -f -qq -e trace=setuid,setreuid,setresuid,setgid,setregid,setresgid,setgroups,capget,capset \
-    -o "$work/identity.trace" -p "$daemon_pid" 2>"$work/identity-trace.err" &
-identity_trace_pid=$!
-for _ in {1..20}; do
-    [[ $(awk '/^TracerPid:/ {print $2}' "/proc/$daemon_pid/status") == "$identity_trace_pid" ]] && break
-    sleep 0.1
-done
-[[ $(awk '/^TracerPid:/ {print $2}' "/proc/$daemon_pid/status") == "$identity_trace_pid" ]]
 query "$other" "$(jq -cn --arg destination "$personal_destination" '{op:"repository.create",params:{name:"Personal integration repository",destination_id:$destination,path:"personal-repository"}}')"
-kill -INT "$identity_trace_pid"
-wait "$identity_trace_pid" || true
-identity_trace_pid=
 check '.response.ok'
 personal_repository=$(jq -r .response.data.id <<< "$last")
 prompts=$(jq -r .challenges <<< "$last")
