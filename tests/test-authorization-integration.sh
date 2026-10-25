@@ -34,11 +34,18 @@ cleanup() {
     rm -rf -- "$work"
 }
 failed() {
-    local status=$?
+    local status=$? user unit
     printf 'Real authorization integration failed during: %s\n' "$stage" >&2
     jq -c '.response.error // empty | {code,message}' <<< "$last" >&2 || true
     jq -c '{challenges,authentications}' <<< "$last" >&2 || true
     journalctl --no-pager -n 80 -u octovault.service -u polkit.service -u systemd-logind.service >&2 || true
+    loginctl show-seat seat0 --property=CanTTY --property=ActiveSession --property=Sessions >&2 || true
+    systemctl list-jobs --no-pager >&2 || true
+    for unit in "${units[@]}"; do
+        systemctl show "$unit" --property=ActiveState --property=SubState --property=Result \
+            --property=MainPID --property=ExecMainCode --property=ExecMainStatus >&2 || true
+        journalctl --no-pager -n 80 -u "$unit" >&2 || true
+    done
     for user in "${created_users[@]}"; do
         if [[ -f $work/$user/client.err ]]; then cat "$work/$user/client.err" >&2; fi
         if [[ -n ${sessions[$user]:-} ]]; then
@@ -74,7 +81,7 @@ start_client() {
     inputs[$user]=$input; outputs[$user]=$output
     units[$user]=octovault-authorization-$user.service
     systemd-run --quiet --wait --collect --pipe --unit="${units[$user]}" \
-        --uid="$user" "${session_options[@]}" --property=Type=exec \
+        --uid="$user" "${session_options[@]}" --property=Type=exec --property=TimeoutStartSec=30s \
         --setenv=OCTOVAULT_DISPOSABLE_TEST=1 --setenv=G_DEBUG=fatal-criticals \
         "$work/agent" "$administrator" "$work/$user/credentials.json" \
         <"$work/$user/input" >"$work/$user/output" 2>"$work/$user/client.err" &
@@ -157,7 +164,7 @@ chmod 0644 /etc/polkit-1/rules.d/00-octovault-authorization-ci.rules
 # stack and its real helper, not this session-registration stack.
 cat > /etc/pam.d/octovault-authorization-ci <<'PAM'
 account include common-account
-session required pam_systemd.so class=user type=tty
+session required pam_systemd.so class=user type=tty debug
 PAM
 chmod 0644 /etc/pam.d/octovault-authorization-ci
 systemctl daemon-reload
@@ -165,6 +172,7 @@ systemctl restart polkit.service
 systemctl reload dbus.service
 systemctl start octovault.service
 gdbus introspect --system --dest io.vdm.OctoVault1 --object-path /io/vdm/OctoVault1 >/dev/null
+step 'starting a real local user login session'
 start_client "$ordinary"
 start_client "$other"
 activate_client "$ordinary"
@@ -199,6 +207,11 @@ query "$ordinary" "$(jq -cn --arg id "$system_destination" '{op:"destination.tes
 check ".response.ok and .challenges == $prompts"
 [[ -f /var/lib/octovault/users/$(id -u "$ordinary")/destinations/$system_destination.json ]]
 [[ ! -e /var/lib/octovault/users/$(id -u "$administrator")/destinations/$system_destination.json ]]
+
+step 'authorizing an application launched by the real systemd user manager'
+query "$ordinary" "$(jq -cn --arg path "/home/$ordinary/backups" '{test:"manager-cli",arguments:["--json","destination","save","--name","User manager application","--type","local","--path",$path]}')"
+check ".response.ok and .challenges == ($prompts + 1)"
+prompts=$(jq -r .challenges <<< "$last")
 
 step 'requiring a fresh challenge for recovery disclosure'
 query "$ordinary" '{"test":"mode","value":"cancel"}'
