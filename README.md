@@ -10,12 +10,22 @@ Download the `.deb` matching **your Ubuntu release and CPU architecture** from [
 
 ```bash
 sha256sum --check SHA256SUMS-ubuntu26.04
-sudo apt install ./octovault_1.1.2_ubuntu26.04_amd64.deb
+sudo apt install ./octovault_1.2.0_ubuntu26.04_amd64.deb
 ```
 
 APT installs the required encryption, backup, desktop, and system-integration dependencies. The checksum detects damaged or changed downloads; it is not an independent publisher signature. A downloaded Debian package does not enroll the computer into an automatic update repository.
 
-Launch **OctoVault** from GNOME, or run `octovault-gtk`. Run both interfaces as your regular user: privileged operations request administrator authentication. Running `sudo octovault` selects the root account's configuration, not your normal account. In a headless terminal the CLI starts a PolicyKit terminal authentication agent when needed.
+Launch **OctoVault** from GNOME, or run `octovault-gtk`. Run both interfaces as your regular user. Running `sudo octovault` selects the root account's configuration, not your normal account; an administrator approving your request does not become the owner of your vaults or backups.
+
+## Authorization and personal access
+
+Opening the desktop application starts authorization for a working session. **Authorize management** uses the operating system's administrator prompt once for ordinary management operations in that session. Cancelling leaves your saved metadata and diagnostic reports available for inspection. The header shows **Management authorized**, **Personal access**, or **Read-only**. Background activation does not open an unexpected administrator prompt.
+
+An administrator can open **Settings → Manage personal access…** to select an eligible local account and grant access without adding it to sudo. The enrolled account can use **Use personal access** without another administrator prompt to work with its own personal vaults and backups. Personal backup and restore processes run as that account, so they cannot read protected system files or restore into locations the account cannot write. Administrator-managed resources and forced vault closure require management authorization. Each grant or revocation requires fresh administrator approval.
+
+Authorization belongs to this application connection and its active, local, unlocked login session. It lasts at most eight hours and ends on **End authorization**, application disconnection, desktop lock, logout, suspension, loss of the active session, service restart, access-policy change, revocation, or expiry. Ending authorization prevents new protected operations; it does not close an open vault or cancel work already running. Use the vault's lock action to close it and check its displayed state. Vault passphrases and YubiKey PIN/touch prompts remain separate from operating-system authorization.
+
+Saved schedules do not need an open management session. Personal schedules still require the owner's administrator-approved personal grant. Revocation prevents future personal scheduled backups; running jobs finish, and saved vault safety-close policies remain in effect. Existing records retain their original execution scope: records created before this feature remain administrator-managed, and granting personal access does not silently convert them. See the [authorization model](docs/authorization.md) for the boundaries.
 
 ## Vaults
 
@@ -43,7 +53,7 @@ Choose **Create backup** for guided setup. Give the backup a name, choose an exi
 
 Storage can be a local directory, an S3-compatible endpoint and bucket, an SFTP server, or a REST server. Each type shows its relevant connection fields. Local storage uses a folder picker; server paths refer to folders on the remote server. Remote access is separate from the repository's encryption password. For SFTP, verify the server host-key fingerprint with the server administrator or provider.
 
-Create a repository within that destination, or register an existing repository with its password. A new repository receives a generated password. Save the recovery information into your own password manager when it is shown: it includes the repository address and the credentials needed to access and decrypt it. The explicit **Recovery** action reveals it again after administrator authentication. Keep that copy outside this computer; encrypted local credential files alone are not a portable recovery kit.
+Create a repository within that destination, or register an existing repository with its password. A new repository receives a generated password. Save the recovery information into your own password manager when it is shown: it includes the repository address and the credentials needed to access and decrypt it. The explicit **Recovery** action requires fresh authentication: your own authentication when using personal access to a personal repository, administrator authentication when using management access. Keep that copy outside this computer; encrypted local credential files alone are not a portable recovery kit.
 
 The **Advanced options** checkbox exposes optional tuning when needed, including exclusions, filesystem boundaries, vault integration, power and network preferences, and retention. Leaving advanced options hidden uses the normal defaults for new records and preserves existing settings when editing. Retention keeps all snapshots until you choose a policy; pruning is a separate action.
 
@@ -51,12 +61,13 @@ Plans can run manually, on a calendar, after boot, while idle, after a configure
 
 For an open-vault plan, back up the accessible plaintext content: Restic encrypts it independently in the repository. For a closed-vault plan, back up the closed encrypted container. Do not copy a changing, mounted container and assume that copy is consistent. Application databases also need their own quiescing or application-consistent export when a consistent transaction boundary matters.
 
-Browse snapshots and files, compare snapshots, search paths, restore into a chosen target, inspect repository statistics, check repository integrity, preview retention, and prune unreferenced data. Prefer restoring into an empty directory before replacing working files. Restores run with the privileges necessary to preserve ownership; carefully review the destination and overwrite choice. Unregistering a destination, repository, or vault removes its OctoVault record, not the underlying data.
+Browse snapshots and files, compare snapshots, search paths, restore into a chosen target, inspect repository statistics, check repository integrity, preview retention, and prune unreferenced data. These data operations require authorization even when they do not modify a repository. Prefer restoring into an empty directory before replacing working files. Personal restores use your account's permissions and cannot restore arbitrary system ownership; administrator-managed restores can preserve ownership with system privileges. Carefully review the destination and overwrite choice. Unregistering a destination, repository, or vault removes its OctoVault record, not the underlying data.
 
 ## Command line
 
 ```bash
 octovault --help
+octovault access status
 octovault vault list
 octovault repository list
 octovault backup list
@@ -73,6 +84,10 @@ octovault vault create --name Personal --directory "$HOME" --size-gb 10 --passwo
 
 The command structure is `octovault GROUP ACTION`. Options use `--hyphenated-names`; arrays use repeated `--source`, `--exclude`, `--include`, or `--close-on`. Use the actual record IDs returned by list operations. Secret options such as `--password`, `--secret-key`, and `--ssh-private-key` **take no command-line value**: they prompt without terminal echo. Automated callers can supply a complete JSON request through standard input using `octovault --json request -`. Avoid persisting secret requests in shell history or world-readable files.
 
+The CLI starts authorization automatically when an operation requires it. It uses approved personal access when available; add `--system` to request administrator authorization for administrator-managed resources. For example, `octovault --system schedule sync` synchronizes schedules with system access. The CLI can start a PolicyKit terminal agent when needed; the operating system still decides which account may approve the request. Supported headless or remote operations request fresh administrator approval for each operation, without creating a reusable desktop authorization session.
+
+`access status` inspects the current connection, `access users` lists eligible local accounts, and `access list` lists personal grants. `access grant --user LOGIN` and `access revoke --user LOGIN` select an account by its actual login name and require fresh administrator approval. `access unlock` and `access lock` affect only the calling connection: a standalone `octovault access unlock` exits immediately and does not authorize later CLI invocations or the desktop application. Normally run the operation you need and let the CLI authorize its own connection.
+
 GUI and CLI share the same service, records, authorization checks, asynchronous jobs, and adapters. See `man octovault` for available groups. An error returns a nonzero status; cancellation requests stop the worker and its subprocesses while preserving recovery material.
 
 Backend failures include the specific error and any recorded retained-file locations. Open **Technical details** or choose **Copy diagnostic report** in the error dialog. The most recent 100 private summaries remain available through **Activity → Saved diagnostic reports**, including after restarting the application. The CLI can also read them:
@@ -88,7 +103,7 @@ These summaries describe the failed stage and recovery locations without saving 
 
 OctoVault uses encrypted systemd credentials rather than compiling secrets into a script. Host-bound protection is used where available; TPM-backed protection depends on the computer's support and systemd configuration. Secrets still have to be available to the authorized process during use. **A fully compromised running root account can access active secrets and decrypted data.** No local unattended-backup design can honestly guarantee otherwise. The [security guide](docs/security.md) describes the boundaries.
 
-Upgrading with a newer matching `.deb` preserves configuration, encrypted credentials, vaults, repositories, and migration recovery state. Removal and purge remove the software without intentionally deleting your data. Generated backup schedules are disabled when the program is removed. Installing the software does not create vaults or backup repositories, migrate folders, or grant access to remote servers.
+Upgrading with a newer matching `.deb` preserves configuration, encrypted credentials, vaults, repositories, personal access grants, and migration recovery state. Existing vault and backup records remain administrator-managed unless they were explicitly created with personal scope. Removal and purge remove the software without intentionally deleting your data. Generated backup schedules are disabled when the program is removed. Installing the software does not create vaults or backup repositories, migrate folders, grant personal access, or grant access to remote servers.
 
 ## Development and release
 

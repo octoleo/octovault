@@ -11,4 +11,9 @@ if ov_priority_blocked; then
     exit 0
 fi
 export OV_INTERNAL=1
-jq -nc --arg id "$2" '{op:"event.handle",params:{event:"timer",id:$id}}' | /usr/libexec/octovault/backend "$1"
+# The saved, root-owned plan determines execution privileges after logout or
+# reboot; a personal plan must never inherit this system unit's root scope.
+record="/var/lib/octovault/users/$1/plans/$2.json"
+[[ -f $record && ! -L $record && $(stat -c %u "$record") == 0 ]] || exit 65
+scope=$(jq -er '.execution_scope // "system" | select(. == "personal" or . == "system")' "$record") || exit 65
+jq -nc --arg id "$2" '{op:"event.handle",params:{event:"timer",id:$id}}' | /usr/libexec/octovault/backend "$1" "$scope"

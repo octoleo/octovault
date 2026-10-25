@@ -80,6 +80,28 @@ ov_require() {
     printf '%s' "$value"
 }
 ov_id() { [[ $1 =~ ^[a-zA-Z0-9_-]{1,64}$ ]] || ov_fail invalid_id 'Invalid record identifier.'; }
+ov_execution_scope() {
+    case ${1-system} in personal|system) printf '%s\n' "${1-system}" ;; *) ov_fail invalid_scope 'The service supplied an invalid execution scope.' ;; esac
+}
+ov_record_scope() {
+    local scope
+    scope=$(jq -er '.execution_scope // "system" | select(. == "personal" or . == "system")' <<< "$1") ||
+        ov_fail invalid_state 'The saved execution scope is invalid.'
+    printf '%s\n' "$scope"
+}
+ov_scope_require_record() {
+    local scope
+    scope=$(ov_record_scope "$1") || ov_fail invalid_state 'The saved execution scope is invalid.'
+    if [[ ${OV_EXECUTION_SCOPE:-system} == personal && $scope != personal ]]; then
+        ov_fail admin_required 'This resource was configured for system access. Unlock administrator access to use or change it.'
+    fi
+}
+ov_personal_enrolled() {
+    local file=${OV_ACCESS_FILE:-/var/lib/octovault/access.json}
+    [[ -f $file && ! -L $file && $(stat -c '%u:%a' "$file") == 0:600 ]] || return 1
+    jq -e --argjson uid "$OV_UID" --arg user "$OV_USER" \
+        '.schema_version == 1 and any(.grants[]?; .uid == $uid and .user == $user)' "$file" >/dev/null 2>&1
+}
 ov_collection() {
     case "$1" in vaults|destinations|repositories|plans|migrations|history|settings|diagnostics) ;; *) ov_fail invalid_collection 'Invalid record collection.';; esac
 }

@@ -4,9 +4,11 @@
 
 ov_backup_cleanup() {
     [[ -z ${OV_BACKUP_TMP:-} ]] || rm -rf -- "$OV_BACKUP_TMP"
-    unset OV_BACKUP_TMP
+    [[ -z ${OV_BACKUP_IO:-} || ${OV_BACKUP_IO:-} == "${OV_BACKUP_TMP:-}" ]] || rm -rf -- "$OV_BACKUP_IO"
+    unset OV_BACKUP_TMP OV_BACKUP_IO OV_BACKUP_WORKSPACE_SCOPE
     if declare -F ov_secret_close >/dev/null; then ov_secret_close; fi
     if declare -F ov_resource_unlock >/dev/null; then ov_resource_unlock; fi
+    if declare -F ov_error_cleanup >/dev/null; then ov_error_cleanup; fi
     # A vault event can enter the backup adapter in the same worker. Preserve
     # the backend's vault cleanup when this adapter installs its EXIT trap.
     # ov_vault_unpin deliberately retains aliases that still have a loop device.
@@ -14,12 +16,71 @@ ov_backup_cleanup() {
 }
 
 ov_backup_workspace() {
-    [[ -z ${OV_BACKUP_TMP:-} ]] || return 0
+    local scope=${OV_BACKUP_SCOPE:-${OV_EXECUTION_SCOPE:-system}}
+    if [[ -n ${OV_BACKUP_TMP:-} ]]; then
+        [[ ${OV_BACKUP_WORKSPACE_SCOPE:-system} == "$scope" ]] || ov_fail scope_mismatch 'Backup execution scope changed while preparing private inputs.'
+        return 0
+    fi
+    OV_BACKUP_WORKSPACE_SCOPE=$scope
     install -d -m 0700 "${OV_RUNTIME_ROOT:-/run/octovault}"
     OV_BACKUP_TMP=$(mktemp -d "${OV_RUNTIME_ROOT:-/run/octovault}/backup.XXXXXXXX")
     chmod 0700 "$OV_BACKUP_TMP"
+    OV_BACKUP_IO=$OV_BACKUP_TMP
+    if [[ $scope == personal ]]; then
+        # Root owns every directory entry. The owner process can read only the
+        # individual inputs prepared for this operation, not replace entries.
+        local base=/run/octovault-personal
+        [[ ! -L $base ]] || ov_fail unsafe_state 'Unsafe personal backup runtime directory.'
+        install -d -o root -g root -m 0711 "$base"
+        [[ $(stat -c '%u:%a' "$base") == 0:711 ]] || ov_fail unsafe_state 'Unsafe personal backup runtime permissions.'
+        OV_BACKUP_IO=$(mktemp -d "$base/job.XXXXXXXX")
+        chmod 0711 "$OV_BACKUP_IO"
+    fi
     trap ov_backup_cleanup EXIT
 }
+
+ov_backup_use_record() {
+    ov_scope_require_record "$1"
+    OV_BACKUP_SCOPE=$(ov_record_scope "$1")
+}
+
+ov_backup_require_record() {
+    ov_scope_require_record "$1"
+    [[ $(ov_record_scope "$1") == "${OV_BACKUP_SCOPE:-${OV_EXECUTION_SCOPE:-system}}" ]] ||
+        ov_fail scope_mismatch 'Personal and system backup resources cannot be combined. Select resources with the same access scope.'
+}
+
+ov_backup_process() (
+    local item path descriptor name owner_user=$OV_USER owner_home=$OV_HOME
+    if [[ ${OV_BACKUP_SCOPE:-system} == personal ]]; then
+        # These directory entries remain root-owned. Root never executes their
+        # contents: an SSH askpass helper runs with the owner's identity.
+        for path in "$OV_BACKUP_IO/"*; do
+            [[ -e $path ]] || continue
+            [[ -f $path && ! -L $path ]] || ov_fail unsafe_state 'Unsafe personal backup input.'
+            chown "$OV_UID:$(id -g "$OV_USER")" -- "$path"
+            if [[ ${path##*/} == askpass ]]; then chmod 0500 "$path"; else chmod 0400 "$path"; fi
+        done
+        # Credentials belong in the child environment, never env(1) arguments.
+        for path in /proc/self/fd/*; do
+            descriptor=${path##*/}
+            [[ $descriptor =~ ^[0-9]+$ && $descriptor -gt 2 ]] || continue
+            exec {descriptor}>&-
+        done
+        while IFS= read -r name; do unset "$name" 2>/dev/null || true; done < <(compgen -e)
+        export PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C.UTF-8 LC_ALL=C.UTF-8
+        export HOME="$owner_home" USER="$owner_user" LOGNAME="$owner_user"
+        for item in "${OV_RESTIC_ENV[@]}"; do export "${item?}"; done
+        [[ -z ${OV_RESTIC_PASSWORD_FILE:-} ]] || export RESTIC_PASSWORD_FILE="$OV_RESTIC_PASSWORD_FILE"
+        exec runuser --preserve-environment -u "$owner_user" -- "$@"
+    fi
+    unset RESTIC_PASSWORD RESTIC_PASSWORD_COMMAND RESTIC_REPOSITORY RESTIC_REPOSITORY_FILE
+    unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_PROFILE
+    unset RESTIC_REST_USERNAME RESTIC_REST_PASSWORD SSH_AUTH_SOCK
+    for item in "${OV_RESTIC_ENV[@]}"; do export "${item?}"; done
+    [[ -z ${OV_RESTIC_PASSWORD_FILE:-} ]] || export RESTIC_PASSWORD_FILE="$OV_RESTIC_PASSWORD_FILE"
+    "$@"
+)
 
 ov_backup_string() {
     local value=$1 label=$2
@@ -51,13 +112,14 @@ ov_backup_require_tools() {
 ov_backup_save_record() {
     local collection=$1 id=$2 record=$3 now
     now=$(ov_now)
-    record=$(jq --arg now "$now" '.schema_version=1 | .created_at=(.created_at // $now) | .updated_at=$now' <<<"$record")
+    record=$(jq --arg now "$now" --arg scope "${OV_BACKUP_SCOPE:-${OV_EXECUTION_SCOPE:-system}}" '.execution_scope=$scope | .schema_version=1 | .created_at=(.created_at // $now) | .updated_at=$now' <<<"$record")
     ov_save "$collection" "$id" "$record"
 }
 
 ov_backup_get_destination() {
     ov_load destinations "$1"
     OV_DESTINATION=$OV_RECORD
+    ov_backup_require_record "$OV_DESTINATION"
 }
 
 ov_backup_url() {
@@ -97,6 +159,7 @@ ov_backup_secret_file() {
 
 ov_backup_prepare_destination() {
     local destination=$1 prefix=${2:-primary} kind reference value key_file known_file pass_file config_file host
+    ov_backup_require_record "$destination"
     ov_backup_workspace
     kind=$(jq -r .type <<<"$destination")
     OV_RESTIC_OPTIONS=()
@@ -124,10 +187,10 @@ ov_backup_prepare_destination() {
             done
             ;;
         sftp)
-            key_file="$OV_BACKUP_TMP/$prefix.identity"
-            known_file="$OV_BACKUP_TMP/$prefix.known_hosts"
-            config_file="$OV_BACKUP_TMP/$prefix.ssh_config"
-            pass_file="$OV_BACKUP_TMP/$prefix.passphrase"
+            key_file="$OV_BACKUP_IO/$prefix.identity"
+            known_file="$OV_BACKUP_IO/$prefix.known_hosts"
+            config_file="$OV_BACKUP_IO/$prefix.ssh_config"
+            pass_file="$OV_BACKUP_IO/$prefix.passphrase"
             ov_backup_secret_file "$(jq -r .credentials.ssh_private_key <<<"$destination")" "$key_file"
             printf '\n' >>"$key_file"
             jq -r .known_hosts <<<"$destination" >"$known_file"
@@ -141,9 +204,9 @@ ov_backup_prepare_destination() {
             reference=$(jq -r '.credentials.ssh_passphrase // empty' <<<"$destination")
             if [[ -n $reference ]]; then
                 ov_backup_secret_file "$reference" "$pass_file"
-                printf '#!/bin/sh\nexec /bin/cat "$OCTOVAULT_SSH_PASSPHRASE_FILE"\n' >"$OV_BACKUP_TMP/askpass"
-                chmod 0700 "$OV_BACKUP_TMP/askpass"
-                OV_RESTIC_ENV+=("SSH_ASKPASS=$OV_BACKUP_TMP/askpass" 'SSH_ASKPASS_REQUIRE=force' 'DISPLAY=:0' "OCTOVAULT_SSH_PASSPHRASE_FILE=$pass_file")
+                printf '#!/bin/sh\nexec /bin/cat "$OCTOVAULT_SSH_PASSPHRASE_FILE"\n' >"$OV_BACKUP_IO/askpass"
+                chmod 0700 "$OV_BACKUP_IO/askpass"
+                OV_RESTIC_ENV+=("SSH_ASKPASS=$OV_BACKUP_IO/askpass" 'SSH_ASKPASS_REQUIRE=force' 'DISPLAY=:0' "OCTOVAULT_SSH_PASSPHRASE_FILE=$pass_file")
             else
                 printf '  BatchMode yes\n' >>"$config_file"
             fi
@@ -156,24 +219,19 @@ ov_backup_prepare_destination() {
 
 ov_backup_prepare_repository() {
     local record=$1 prefix=${2:-primary}
+    ov_backup_require_record "$record"
     ov_backup_require_tools
     ov_backup_get_destination "$(jq -r .destination_id <<<"$record")"
     ov_backup_prepare_destination "$OV_DESTINATION" "$prefix"
     OV_RESTIC_REPOSITORY=$(jq -r .repository <<<"$record")
-    OV_RESTIC_PASSWORD_FILE="$OV_BACKUP_TMP/$prefix.password"
+    OV_RESTIC_PASSWORD_FILE="$OV_BACKUP_IO/$prefix.password"
     ov_backup_secret_file "$(jq -r .credential_id <<<"$record")" "$OV_RESTIC_PASSWORD_FILE"
 }
 
 # env arguments are populated by the shell, and would otherwise expose secrets
 # in /proc/.../cmdline. Export only inside this short-lived subshell instead.
 ov_backup_restic_process() (
-    local item
-    unset RESTIC_PASSWORD RESTIC_PASSWORD_COMMAND RESTIC_REPOSITORY RESTIC_REPOSITORY_FILE
-    unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_PROFILE
-    unset RESTIC_REST_USERNAME RESTIC_REST_PASSWORD SSH_AUTH_SOCK
-    for item in "${OV_RESTIC_ENV[@]}"; do export "${item?}"; done
-    export RESTIC_PASSWORD_FILE="$OV_RESTIC_PASSWORD_FILE"
-    restic --json --no-cache --repo "$OV_RESTIC_REPOSITORY" "${OV_RESTIC_OPTIONS[@]}" "$@"
+    ov_backup_process restic --json --no-cache --repo "$OV_RESTIC_REPOSITORY" "${OV_RESTIC_OPTIONS[@]}" "$@"
 )
 
 ov_backup_execute() {
@@ -233,6 +291,7 @@ ov_destination_save() {
     local id record kind name key value reference old known fingerprint host port endpoint bucket path existing
     id=$(ov_param id)
     if [[ -n $id ]]; then ov_load destinations "$id"; record=$OV_RECORD; else id=$(ov_new_id); record='{}'; fi
+    if [[ $record != '{}' ]]; then ov_backup_use_record "$record"; fi
     old=$record
     record=$(jq --arg id "$id" --argjson old "$record" '$old + ({name,type,endpoint,region,bucket,host,port,user,path,host_fingerprint} | with_entries(select(.value != null))) | .id=$id | .credentials=(.credentials // {})' <<<"$OV_PARAMS")
     kind=$(jq -r '.type // ""' <<<"$record")
@@ -319,20 +378,20 @@ ov_backup_curl_quote() {
 }
 
 ov_destination_test() {
-    local destination=$1 kind endpoint bucket access secret region username password path result=0 item
+    local destination=$1 kind endpoint bucket access secret region username password path result=0
     ov_backup_prepare_destination "$destination"
     kind=$(jq -r .type <<<"$destination")
     path=$(jq -r '.path // ""' <<<"$destination")
     case $kind in
         local)
-            [[ -d $path && -r $path && -w $path ]] || ov_fail destination_unavailable 'The local destination must exist and be readable and writable.'
+            if ! ov_backup_process test -d "$path" || ! ov_backup_process test -r "$path" || ! ov_backup_process test -w "$path"; then
+                ov_fail destination_unavailable 'The local destination must exist and be readable and writable by the configured backup account.'
+            fi
             ;;
         sftp)
-            printf 'ls "%s"\n' "$path" >"$OV_BACKUP_TMP/sftp_batch"
-            (
-                for item in "${OV_RESTIC_ENV[@]}"; do export "${item?}"; done
-                sftp -oBatchMode=no -F "$OV_BACKUP_TMP/primary.ssh_config" -b "$OV_BACKUP_TMP/sftp_batch" "$(jq -r .host <<<"$destination")"
-            ) >"$OV_BACKUP_TMP/test.out" 2>"$OV_BACKUP_TMP/test.err" || result=$?
+            printf 'ls "%s"\n' "$path" >"$OV_BACKUP_IO/sftp_batch"
+            ov_backup_process sftp -oBatchMode=no -F "$OV_BACKUP_IO/primary.ssh_config" -b "$OV_BACKUP_IO/sftp_batch" "$(jq -r .host <<<"$destination")" \
+                >"$OV_BACKUP_TMP/test.out" 2>"$OV_BACKUP_TMP/test.err" || result=$?
             ;;
         s3|rest)
             endpoint=$(jq -r .endpoint <<<"$destination")
@@ -353,8 +412,8 @@ ov_destination_test() {
                     printf 'user = "%s:%s"\n' "$(ov_backup_curl_quote "$username")" "$(ov_backup_curl_quote "$password")"
                     printf 'url = "%s/%s/"\n' "$(ov_backup_curl_quote "${endpoint%/}")" "$(ov_backup_curl_quote "${path#/}")"
                 fi
-            } >"$OV_BACKUP_TMP/curl.config"
-            curl --config "$OV_BACKUP_TMP/curl.config" >"$OV_BACKUP_TMP/test.out" 2>"$OV_BACKUP_TMP/test.err" || result=$?
+            } >"$OV_BACKUP_IO/curl.config"
+            ov_backup_process curl --config "$OV_BACKUP_IO/curl.config" >"$OV_BACKUP_TMP/test.out" 2>"$OV_BACKUP_TMP/test.err" || result=$?
             ;;
     esac
     (( result == 0 )) || ov_fail destination_unavailable 'Destination access failed. Check network connectivity, credentials, remote path and access permissions.'
@@ -367,12 +426,14 @@ ov_repository_create() {
     name=$(ov_require name)
     destination_id=$(ov_require destination_id)
     relative=$(ov_param path)
+    ov_load destinations "$destination_id"
+    ov_backup_use_record "$OV_RECORD"
     ov_backup_get_destination "$destination_id"; destination=$OV_DESTINATION
     repository=$(ov_backup_url "$destination" "$relative")
     if [[ $action == import ]]; then password=$(ov_require password); else password=$(head -c 48 /dev/urandom | base64 -w 0); fi
     credential="repository-$id"
     ov_credential_set "$credential" "$password"
-    record=$(jq -n --arg id "$id" --arg name "$name" --arg did "$destination_id" --arg path "$relative" --arg repository "$repository" --arg cid "$credential" '{id:$id,name:$name,destination_id:$did,path:$path,repository:$repository,credential_id:$cid}')
+    record=$(jq -n --arg id "$id" --arg name "$name" --arg did "$destination_id" --arg path "$relative" --arg repository "$repository" --arg cid "$credential" --arg scope "$OV_BACKUP_SCOPE" '{id:$id,name:$name,destination_id:$did,path:$path,repository:$repository,credential_id:$cid,execution_scope:$scope}')
     ov_backup_prepare_repository "$record"
     if [[ $action == create ]]; then ov_backup_execute initialize init || :; else ov_backup_execute import cat config || :; fi
     ov_backup_check_result
@@ -388,6 +449,7 @@ ov_repository_create() {
 
 ov_repository_recovery() {
     local record=$1 destination result key reference value
+    ov_backup_require_record "$record"
     ov_backup_get_destination "$(jq -r .destination_id <<<"$record")"; destination=$OV_DESTINATION
     # Secret values enter jq through stdin, never its argv. jq --rawfile reads
     # only transient files whose names contain no secret information.
@@ -442,7 +504,7 @@ ov_repository_action() {
             else
                 case $overwrite in
                     never)
-                        if [[ -e $target ]] && [[ ! -d $target || -n $(find "$target" -mindepth 1 -maxdepth 1 -print -quit) ]]; then
+                        if ov_backup_process test -e "$target" && { ! ov_backup_process test -d "$target" || [[ -n $(ov_backup_process find "$target" -mindepth 1 -maxdepth 1 -print -quit) ]]; }; then
                             ov_fail restic_upgrade_required 'This backup engine version can safely restore without overwriting only into a new or empty folder. Choose another destination or update the backup engine.'
                         fi
                         ;;
@@ -471,8 +533,8 @@ ov_repository_action() {
             id=$(jq -r .id <<<"$record")
             new_credential="repository-$id-$(ov_new_id | cut -c1-8)"
             ov_credential_set "$new_credential" "$new_password"
-            ov_backup_secret_file "$new_credential" "$OV_BACKUP_TMP/new-password"
-            args=(key passwd --new-password-file "$OV_BACKUP_TMP/new-password")
+            ov_backup_secret_file "$new_credential" "$OV_BACKUP_IO/new-password"
+            args=(key passwd --new-password-file "$OV_BACKUP_IO/new-password")
             ;;
         *) ov_fail unknown_operation 'Unknown repository operation.' ;;
     esac
@@ -497,21 +559,31 @@ ov_repository_action() {
 }
 
 ov_backup_plan_save() {
-    local id record value key source vault mode trigger repository_id
+    local id record value key source vault mode trigger repository_id existing=false
     id=$(ov_param id)
-    if [[ -n $id ]]; then ov_load plans "$id"; record=$OV_RECORD; else id=$(ov_new_id); record='{}'; fi
+    if [[ -n $id ]]; then ov_load plans "$id"; record=$OV_RECORD; existing=true; else id=$(ov_new_id); record='{}'; fi
+    if [[ $record != '{}' ]]; then ov_backup_use_record "$record"; fi
     record=$(jq --arg id "$id" --argjson old "$record" '$old + ({name,repository_id,sources,excludes,one_file_system,vault_id,vault_mode,trigger,calendar,boot_delay_sec,idle_sec,drive_uuid,on_battery,metered,retention} | with_entries(select(.value != null))) | .id=$id | .excludes=(.excludes // []) | .one_file_system=(.one_file_system // false) | .vault_mode=(.vault_mode // "none") | .trigger=(.trigger // "manual") | .on_battery=(.on_battery // false) | .metered=(.metered // false)' <<<"$OV_PARAMS")
     [[ $(jq -r '.name // empty' <<<"$record") ]] || ov_fail invalid_parameter 'A backup plan name is required.'
     repository_id=$(jq -r '.repository_id // empty' <<<"$record")
     ov_load repositories "$repository_id"
+    if [[ $existing == false ]]; then ov_backup_use_record "$OV_RECORD"; fi
+    ov_backup_require_record "$OV_RECORD"
+    ov_backup_get_destination "$(jq -r .destination_id <<< "$OV_RECORD")"
     jq -e '(.sources | type == "array" and length > 0 and all(.[]; type == "string" and length > 0)) and (.excludes | type == "array" and all(.[]; type == "string")) and (.one_file_system | type == "boolean") and (.on_battery | type == "boolean") and (.metered | type == "boolean")' >/dev/null <<<"$record" || ov_fail invalid_plan 'Select at least one source path and valid backup options.'
-    while IFS= read -r -d '' source; do ov_backup_absolute "$source"; done < <(jq -j '.sources[] | ., "\u0000"' <<<"$record")
+    while IFS= read -r -d '' source; do
+        ov_backup_absolute "$source"
+        if [[ $OV_BACKUP_SCOPE == personal ]]; then
+            ov_as_user test -r "$source" || ov_fail permission_denied 'A selected backup source is not readable by your account. Choose your own files or ask an administrator to configure a system backup.'
+        fi
+    done < <(jq -j '.sources[] | ., "\u0000"' <<<"$record")
     mode=$(jq -r .vault_mode <<<"$record")
     case $mode in
         none) ;;
         open-files|closed-container)
             vault=$(jq -r '.vault_id // empty' <<<"$record")
             ov_load vaults "$vault"
+            ov_backup_require_record "$OV_RECORD"
             ;;
         *) ov_fail invalid_mode 'Vault mode must be none, open-files or closed-container.' ;;
     esac
@@ -525,6 +597,7 @@ ov_backup_plan_save() {
             vault=$(jq -r '.vault_id // empty' <<<"$record")
             [[ -n $vault ]] || ov_fail invalid_trigger 'Select the vault whose event should start this backup.'
             ov_load vaults "$vault"
+            ov_backup_require_record "$OV_RECORD"
             if [[ $trigger == vault-open && $mode == closed-container ]] || [[ $trigger == vault-close && $mode == open-files ]]; then
                 ov_fail invalid_trigger 'The selected trigger conflicts with the required vault state. Use vault-open for unlocked files or vault-close for the closed container.'
             fi
@@ -595,6 +668,10 @@ ov_backup_history_add() {
 ov_backup_run_plan() {
     local plan=$1 id record source value started finished status snapshot summary history key maintenance=0
     local -a args=() retention_args=()
+    ov_backup_use_record "$plan"
+    if [[ $OV_BACKUP_SCOPE == personal ]] && ! ov_personal_enrolled; then
+        ov_fail access_revoked 'Personal backup access is no longer enabled for this account. Ask an administrator to enable it again; saved data and safety-lock policies are retained.'
+    fi
     id=$(jq -r .id <<<"$plan")
     ov_load repositories "$(jq -r .repository_id <<<"$plan")"; record=$OV_RECORD
     ov_backup_prepare_repository "$record"
@@ -603,6 +680,9 @@ ov_backup_run_plan() {
     ov_backup_vault_guard "$plan"
     for source in "${OV_BACKUP_SOURCES[@]}"; do
         [[ -e $source || -L $source ]] || ov_fail source_missing 'A configured backup source is unavailable; no incomplete replacement backup was started.'
+        if [[ $OV_BACKUP_SCOPE == personal ]]; then
+            ov_as_user test -r "$source" || ov_fail permission_denied 'A configured source is no longer readable by your account; personal backups cannot read administrator-only files.'
+        fi
     done
     args=(backup --tag "octovault-plan:$id")
     [[ $(jq -r '.one_file_system // false' <<<"$plan") != true ]] || args+=(--one-file-system)
@@ -692,6 +772,7 @@ ov_backup_remove() {
 
 ov_backup_dispatch() {
     local id action collection record
+    OV_BACKUP_SCOPE=${OV_EXECUTION_SCOPE:-system}
     jq -e '[.. | strings | contains("\u0000")] | any | not' >/dev/null <<<"$OV_PARAMS" || ov_fail invalid_parameter 'NUL characters are not supported in application parameters.'
     case "$OV_OP" in
         destination.*) collection=destinations ;;
@@ -707,6 +788,10 @@ ov_backup_dispatch() {
         backup.save) ov_backup_plan_save; return ;;
     esac
     id=$(ov_require id); ov_id "$id"; ov_load "$collection" "$id"; record=$OV_RECORD
+    case "$OV_OP" in
+        destination.get|repository.get|backup.get|backup.history) ;;
+        *) ov_backup_use_record "$record" ;;
+    esac
     case "$OV_OP" in
         destination.get|repository.get|backup.get) ov_ok "$record" ;;
         destination.remove|repository.remove|backup.remove) ov_backup_remove "$collection" "$id" ;;

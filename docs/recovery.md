@@ -10,6 +10,14 @@ Keys generated during creation are stored under your private `~/.local/share/oct
 
 Text key carriers also require the exact word map used to create them. OctoVault includes its original 66-word map at `/usr/share/octovault/cloak-ciphers/words`; preserve a copy with your recovery materials, especially when using a custom map. This stable data file only translates the already encrypted key into words. The distribution's Tomb helpers perform the conversion, and the key still requires its passphrase.
 
+## Authorization and recovery credentials
+
+Operating-system authorization and encryption credentials serve different purposes. **Authorize management** permits administrative operations during the application's session; it cannot replace a vault passphrase, YubiKey PIN, OpenPGP private key, or repository password. An administrator's approval does not transfer ownership of your data to that administrator. The **Recovery** action asks for fresh authentication before disclosing stored repository credentials: your own authentication when using personal access to a personal repository, administrator authentication when using management access.
+
+If the header shows **Read-only** after a lock, session change, or expiry, authorize again before attempting a protected operation. Populated setup forms retain their nonsecret entries. Ending management authorization does not close an open vault or cancel work already running. Use the vault's lock action and check its actual state; saved safety-close policies remain independent of the header's authorization status.
+
+A revoked personal grant prevents new personal sessions and future personal scheduled backups, but does not delete containers, repositories, or recovery material. Ask an administrator to review the account's access. Already-running jobs finish and saved vault safety-close policies remain in effect. Records created before personal access was introduced remain administrator-managed; enabling personal access does not convert them. Use management authorization for those records, or `--system` for the CLI operation that needs them.
+
 ## Failed vault creation
 
 Read the specific error and failed stage before retrying. OctoVault checks OpenPGP authentication before allocating a new container: a missing public key, unavailable token, failed PIN prompt, or unsuccessful decryption challenge must be resolved first. **Software OpenPGP key** uses your local OpenPGP private key; **YubiKey / OpenPGP security key** requires the matching OpenPGP encryption key on the connected token. Having used a YubiKey for web sign-in does not by itself configure its OpenPGP application.
@@ -31,7 +39,9 @@ Older versions displayed “Existing recovery material has been retained” for 
 
 ## Restore on another computer
 
-Install OctoVault and its dependencies. Recreate the destination using the saved remote credentials, then import the existing repository with its saved repository password. List snapshots, choose files, and restore into a new empty directory. Check the restored contents and ownership before replacing existing files. This process does not require the original machine's encrypted credential store.
+Install OctoVault and its dependencies. Obtain management authorization or have an administrator grant your local account personal access. Recreate the destination using the saved remote credentials, then import the existing repository with its saved repository password. List snapshots, choose files, and restore into a new empty directory. Check the restored contents and ownership before replacing existing files. This process does not require the original machine's encrypted credential store.
+
+Personal repositories and their destinations and plans must all use personal scope. Personal restore runs as your account and can write only where that account is allowed; it cannot restore arbitrary system ownership. Restoring protected system files requires an administrator-managed repository and system authorization. Existing personal records keep their scope even when operated from a management session.
 
 The underlying repository can also be accessed directly with Restic and the saved credentials. Likewise, a vault can be opened directly with a compatible Tomb version and its key. OctoVault records add management information; they are not a proprietary data format required to decrypt the content.
 
@@ -43,12 +53,14 @@ When the vault is closed, its mapped original path is an ordinary underlying fol
 
 ## Busy vaults
 
-Close applications using the vault and retry normal locking. Forced locking is available only by explicit request or saved force-close policy, and may terminate processes. Check the actual mounted state after a failed close; a failed command must not be interpreted as a securely closed vault. Native engine tools remain available for diagnosis and recovery.
+Close applications using the vault and retry normal locking. Requesting forced locking or enabling its policy requires management authorization and may terminate processes. An administrator-approved saved force-close policy can run independently of an open management session. Personal access cannot enable that policy or request forced closure. Check the actual mounted state after a failed close; a failed command must not be interpreted as a securely closed vault. Native engine tools remain available for diagnosis and recovery.
 
 ## Upgrades, removal, and machine migration
 
-Package upgrades retain private state under `/var/lib/octovault` and do not intentionally close vaults or remove repositories. Installing a newer compatible package upgrades the application through Debian's package manager. Removing or purging OctoVault retains encrypted data, secrets, and configuration. Generated backup timers are disabled so they do not repeatedly invoke missing software; reinstall and synchronize schedules to restore them.
+Package upgrades retain private state under `/var/lib/octovault`, including personal access grants, and do not intentionally close vaults or remove repositories. A restarted service requires a new authorization session. Existing record execution scope remains unchanged; records without an explicit scope retain system access. Installing a newer compatible package upgrades the application through Debian's package manager. Removing or purging OctoVault retains encrypted data, secrets, and configuration. Generated backup timers are disabled so they do not repeatedly invoke missing software; reinstall and synchronize schedules to restore them.
 
 Copying `/var/lib/octovault` alone is not a portable credentials migration. Encrypted systemd credentials can be bound to the original host and TPM. Use your saved recovery information to register repositories on the replacement system. If you intentionally migrate the original operating system and its host credential keys, assess that migration's security implications separately.
+
+Personal access grants match local account names and numeric user IDs. Have an administrator review enrollment on the replacement computer; copying an access-policy file is not a substitute for checking that the intended local accounts exist and have the correct permissions.
 
 Deleting an OctoVault registration is different from deleting its actual container or remote repository. Verify which action you are taking before removing data. No recovery procedure can recover deliberately deleted repository data without another surviving copy.

@@ -12,6 +12,7 @@ GDBusConnection *ov_client_connect(GError **error);
 gchar *ov_client_prepare_request(const gchar *request, GError **error);
 gboolean ov_session_valid(JsonNode *session);
 gchar *ov_client_submit(GDBusConnection *bus, const gchar *request, GError **error);
+gchar *ov_client_submit_cancellable(GDBusConnection *bus, const gchar *request, GCancellable *cancellable, GError **error);
 JsonNode *ov_client_get_job(GDBusConnection *bus, const gchar *id, GError **error);
 gboolean ov_client_cancel(GDBusConnection *bus, const gchar *id, GError **error);
 gchar *ov_json_encode(JsonNode *node, gboolean pretty);

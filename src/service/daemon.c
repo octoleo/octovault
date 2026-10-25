@@ -28,13 +28,16 @@
 
 typedef struct {
     gchar *id, *op, *request, *state, *stage, *message;
+    gchar *sender, *scope, *session_path;
     guint32 uid;
+    guint64 policy_revision, sender_revision, session_revision;
     gint percent;
     gint64 created, created_at, finished, expires;
     GSubprocess *process;
     GString *output, *errors;
     JsonNode *result;
     gboolean stdin_done, stdout_done, stderr_done, process_done, success, cancelled, overflow, priority;
+    gboolean requires_session, one_shot, auth_invalidated;
     guint kill_timer;
     GPid pid;
 } Job;
@@ -42,7 +45,13 @@ typedef struct {
 typedef struct {
     GDBusMethodInvocation *invocation;
     gchar *sender, *request, *op, *id, *method;
+    gchar *scope, *session_path, *session_id, *auth_session_path, *auth_action, *availability_reason;
     guint32 uid;
+    guint32 pid;
+    guint duration;
+    guint64 policy_revision, sender_revision, session_revision, transition_revision;
+    JsonNode *immediate_result;
+    gboolean session_active, session_remote, auth_completed, requires_session, one_shot, can_request_system;
     gboolean counted;
 } Pending;
 
@@ -53,6 +62,9 @@ static gboolean shutting_down;
 static int service_exit_status;
 static guint owner_id;
 static guint pending_count;
+static gboolean access_job_valid(Job *j);
+static gboolean access_result_visible(Job *j, Pending *p);
+static void access_protect_result(Job *j);
 static const gchar introspection[] =
     "<node><interface name='io.vdm.OctoVault1'>"
     "<method name='Submit'><arg type='s' direction='in'/><arg type='s' direction='out'/></method>"
@@ -73,6 +85,9 @@ static void pending_free(Pending *p)
     if (p->counted) pending_count--;
     g_object_unref(p->invocation);
     wipe(p->request);
+    g_free(p->scope); g_free(p->session_path); g_free(p->session_id); g_free(p->auth_session_path);
+    g_free(p->auth_action); g_free(p->availability_reason);
+    if (p->immediate_result) json_node_unref(p->immediate_result);
     g_free(p->request); g_free(p->sender); g_free(p->op); g_free(p->id); g_free(p->method); g_free(p);
 }
 
@@ -84,6 +99,7 @@ static void job_free(gpointer pointer)
     if (j->output) { wipe(j->output->str); g_string_free(j->output, TRUE); }
     if (j->errors) { wipe(j->errors->str); g_string_free(j->errors, TRUE); }
     if (j->result) json_node_unref(j->result);
+    g_free(j->sender); g_free(j->scope); g_free(j->session_path);
     g_clear_object(&j->process);
     g_free(j->id); g_free(j->op); g_free(j->state); g_free(j->stage); g_free(j->message); g_free(j);
 }
@@ -136,6 +152,7 @@ static void complete(Job *j)
             j->result = failure("BACKEND_FAILURE", "The operation exited unsuccessfully.");
         }
     }
+    access_protect_result(j);
     gboolean ok = json_object_get_boolean_member(json_node_get_object(j->result), "ok");
     g_free(j->state); j->state = g_strdup(j->cancelled ? "cancelled" : ok ? "succeeded" : "failed");
     j->finished = g_get_real_time() / G_USEC_PER_SEC;
@@ -241,6 +258,13 @@ static void child_setup(gpointer data)
 
 static void start_job(Job *j)
 {
+    if (!access_job_valid(j)) {
+        JsonNode *denied = failure("AUTH_REVOKED", "Authorization ended before this queued operation could start. Unlock OctoVault and submit it again.");
+        gchar *encoded = ov_json_encode(denied, FALSE);
+        g_string_assign(j->output, encoded); g_free(encoded); json_node_unref(denied);
+        j->stdin_done = j->process_done = j->stdout_done = j->stderr_done = TRUE;
+        complete(j); return;
+    }
     g_free(j->state); j->state = g_strdup("running");
     gchar uid[32]; g_snprintf(uid, sizeof(uid), "%u", j->uid);
     GSubprocessLauncher *launcher = g_subprocess_launcher_new(
@@ -250,7 +274,7 @@ static void start_job(Job *j)
     g_subprocess_launcher_set_cwd(launcher, "/");
     g_subprocess_launcher_set_child_setup(launcher, child_setup, NULL, NULL);
     j->process = g_subprocess_launcher_spawn(launcher, NULL,
-        j->priority ? OV_PRIORITY_BACKEND_PATH : OV_BACKEND_PATH, uid, NULL);
+        j->priority ? OV_PRIORITY_BACKEND_PATH : OV_BACKEND_PATH, uid, j->scope, NULL);
     g_object_unref(launcher);
     if (!j->process) {
         j->stdin_done = j->process_done = j->stdout_done = j->stderr_done = TRUE;
@@ -350,6 +374,10 @@ static void submit_authorized(Pending *p)
     }
     Job *j = g_new0(Job, 1);
     j->id = g_uuid_string_random(); j->uid = p->uid; j->op = g_strdup(p->op);
+    j->sender = g_strdup(p->sender); j->scope = g_strdup(p->scope ? p->scope : "personal");
+    j->session_path = g_strdup(p->session_path); j->requires_session = p->requires_session;
+    j->one_shot = p->one_shot;
+    j->policy_revision = p->policy_revision; j->sender_revision = p->sender_revision; j->session_revision = p->session_revision;
     j->request = g_steal_pointer(&p->request); j->state = g_strdup("queued");
     j->priority = closes_vaults(j->uid, j->op, j->request);
     j->stage = g_strdup("queued"); j->message = g_strdup("Waiting to start"); j->percent = -1;
@@ -357,6 +385,16 @@ static void submit_authorized(Pending *p)
     j->output = g_string_new(NULL); j->errors = g_string_new(NULL);
     g_hash_table_insert(jobs, j->id, j);
     g_dbus_method_invocation_return_value(p->invocation, g_variant_new("(s)", j->id));
+    if (p->immediate_result) {
+        j->result = g_steal_pointer(&p->immediate_result);
+        gboolean ok = json_object_get_boolean_member(json_node_get_object(j->result), "ok");
+        g_free(j->state); j->state = g_strdup(ok ? "succeeded" : "failed");
+        j->finished = g_get_real_time() / G_USEC_PER_SEC;
+        j->expires = g_get_monotonic_time() + RESULT_TTL * G_USEC_PER_SEC;
+        j->percent = ok ? 100 : 0;
+        wipe(j->request); g_clear_pointer(&j->request, g_free);
+        pending_free(p); return;
+    }
     if (j->priority) {
         g_hash_table_iter_init(&iter, jobs);
         while (g_hash_table_iter_next(&iter, NULL, &value)) {
@@ -374,84 +412,25 @@ static void submit_authorized(Pending *p)
 static gboolean config_read(const gchar *op)
 {
     const gchar *allowed[] = { "vault.list", "vault.get", "destination.list", "destination.get",
-        "repository.list", "repository.snapshots", "repository.files", "repository.find", "repository.diff",
-        "repository.stats", "vault.search", "backup.list", "backup.history", "migration.list", "system.info",
+        "repository.list", "repository.get", "backup.list", "backup.get", "backup.history", "migration.list", "system.info",
         "diagnostic.list", "diagnostic.get", "vault.auth-check", NULL };
     for (guint i = 0; allowed[i]; i++) if (g_str_equal(op, allowed[i])) return TRUE;
     return FALSE;
 }
 
-static void authorization_done(GObject *bus, GAsyncResult *result, gpointer data)
-{
-    Pending *p = data;
-    GVariant *reply = g_dbus_connection_call_finish(G_DBUS_CONNECTION(bus), result, NULL);
-    gboolean authorized = FALSE, challenge = FALSE;
-    if (reply) {
-        GVariant *details = NULL;
-        g_variant_get(reply, "((bb@a{ss}))", &authorized, &challenge, &details);
-        g_variant_unref(details); g_variant_unref(reply);
-    }
-    if (!authorized) { dbus_error(p, "NotAuthorized", "Administrative authorization was not granted."); return; }
-    submit_authorized(p);
-}
-
-static void session_state_done(GObject *bus, GAsyncResult *result, gpointer data)
-{
-    Pending *p = data;
-    GVariant *reply = g_dbus_connection_call_finish(G_DBUS_CONNECTION(bus), result, NULL);
-    gboolean active = FALSE;
-    if (reply) {
-        GVariant *value, *inner;
-        g_variant_get(reply, "(@v)", &value); inner = g_variant_get_variant(value);
-        if (g_variant_is_of_type(inner, G_VARIANT_TYPE_STRING)) {
-            const gchar *state = g_variant_get_string(inner, NULL);
-            active = g_str_equal(state, "active");
-            if (!active && g_str_equal(state, "closing")) {
-                JsonParser *parser = json_parser_new();
-                if (json_parser_load_from_data(parser, p->request, -1, NULL)) {
-                    JsonObject *params = json_object_get_object_member(json_node_get_object(json_parser_get_root(parser)), "params");
-                    JsonNode *event = json_object_get_member(params, "event");
-                    if (event && JSON_NODE_HOLDS_VALUE(event) && json_node_get_value_type(event) == G_TYPE_STRING)
-                        active = g_str_equal(json_node_get_string(event), "logout") || g_str_equal(json_node_get_string(event), "shutdown");
-                }
-                g_object_unref(parser);
-            }
-        }
-        g_variant_unref(inner); g_variant_unref(value); g_variant_unref(reply);
-    }
-    if (!active) { dbus_error(p, "NotAuthorized", "Desktop events require an active user session; closing sessions may request logout or shutdown."); return; }
-    submit_authorized(p);
-}
+#include "access.c"
 
 static void authorize(Pending *p)
 {
     if (g_str_equal(p->op, "event.handle")) { dbus_error(p, "NotAuthorized", "Internal events cannot be submitted over D-Bus."); return; }
 #ifdef OCTOVAULT_TEST
-    submit_authorized(p);
-    return;
+    p->scope = g_strdup("system");
+    submit_authorized(p); return;
 #endif
-    if (g_str_equal(p->op, "event.session")) {
-        gchar *path = g_strdup_printf("/org/freedesktop/login1/user/_%u", p->uid);
-        g_dbus_connection_call(connection, "org.freedesktop.login1", path, "org.freedesktop.DBus.Properties", "Get",
-            g_variant_new("(ss)", "org.freedesktop.login1.User", "State"), G_VARIANT_TYPE("(v)"),
-            G_DBUS_CALL_FLAGS_NONE, 5000, NULL, session_state_done, p);
-        g_free(path); return;
-    }
-    if (config_read(p->op)) { submit_authorized(p); return; }
-    GVariantBuilder subject, details;
-    g_variant_builder_init(&subject, G_VARIANT_TYPE("a{sv}"));
-    g_variant_builder_add(&subject, "{sv}", "name", g_variant_new_string(p->sender));
-    g_variant_builder_init(&details, G_VARIANT_TYPE("a{ss}"));
-    g_variant_builder_add(&details, "{ss}", "polkit.message", "Authorize this OctoVault operation");
-    const gchar *action = g_str_equal(p->op, "repository.recovery") ? "io.vdm.octovault.recovery" : "io.vdm.octovault.manage";
-    g_dbus_connection_call(connection, "org.freedesktop.PolicyKit1", "/org/freedesktop/PolicyKit1/Authority",
-        "org.freedesktop.PolicyKit1.Authority", "CheckAuthorization",
-        g_variant_new("((s@a{sv})s@a{ss}us)", "system-bus-name", g_variant_builder_end(&subject),
-                      action, g_variant_builder_end(&details), 1u, ""),
-        G_VARIANT_TYPE("((bba{ss}))"), G_DBUS_CALL_FLAGS_NONE, 180000, NULL, authorization_done, p);
+    access_authorize(p);
 }
 
-static gchar *serialize_job(Job *j)
+static gchar *serialize_job(Job *j, gboolean reveal_result)
 {
     JsonBuilder *b = json_builder_new();
     json_builder_begin_object(b);
@@ -463,7 +442,11 @@ static gchar *serialize_job(Job *j)
     STRING_FIELD("stage", j->stage); STRING_FIELD("message", j->message);
     json_builder_set_member_name(b, "percent"); json_builder_add_int_value(b, j->percent);
     json_builder_end_object(b);
-    if (j->result) { json_builder_set_member_name(b, "result"); json_builder_add_value(b, json_node_copy(j->result)); }
+    if (j->result || (terminal(j) && !reveal_result)) {
+        json_builder_set_member_name(b, "result");
+        json_builder_add_value(b, reveal_result ? json_node_copy(j->result) :
+            failure("AUTH_REVOKED", "Authorization ended. Unlock OctoVault to view this result; request sensitive recovery information again."));
+    }
     json_builder_end_object(b);
 #undef STRING_FIELD
     JsonNode *root = json_builder_get_root(b); gchar *json = ov_json_encode(root, FALSE);
@@ -483,7 +466,8 @@ static void uid_done(GObject *bus, GAsyncResult *result, gpointer data)
     }
     if (!j || j->uid != p->uid) { dbus_error(p, "NotFound", "This job is not available or has expired."); return; }
     if (g_str_equal(p->method, "GetJob")) {
-        gchar *json = serialize_job(j);
+        access_protect_result(j);
+        gchar *json = serialize_job(j, access_result_visible(j, p));
         g_dbus_method_invocation_return_value(p->invocation, g_variant_new("(s)", json));
         wipe(json); g_free(json);
     } else {
@@ -513,6 +497,10 @@ static gboolean parse_request(Pending *p)
                 if (strlen(name) <= 64 && g_regex_match_simple("^[a-z]+\\.[a-z][a-z-]*$", name, 0, 0)) {
                     JsonObject *par = json_node_get_object(params);
                     valid = !json_object_has_member(par, "uid") && !json_object_has_member(par, "home") && !json_object_has_member(par, "executable");
+                    if (json_object_has_member(par, "force")) {
+                        JsonNode *force = json_object_get_member(par, "force");
+                        valid = valid && JSON_NODE_HOLDS_VALUE(force) && json_node_get_value_type(force) == G_TYPE_BOOLEAN;
+                    }
                     if (valid) p->op = g_strdup(name);
                 }
             }
@@ -562,6 +550,7 @@ static void bus_acquired(GDBusConnection *bus, const gchar *name, gpointer data)
 {
     (void) name; (void) data;
     connection = g_object_ref(bus);
+    access_initialize();
     GDBusNodeInfo *info = g_dbus_node_info_new_for_xml(introspection, NULL);
     static const GDBusInterfaceVTable table = { .method_call = method_call };
     guint registered = g_dbus_connection_register_object(bus, OV_OBJECT_PATH, info->interfaces[0], &table, NULL, NULL, NULL);
@@ -621,6 +610,7 @@ int main(void)
         if (!terminal(j) && j->pid > 1) kill(-j->pid, SIGKILL);
     }
     /* The process exits here: asynchronous callbacks cannot outlive its address space. */
+    access_shutdown();
     g_clear_object(&connection); g_main_loop_unref(loop);
     g_hash_table_destroy(jobs);
     return service_exit_status;

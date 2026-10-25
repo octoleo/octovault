@@ -5,7 +5,8 @@
 set -euo pipefail
 umask 077
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
-[[ $EUID -eq 0 && $# -eq 1 ]] || exit 64
+[[ $EUID -eq 0 && $# -ge 1 && $# -le 2 ]] || exit 64
+case ${2-system} in personal|system) ;; *) exit 64 ;; esac
 # shellcheck source=lib/octovault/priority.sh
 source /usr/lib/octovault/priority.sh
 ov_priority_setup "$1"
@@ -16,4 +17,4 @@ if ! ov_priority_cancel_plans; then
     printf '%s\n' '{"ok":false,"error":{"code":"backup_busy","message":"Scheduled backup cancellation did not finish; the vault has not been assumed closed."}}'
     exit 1
 fi
-/usr/libexec/octovault/backend "$1"
+/usr/libexec/octovault/backend "$1" "${2-system}"

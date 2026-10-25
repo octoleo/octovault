@@ -19,6 +19,7 @@ ov_event_records() {
 
 ov_schedule_validate_record() {
     local record=$1 trigger calendar delay
+    ov_record_scope "$record" >/dev/null
     ov_id "$(jq -er '.id' <<<"$record")"
     trigger=$(jq -r '.trigger // "manual"' <<<"$record")
     case "$trigger" in
@@ -38,9 +39,12 @@ ov_schedule_validate_record() {
 
 ov_schedule_sync() {
     local unit_dir=${OV_SYSTEMD_DIR:-/etc/systemd/system}
-    local record id base trigger timer calendar delay file records
+    local record id base trigger timer calendar delay file records scope
     [[ $OV_UID =~ ^[0-9]+$ ]] || ov_fail invalid_user 'Invalid schedule owner.'
     records=$(ov_event_records plans) || ov_fail invalid_state 'A saved backup plan is damaged; existing schedules were retained.'
+    if [[ ${OV_EXECUTION_SCOPE:-system} == personal ]]; then
+        records=$(jq -c 'select(.execution_scope == "personal")' <<< "$records")
+    fi
     # Validate every expression before changing any existing working timer.
     while IFS= read -r record; do
         [[ -n "$record" ]] || continue
@@ -51,22 +55,30 @@ ov_schedule_sync() {
     # Stop old timers before replacing; active backups are deliberately not stopped.
     for file in "$unit_dir/octovault-backup-$OV_UID-"*.timer; do
         [[ -f "$file" ]] || continue
+        if [[ ${OV_EXECUTION_SCOPE:-system} == personal ]]; then
+            grep -qx '# OctoVault-Execution-Scope=personal' "$file" || continue
+        fi
         systemctl disable --now "${file##*/}" >/dev/null 2>&1 || true
         rm -f -- "$file"
     done
     for file in "$unit_dir/octovault-backup-$OV_UID-"*.service; do
         [[ -f "$file" ]] || continue
+        if [[ ${OV_EXECUTION_SCOPE:-system} == personal ]]; then
+            grep -qx '# OctoVault-Execution-Scope=personal' "$file" || continue
+        fi
         rm -f -- "$file"
     done
     local -a timers=()
     while IFS= read -r record; do
         [[ -n "$record" ]] || continue
         id=$(jq -er '.id' <<<"$record") || ov_fail invalid_plan 'A backup plan has no identifier.'
+        scope=$(ov_record_scope "$record")
         base=$(ov_event_unit_name "$id")
         trigger=$(jq -r '.trigger // "manual"' <<<"$record")
         # Every plan has a fixed worker service so desktop/vault events can queue it.
         file="$unit_dir/$base.service"
         (umask 022; cat > "$file" <<UNIT
+# OctoVault-Execution-Scope=$scope
 [Unit]
 Description=OctoVault backup for user $OV_UID ($id)
 Wants=network-online.target
@@ -105,6 +117,7 @@ UNIT
         if [[ -n "$timer" ]]; then
             file="$unit_dir/$base.timer"
             (umask 022; cat > "$file" <<UNIT
+# OctoVault-Execution-Scope=$scope
 [Unit]
 Description=OctoVault backup schedule for user $OV_UID ($id)
 
@@ -153,6 +166,7 @@ ov_event_plan_allowed() {
 
 ov_event_queue_plan() {
     local id=$1 record=$2 base
+    if [[ $(ov_record_scope "$record") == personal ]] && ! ov_personal_enrolled; then return 2; fi
     ov_event_plan_allowed "$record" || return 2
     base=$(ov_event_unit_name "$id")
     # No blocking start: the worker currently owns the per-user backend lock.
@@ -196,6 +210,10 @@ ov_event_resume_plans() {
 
 ov_event_vault_operation() {
     local operation=$1 id=$2 force=${3:-false} result status
+    # The event dispatcher derives this close policy from a root-owned record.
+    # Ending an interactive permission session or revoking enrollment must not
+    # prevent an already approved safety lock, including its force policy.
+    local OV_EXECUTION_SCOPE=system
     # Run adapter in a subshell: ov_ok/ov_fail may terminate the worker function.
     if result=$(OV_OP="vault.$operation" OV_PARAMS=$(jq -nc --arg id "$id" --argjson force "$force" '{id:$id,force:$force}') ov_vault_dispatch); then
         status=$(jq -r '.ok // false' <<<"$result" 2>/dev/null) || status=false

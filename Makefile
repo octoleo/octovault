@@ -22,7 +22,7 @@ gui: build/octovault-gtk
 build:
 	mkdir -p $@
 
-build/octovaultd: src/service/daemon.c src/service/client.c src/service/client.h | build
+build/octovaultd: src/service/daemon.c src/service/access.c src/service/access-store.c src/service/access-recovery.c src/service/client.c src/service/client.h | build
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(CORE_CFLAGS) src/service/daemon.c src/service/client.c -o $@ $(LDFLAGS) $(CORE_LIBS)
 
 build/octovault: src/service/cli.c src/service/client.c src/service/client.h | build

@@ -261,6 +261,82 @@ static void test_safe_error_details(void)
     g_assert_nonnull(strstr(details,"Stage: queued"));g_assert_null(strstr(details,"Retained"));g_free(details);
 }
 
+static void test_access_capabilities_and_expiry(void)
+{
+    App app={0};JsonObject *state=json_object_new();app.access_state=state;
+    g_assert_true(access_can(&app,"vault.list"));g_assert_false(access_can(&app,"vault.create"));
+    g_assert_true(access_can(&app,"repository.get"));g_assert_true(access_can(&app,"vault.auth-check"));
+    g_assert_false(access_can(&app,"repository.snapshots"));g_assert_false(access_can(&app,"repository.files"));g_assert_false(access_can(&app,"vault.search"));
+    JsonArray *capabilities=json_array_new();json_array_add_string_element(capabilities,"vault.create");
+    json_object_set_array_member(state,"capabilities",capabilities);json_object_set_boolean_member(state,"authorized",TRUE);
+    json_object_set_string_member(state,"scope","personal");json_object_set_int_member(state,"expires_at",g_get_real_time()/G_USEC_PER_SEC+60);
+    g_assert_true(access_can(&app,"vault.create"));g_assert_false(access_can(&app,"access.grant"));g_assert_false(access_system(&app));
+    json_object_set_string_member(state,"scope","system");g_assert_true(access_system(&app));
+    json_object_set_int_member(state,"expires_at",g_get_real_time()/G_USEC_PER_SEC-1);
+    g_assert_true(access_expired(&app));g_assert_false(access_authorized(&app));g_assert_false(access_can(&app,"vault.create"));
+    g_assert_true(access_can(&app,"vault.list"));g_assert_true(access_can(&app,"access.unlock"));json_object_unref(state);
+}
+
+static void test_access_startup_prompt_policy(void)
+{
+    App app={0};JsonObject *state=json_object_new();app.access_state=state;
+    json_object_set_boolean_member(state,"available",TRUE);json_object_set_boolean_member(state,"can_request_system",TRUE);
+    g_assert_cmpstr(access_startup_scope(&app),==,"system");
+    app.access_background_launch=TRUE;g_assert_null(access_startup_scope(&app));
+    json_object_set_boolean_member(state,"delegated_personal",TRUE);g_assert_cmpstr(access_startup_scope(&app),==,"personal");
+    app.access_startup_attempted=TRUE;g_assert_null(access_startup_scope(&app));
+    app.access_background_launch=FALSE;g_assert_null(access_startup_scope(&app));
+    app.access_startup_attempted=FALSE;json_object_set_boolean_member(state,"authorized",TRUE);g_assert_null(access_startup_scope(&app));
+    json_object_set_boolean_member(state,"authorized",FALSE);json_object_set_boolean_member(state,"available",FALSE);g_assert_null(access_startup_scope(&app));json_object_unref(state);
+}
+
+static void test_access_error_guidance(void)
+{
+    const char *expired=access_error_message("io.vdm.OctoVault1.AuthorizationExpired");
+    const char *required=access_error_message("io.vdm.OctoVault1.AuthorizationRequired");
+    g_assert_nonnull(strstr(expired,"expired"));g_assert_nonnull(strstr(required,"required"));
+    g_assert_nonnull(strstr(access_error_message("AUTH_CANCELLED"),"cancelled"));
+    g_assert_nonnull(strstr(access_error_message("AUTH_DENIED"),"denied"));
+    g_assert_nonnull(strstr(access_error_message("AUTH_AGENT_UNAVAILABLE"),"agent"));
+    g_assert_nonnull(strstr(access_error_message("AUTH_SERVICE_UNAVAILABLE"),"service"));
+    g_assert_nonnull(strstr(access_error_message("AUTH_SESSION_UNAVAILABLE"),"session"));
+    App app={0};app.access_state=json_object_new();json_object_set_string_member(app.access_state,"reason","This desktop session is locked.");
+    g_assert_cmpstr(access_unavailable_reason(&app),==,"This desktop session is locked.");
+    json_object_remove_member(app.access_state,"reason");g_assert_nonnull(strstr(access_unavailable_reason(&app),"local desktop session"));json_object_unref(app.access_state);
+    g_assert_null(access_error_message("GPG_FAILURE"));
+}
+
+static void test_stale_access_status(void)
+{
+    App app={.access_generation=2,.access_status_pending=TRUE};
+    app.access_state=json_object_new();json_object_set_boolean_member(app.access_state,"authorized",TRUE);
+    json_object_set_string_member(app.access_state,"scope","system");
+    JsonObject *old=json_object_new();json_object_set_boolean_member(old,"authorized",FALSE);
+    JsonNode *payload=json_node_new(JSON_NODE_OBJECT);json_node_take_object(payload,old);
+    Operation status={.app=&app,.op="access.status",.access_generation=1};
+    g_assert_true(access_handle_result(&status,payload,NULL,NULL));g_assert_false(app.access_status_pending);
+    g_assert_true(access_authorized(&app));g_assert_cmpstr(str(app.access_state,"scope"),==,"system");
+    json_node_free(payload);json_object_unref(app.access_state);
+}
+
+static void test_access_resource_scope(void)
+{
+    App app={0};app.access_state=json_object_new();json_object_set_boolean_member(app.access_state,"authorized",TRUE);
+    json_object_set_string_member(app.access_state,"scope","personal");
+    JsonObject *legacy=json_object_new();json_object_set_string_member(legacy,"id","legacy-vault");
+    g_assert_true(access_record_requires_system(&app,"vault.open",legacy));
+    g_assert_false(access_record_requires_system(&app,"vault.get",legacy));
+    json_object_set_string_member(legacy,"execution_scope","personal");
+    g_assert_false(access_record_requires_system(&app,"vault.open",legacy));
+    JsonArray *vaults=json_array_new();json_array_add_object_element(vaults,json_object_ref(legacy));
+    app.collections[0]=json_node_new(JSON_NODE_ARRAY);json_node_take_array(app.collections[0],vaults);
+    JsonObject *reference=json_object_new();json_object_set_string_member(reference,"id","legacy-vault");
+    g_assert_false(access_record_requires_system(&app,"vault.open",reference));
+    json_object_set_string_member(app.access_state,"scope","system");json_object_remove_member(legacy,"execution_scope");
+    g_assert_false(access_record_requires_system(&app,"vault.open",legacy));
+    json_node_free(app.collections[0]);json_object_unref(reference);json_object_unref(legacy);json_object_unref(app.access_state);
+}
+
 static void test_advanced_defaults_and_preservation(void)
 {
     Form form={0};form.original=json_object_new();
@@ -327,6 +403,11 @@ int main(int argc, char **argv)
     g_test_add_func("/ui/decimal-size-serialization", test_decimal_size_serialization);
     g_test_add_func("/ui/token-authentication-contract", test_token_authentication_contract);
     g_test_add_func("/ui/safe-error-details", test_safe_error_details);
+    g_test_add_func("/ui/access-capabilities-expiry", test_access_capabilities_and_expiry);
+    g_test_add_func("/ui/access-startup-prompts", test_access_startup_prompt_policy);
+    g_test_add_func("/ui/access-error-guidance", test_access_error_guidance);
+    g_test_add_func("/ui/access-stale-status", test_stale_access_status);
+    g_test_add_func("/ui/access-resource-scope", test_access_resource_scope);
     g_test_add_func("/ui/advanced-defaults-preservation", test_advanced_defaults_and_preservation);
     g_test_add_func("/ui/destination-guidance", test_destination_guidance);
     return g_test_run();

@@ -112,6 +112,19 @@ jobs:
             --env CI=true --env OCTOVAULT_DISPOSABLE_TEST=1 \
             ubuntu:26.04 bash scripts/test-vault-container.sh
 
+  authorization-integration:
+    name: Real Polkit, PAM and login-session authorization
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Exercise administrator approval and non-sudo personal access
+        env:
+          OCTOVAULT_DISPOSABLE_TEST: '1'
+        run: bash scripts/test-authorization-container.sh
+
   distribution:
     name: Verify GitHub release and APT repository
     needs: package
@@ -146,7 +159,7 @@ jobs:
 
   release:
     name: Publish versioned Debian packages on GitHub
-    needs: [package, vault-integration, distribution]
+    needs: [package, vault-integration, authorization-integration, distribution]
     if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish))
     runs-on: ubuntu-24.04
     timeout-minutes: 10
