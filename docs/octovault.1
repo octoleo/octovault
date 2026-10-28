@@ -1,4 +1,4 @@
-.TH OCTOVAULT 1 "October 2026" "OctoVault 1.2.1" "User Commands"
+.TH OCTOVAULT 1 "October 2026" "OctoVault 1.2.2" "User Commands"
 .SH NAME
 octovault \- manage encrypted local vaults and independent backups
 .SH SYNOPSIS
@@ -120,6 +120,9 @@ migration list before choosing migration recover with --action resume or,
 when the recorded stage permits it, --action rollback. Recovery refuses
 to overwrite an occupied original path. The --migration-id value comes
 from the migration_id field of the recovery record.
+Restoring the original location cancels protection and leaves ordinary files.
+Use migration add again to protect them; an already restored operation cannot
+be resumed. Locking an empty or unlinked vault does not hide ordinary folders.
 .PP
 Vault protection does not create a versioned backup. Preserve the encrypted
 container and its separate encrypted key or carrier, plus the authentication

@@ -10,7 +10,7 @@ Download the `.deb` matching **your Ubuntu release and CPU architecture** from [
 
 ```bash
 sha256sum --check SHA256SUMS-ubuntu26.04
-sudo apt install ./octovault_1.2.1_ubuntu26.04_amd64.deb
+sudo apt install ./octovault_1.2.2_ubuntu26.04_amd64.deb
 ```
 
 APT installs the required encryption, backup, desktop, and system-integration dependencies. The checksum detects damaged or changed downloads; it is not an independent publisher signature. A downloaded Debian package does not enroll the computer into an automatic update repository.
@@ -31,13 +31,15 @@ Saved schedules do not need an open management session. Personal schedules still
 
 Creating a vault makes an **empty encrypted container**. It does not select, move, or protect your existing Documents folder. Give the container a **Vault file name**, choose the **Folder for the encrypted vault file**, and set its capacity in decimal GB. For example, `Document_vault` saved in `/home/alex` creates `/home/alex/Document_vault.tomb`. Your protected folders can have different names; `Documents` does not need to be renamed to `Document_vault`.
 
+The vault card lists its protected locations separately from storage capacity. Available space is reduced by the filesystem and reserved space even before documents are added; it does not establish that Documents has been protected.
+
 These locations serve different purposes:
 
 | Item | What it contains | Where it is used |
 | --- | --- | --- |
 | Encrypted container, such as `Document_vault.tomb` | The encrypted filesystem and its protected files | Stays in the storage folder chosen during creation, whether the vault is locked or unlocked |
 | Encrypted key file or image/text key carrier | The key needed to unlock that container | Stored separately; OctoVault manages its location automatically by default |
-| Unlocked vault folder | The decrypted view of the container while it is open | Managed automatically under `~/.local/share/octovault/mounts/`; **Browse files** opens this view |
+| Unlocked vault folder | The decrypted view of the container while it is open | Managed automatically under `~/.local/share/octovault/mounts/` |
 | Protected original path, such as `~/Documents` | The protected folder while unlocked; a separate ordinary folder while locked | Remains the familiar path your applications use after folder protection succeeds |
 
 OctoVault generates a new encryption key automatically. Choose a passphrase and confirm it; OctoVault remembers the encrypted key's location, never the passphrase. The private managed key folder is accessible only to your account. Select **Reuse an existing vault key file** only when you want to reuse an existing compatible vault key or protected carrier. Capacity is converted to whole MiB for the underlying engine; filesystem overhead reduces usable space.
@@ -62,11 +64,13 @@ To protect an existing folder or file:
 4. Let OctoVault finish copying, mapping, closing, reopening, and checking the files. Keep the application running until it reports completion. A temporary original remains available until the verification succeeds.
 5. Work through `~/Documents` while the vault is unlocked. Lock the vault to hide that protected view; unlock it to show those same protected files at `~/Documents` again.
 
+**Browse files** opens the protected original path when exactly one mapping is active. With multiple mappings, or none, it opens the vault folder. A new or unlinked vault may contain only `lost+found`; locking that empty container does not hide ordinary files in `~/Documents`.
+
 OctoVault creates the folder mapping automatically. You do not need to configure bind hooks or custom scripts. Advanced script hooks run user-provided programs on vault events and are optional; they are separate from folder protection.
 
 After successful protection, the original folder remains present when the vault locks. It starts empty. You can put separate files there while locked, but those files are **outside the encrypted vault**. Unlocking covers that ordinary folder with the protected contents; locking reveals the ordinary folder again. OctoVault does not monitor, erase, merge, or reconcile files written there. A mapped individual file similarly has a separate underlying file while locked.
 
-If the original folder disappears or a `.octovault-staging-…` folder remains, protection has not finished normally. That staging folder is a retained, unencrypted original, not the encrypted container. Do not delete it or repeat protection on it. Open **Folder protection & recovery** for the recorded operation and follow the [interrupted protection guidance](docs/recovery.md#interrupted-folder-protection).
+If the original folder disappears or a `.octovault-staging-…` folder remains, protection has not finished normally. That staging folder is a retained, unencrypted original, not the encrypted container. Do not delete it or repeat protection on it. Open **Folder protection & recovery** for the recorded operation and follow the [interrupted protection guidance](docs/recovery.md#interrupted-folder-protection). **Resume protection…** finishes the move into the vault. **Restore original location…** cancels protection and leaves ordinary files at their original path; choose **Protect a folder or file…** again to protect those restored files.
 
 A vault protects the working copy in its container. It does not create versioned backups or protect against losing the only container and key. Configure a separate backup plan for recoverable copies. When copying a closed vault for recovery, preserve both its `.tomb` container and its encrypted key or carrier, with the required passphrase or OpenPGP recovery arrangement.
 

@@ -51,7 +51,9 @@ A missing original folder, such as `~/Documents`, together with a nearby `.octov
 
 Keep the staging folder in place and avoid editing its files while recovering the move. OctoVault uses this retained original directly and removes it only after successful verification. It contains ordinary readable files until recovery completes.
 
-Updating OctoVault keeps your existing vault, key, and protection records. After installing version 1.2.1 or later, open OctoVault and use the vault card's **Folder protection & recovery** action. The update recognises earlier interrupted operations; you do not need to create another vault or add the staging folder again. Match the record's original path and retained-original path to the affected folder. **Resume protection…** continues the recorded operation and removes staging only after the reopened mapping and content have been verified. **Restore original location…** is available only when the recorded state permits safe rollback; it restores a missing path or empty folder and refuses to overwrite files already there. Once a mapping has been installed, resume is required instead of automatic rollback. Resolve full storage, file permissions, files in use, or unavailable unlock credentials before resuming.
+Updating OctoVault keeps your existing vault, key, and protection records, including earlier interrupted operations. Open the vault card's **Folder protection & recovery** action and match the original path and retained-original path to the affected folder; you do not need another vault.
+
+**Resume protection…** finishes moving the files into the vault and removes staging only after the reopened mapping and content have been verified. **Restore original location…** cancels protection and leaves ordinary files at their original path. Locking or unlocking the vault will not hide those restored files: choose **Protect a folder or file…** again to protect them. An already restored operation cannot be resumed. Restore is available only before mapping when the recorded state permits safe rollback; it refuses to overwrite existing files.
 
 The CLI can inspect the same records without changing them:
 
@@ -66,6 +68,10 @@ Use the actual vault `id` and the operation's `migration_id` returned by these c
 If the record is missing, the recorded path no longer matches the files on disk, or recovery reports a conflict, preserve all surviving copies and inspect the actual mount state before any manual move. A retained staging folder must not be treated as disposable cache. Do not create a new vault or remove the existing registration merely to clear the error.
 
 After successful protection, locking should reveal the ordinary underlying folder at the original path. New content written there is independent of the content in the vault. OctoVault deliberately does not delete or merge it. Review both views independently before any manual reconciliation.
+
+## Browse files shows only lost+found
+
+With exactly one active folder mapping, **Browse files** opens that protected original path, such as `~/Documents`. With multiple active mappings, or none, it opens the vault folder. An empty vault may contain only `lost+found`, a normal filesystem folder. It can also show less available space than its capacity because the filesystem uses and reserves space. The space figure is not evidence that your documents are inside. Restoring files to their original location does not link them to this container; protect them again to make vault lock and unlock control that path.
 
 ## The vault opens, but Browse files fails
 

@@ -396,9 +396,12 @@ static void test_migration_recovery_contract(void)
     json_object_set_string_member(migration,"vault_id","vault-example");
     json_object_set_string_member(migration,"migration_id","protection-example");
     json_object_set_string_member(migration,"id","wrong-legacy-field");
+    json_object_set_string_member(migration,"source","/home/person/Documents");
+    JsonObject*protection=migration_form_parameters(NULL,"vault-example",migration,NULL);
+    g_assert_cmpstr(str(protection,"id"),==,"vault-example");g_assert_cmpstr(str(protection,"source"),==,"/home/person/Documents");g_assert_false(json_object_has_member(protection,"migration_id"));g_assert_false(json_object_has_member(protection,"action"));json_object_unref(protection);
     const char*actions[]={"resume","rollback"};
     for(guint i=0;i<G_N_ELEMENTS(actions);i++){
-        JsonObject*params=migration_recovery_parameters(NULL,"vault-example",migration,actions[i]);
+        JsonObject*params=migration_form_parameters(NULL,"vault-example",migration,actions[i]);
         g_assert_cmpstr(str(params,"id"),==,"vault-example");
         g_assert_cmpstr(str(params,"migration_id"),==,"protection-example");
         g_assert_cmpstr(str(params,"action"),==,actions[i]);
@@ -413,9 +416,29 @@ static void test_migration_recovery_contract(void)
     json_object_unref(migration);
 }
 
+static void test_protected_location_browsing(void)
+{
+    GError*error=NULL;char*base=g_dir_make_tmp("octovault-ui-browse-XXXXXX",&error);g_assert_no_error(error);
+    char*container=g_build_filename(base,"vault",NULL),*documents=g_build_filename(base,"Documents",NULL),*file=g_build_filename(documents,"notes.txt",NULL);
+    g_assert_cmpint(g_mkdir(container,0700),==,0);g_assert_cmpint(g_mkdir(documents,0700),==,0);g_assert_true(g_file_set_contents(file,"test",-1,&error));g_assert_no_error(error);
+    JsonObject*record=json_object_new();json_object_set_string_member(record,"status","open");json_object_set_string_member(record,"mountpoint",container);json_object_set_null_member(record,"protected_locations");
+    char*path=vault_browse_path(record);g_assert_cmpstr(path,==,container);g_free(path);g_assert_cmpstr(vault_browse_label(record),==,"Open vault folder");
+    JsonArray*locations=json_array_new();json_object_set_array_member(record,"protected_locations",locations);
+    path=vault_browse_path(record);g_assert_cmpstr(path,==,container);g_free(path);g_assert_cmpstr(vault_browse_label(record),==,"Open vault folder");
+    JsonObject*location=json_object_new();json_object_set_string_member(location,"source",documents);json_object_set_boolean_member(location,"active",TRUE);json_array_add_object_element(locations,location);
+    path=vault_browse_path(record);g_assert_cmpstr(path,==,documents);g_free(path);g_assert_cmpstr(vault_browse_label(record),==,"Browse files");
+    json_object_set_string_member(location,"source",file);path=vault_browse_path(record);g_assert_cmpstr(path,==,documents);g_free(path);
+    json_object_set_boolean_member(location,"active",FALSE);path=vault_browse_path(record);g_assert_cmpstr(path,==,container);g_free(path);g_assert_cmpstr(vault_browse_label(record),==,"Open vault folder");
+    json_object_set_boolean_member(location,"active",TRUE);json_object_set_string_member(location,"source","/nonexistent/octovault-location");path=vault_browse_path(record);g_assert_cmpstr(path,==,container);g_free(path);
+    json_object_set_string_member(location,"source",documents);json_array_add_object_element(locations,json_object_ref(location));path=vault_browse_path(record);g_assert_cmpstr(path,==,container);g_free(path);
+    json_array_remove_element(locations,1);json_object_set_string_member(record,"status","closed");path=vault_browse_path(record);g_assert_cmpstr(path,==,container);g_free(path);
+    json_object_unref(record);g_assert_cmpint(g_unlink(file),==,0);g_assert_cmpint(g_rmdir(documents),==,0);g_assert_cmpint(g_rmdir(container),==,0);g_assert_cmpint(g_rmdir(base),==,0);g_free(file);g_free(documents);g_free(container);g_free(base);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
+    g_test_add_func("/ui/protected-location-browsing",test_protected_location_browsing);
     g_test_add_func("/ui/migration-recovery-contract",test_migration_recovery_contract);
     g_test_add_func("/ui/request-round-trip", test_request_round_trip);
     g_test_add_func("/ui/nested-policies", test_nested_policies);

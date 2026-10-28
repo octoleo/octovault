@@ -520,6 +520,36 @@ ov_vault_unbind() {
     done < <(jq -r '.filesystems | sort_by(.target|length) | reverse | .[].target' <<< "$mounts")
 }
 
+# Report native mappings only while their metadata is visible. A missing
+# mapping file means no mapped locations, not that the container has no files.
+ov_vault_protected_locations() (
+    local record=$1 mountpoint hook source relative active result='[]' i
+    local -a bindings=()
+    ov_vault_is_exposed "$record" || { printf 'null\n'; return; }
+    mountpoint=$(ov_vault_field "$record" mountpoint); hook="$mountpoint/bind-hooks"
+    if [[ ! -e $hook && ! -L $hook ]]; then printf '[]\n'; return; fi
+    if [[ ! -f $hook || -L $hook ]] || ! ov_vault_read_binds "$hook" >/dev/null 2>&1; then
+        printf 'null\n'; return
+    fi
+    mapfile -d '' -t bindings < <(ov_vault_read_binds "$hook")
+    ((${#bindings[@]} % 2 == 0)) || { printf 'null\n'; return; }
+    # Invalid native paths make this read-only inspection unavailable. Do not
+    # publish a failure report or modify the worker's first-error state.
+    unset OV_ERROR_FILE
+    for ((i=0; i<${#bindings[@]}; i+=2)); do
+        relative=${bindings[i]}; source=${bindings[i+1]}
+        if ! (ov_vault_relative "$relative" >/dev/null 2>&1) ||
+           ! (ov_vault_relative "$source" >/dev/null 2>&1); then
+            printf 'null\n'; return
+        fi
+        source="$OV_HOME/$source"; active=false
+        ov_vault_mapping_matches "$record" "$source" "$relative" >/dev/null 2>&1 && active=true
+        result=$(jq -c --arg source "$source" --arg relative "$relative" --argjson active "$active" \
+            '. + [{source:$source,relative:$relative,active:$active}]' <<< "$result")
+    done
+    printf '%s\n' "$result"
+)
+
 ov_vault_status() {
     local record=$1 status=closed usage='null' mountpoint
     mountpoint=$(ov_vault_active_mount "$record")
@@ -541,13 +571,14 @@ ov_vault_status() {
             *) status=unknown ;;
         esac
     fi
-    local pending='[]' id
+    local pending='[]' id locations
     id=$(ov_vault_field "$record" id)
     if [[ -n $id ]]; then
         pending=$(ov_migration_list "$id" | jq '[.[] | select(.stage != "complete" and .stage != "rolled_back")]')
     fi
-    jq --arg status "$status" --argjson usage "$usage" --argjson pending "$pending" \
-        '. + {status:$status,usage:$usage,pending_migrations:$pending}' <<< "$record"
+    locations=$(ov_vault_protected_locations "$record")
+    jq --arg status "$status" --argjson usage "$usage" --argjson pending "$pending" --argjson locations "$locations" \
+        '. + {status:$status,usage:$usage,pending_migrations:$pending,protected_locations:$locations}' <<< "$record"
 }
 
 ov_vault_validate_record() {
@@ -1378,8 +1409,8 @@ ov_migration_finish() {
 
 ov_migration_add() {
     local id record source relative staging migration migration_id mountpoint protected mounts
+    local OV_EVENT_RUNNING=1 password_loaded=false
     id=$(ov_require id); ov_load vaults "$id"; record=$OV_RECORD
-    ov_vault_is_open "$record" || ov_fail locked "Open this vault before adding files."
     source=$(ov_vault_user_path "$(ov_require source)"); relative=$(ov_vault_relative "$(ov_require relative)")
     [[ $source == "$OV_HOME/"* && $source != "$OV_HOME/.local/share/octovault"* ]] ||
         ov_fail invalid_source "Native folder mappings must be inside your home directory."
@@ -1397,7 +1428,19 @@ ov_migration_add() {
         [[ -z $protected || ( $protected != "$source" && $protected != "$source/"* ) ]] ||
             ov_fail invalid_source "The selected location contains this vault file, its unlocking key, or OctoVault's settings. Choose a folder that does not contain these files."
     done
-    [[ ! -e $mountpoint/$relative && ! -L $mountpoint/$relative ]] || ov_fail exists "The destination already exists inside the vault."
+    if ! ov_vault_is_open "$record"; then
+        ov_vault_password; password_loaded=true
+        ov_vault_open_record "$record"; record=$OV_RECORD
+        # Opening can expose native mappings beneath the selected folder.
+        # Inspect the now-visible mount tree before copying or renaming it.
+        findmnt -rn --mountpoint "$source" >/dev/null 2>&1 && ov_fail mounted "The selected path is already a mountpoint."
+        mounts=$(findmnt --json --list --output TARGET) || ov_fail state_unknown "Mounted folders could not be checked. Your original location has not been moved."
+        if jq -e --arg source "$source/" 'any(.filesystems[]?; .target | startswith($source))' <<< "$mounts" >/dev/null; then
+            ov_fail mounted "The selected folder contains a mounted or already protected location. Your original location has not been moved."
+        fi
+    fi
+    [[ ! -e $mountpoint/$relative && ! -L $mountpoint/$relative ]] ||
+        ov_fail exists "This destination already exists inside the vault, possibly from an earlier copy. It has been retained. Choose another name in Advanced options, or inspect the existing files before retrying."
     local a b
     ov_vault_relative "${source#"$OV_HOME/"}" >/dev/null
     ov_vault_read_binds "$mountpoint/bind-hooks" >/dev/null || ov_fail invalid_mapping "The existing folder mapping file is invalid. Your original location has not been moved."
@@ -1407,13 +1450,13 @@ ov_migration_add() {
            $a != "$relative" && $a != "$relative/"* && $relative != "$a/"* ]] ||
             ov_fail exists "This location overlaps an existing protected folder. Protect a whole folder or its individual items, rather than both."
     done < <(ov_vault_read_binds "$mountpoint/bind-hooks")
+    ov_vault_is_exposed "$record" || ov_fail mapping_failed "The unlocked vault folder is unavailable. Lock and unlock the vault before protecting files. Your original location has not been moved."
     migration_id=$(ov_new_id); staging="$(dirname -- "$source")/.octovault-staging-$migration_id"
     [[ ! -e $staging && ! -L $staging ]] || ov_fail exists "The migration staging location already exists."
     migration=$(jq -n --arg id "$id" --arg mid "$migration_id" --arg source "$source" --arg relative "$relative" \
         --arg staging "$staging" --arg time "$(ov_now)" '{schema_version:1,vault_id:$id,migration_id:$mid,source:$source,relative:$relative,staging:$staging,stage:"prepared",created_at:$time,updated_at:$time}')
     ov_migration_save "$id" "$migration_id" "$migration"
-    ov_vault_password
-    local OV_EVENT_RUNNING=1
+    $password_loaded || ov_vault_password
     ov_progress migrate "Preparing to copy and verify your files" 10
     ov_migration_finish "$record" "$migration"
     ov_progress complete "Files verified after reopening; staging removed" 100
@@ -1427,7 +1470,15 @@ ov_migration_recover() {
     path="$(ov_migration_dir "$id")/$mid.json"
     [[ -f $path ]] || ov_fail not_found "The migration recovery record was not found."
     migration=$(cat -- "$path"); stage=$(jq -r .stage <<< "$migration")
-    [[ $stage != complete && $stage != rolled_back ]] || { ov_ok "$migration"; return; }
+    case $action in resume|rollback) ;; *) ov_fail invalid_action "Recovery action must be resume or rollback." ;; esac
+    case $stage in
+        rolled_back)
+            ov_fail migration_cancelled "This protection attempt was cancelled when the original files were restored. Select the folder with Protect a folder or file to protect it again."
+            ;;
+        complete)
+            ov_fail already_protected "This protection attempt has already completed. Refresh the vault to see its current protected folders."
+            ;;
+    esac
     case $action in
         resume) local OV_EVENT_RUNNING=1; ov_vault_password; ov_migration_finish "$record" "$migration"; ov_ok "$OV_MIGRATION" ;;
         rollback)
