@@ -95,3 +95,5 @@ The output directory must be new. Without signing credentials, this produces onl
 ## Test scope
 
 Automated tests are the merge gate. Native smoke tests establish that the actual GUI starts and its operation wiring is loadable. Service tests establish request authorization boundaries and job behavior in isolation. Integration tests exercise the adapters using controlled fixtures and actual tools where available. A container does not reproduce every laptop's physical power state or token; optional tests on representative equipment are useful additional evidence, not a prerequisite imposed on the user before completing development.
+
+FIDO2 USB access uses the distribution's udev security-token rules and active-session permissions. The package depends on modern udev; it does not install world-writable device rules or run the hardware helper as root.
