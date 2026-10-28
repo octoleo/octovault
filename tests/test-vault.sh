@@ -84,7 +84,20 @@ test_native_binds() {
     assert_equal "${values[2]}" 'literal$(touch-nope)'
     printf 'one two three\n' > "$dir/bind-hooks"
     assert_fails ov_vault_read_binds "$dir/bind-hooks"
-    printf 'ok - native escaped-space bind hooks, literal metacharacters\n'
+    # Native Tomb accepts a last record without a final line feed. Appending
+    # another mapping must preserve both complete records.
+    printf 'Earlier Earlier' > "$dir/bind-hooks"
+    ov_migration_write_bind "$dir" Documents 'My Documents'
+    mapfile -d '' -t values < <(ov_vault_read_binds "$dir/bind-hooks")
+    assert_equal "${#values[@]}" 4
+    assert_equal "${values[0]}" Earlier
+    assert_equal "${values[1]}" Earlier
+    assert_equal "${values[2]}" Documents
+    assert_equal "${values[3]}" 'My Documents'
+    printf 'invalid existing mapping' > "$dir/bind-hooks"
+    assert_fails ov_migration_write_bind "$dir" Other Other
+    assert_equal "$(cat "$dir/bind-hooks")" 'invalid existing mapping'
+    printf 'ok - native escaped-space binds, literal metacharacters and atomic newline-safe updates\n'
 }
 
 test_compare() {
@@ -144,6 +157,260 @@ test_interrupted_migration() (
     assert_equal "$(cat "$staging/data")" 'keep me'
     assert_equal "$(jq -r .stage "$OV_ROOT/migrations/recoveryvault/recoverytest.json")" mapped
     printf 'ok - interrupted close retains staged original and recovery journal\n'
+)
+
+test_failed_copy_preserves_original() (
+    local source="$OV_HOME/Copy failure" mountpoint="$OV_HOME/copy-failure-vault"
+    local staging="$OV_HOME/.octovault-staging-copyfailure" record migration
+    mkdir -p "$source" "$mountpoint"
+    printf 'original data\n' > "$source/data"
+    record=$(jq -n --arg mount "$mountpoint" '{id:"copyfailurevault",mountpoint:$mount}')
+    migration=$(jq -n --arg source "$source" --arg staging "$staging" \
+        '{migration_id:"copyfailure",source:$source,staging:$staging,relative:"Data",stage:"prepared"}')
+    ov_migration_save copyfailurevault copyfailure "$migration"
+    ov_vault_is_open() { return 0; }
+    rsync() { printf 'partial copy\n' > "${!#}/partial"; return 23; }
+    if (ov_migration_finish "$record" "$migration") > "$WORK/copy-failure.json" 2>/dev/null; then
+        printf 'Expected copying to fail\n' >&2; exit 1
+    fi
+    assert_equal "$(jq -r .error.code "$WORK/copy-failure.json")" migration_failed
+    jq -e --arg source "$source" --arg target "$mountpoint/Data" \
+        '(.error.retained_paths | index($source) != null) and (.error.retained_paths | index($target) != null)' "$WORK/copy-failure.json" >/dev/null
+    assert_equal "$(cat "$source/data")" 'original data'
+    [[ ! -e $staging && ! -L $staging && -f $mountpoint/Data/partial ]]
+    assert_equal "$(jq -r .stage "$OV_ROOT/migrations/copyfailurevault/copyfailure.json")" prepared
+    printf 'ok - failed initial copy leaves the original folder and prepared recovery record intact\n'
+)
+
+test_symlink_destination_preserves_original() (
+    local source="$OV_HOME/Symlink destination Documents" mountpoint="$OV_HOME/symlink-destination-vault"
+    local staging="$OV_HOME/.octovault-staging-symlinkdestination" external="$OV_HOME/external-destination" record migration
+    mkdir -p "$source" "$mountpoint" "$external/Data"
+    printf 'original stays here\n' > "$source/data"
+    printf 'external stays unchanged\n' > "$external/Data/data"
+    ln -s "$external" "$mountpoint/Linked"
+    record=$(jq -n --arg mount "$mountpoint" '{id:"symlinkdestinationvault",mountpoint:$mount}')
+    migration=$(jq -n --arg source "$source" --arg staging "$staging" \
+        '{migration_id:"symlinkdestination",source:$source,staging:$staging,relative:"Linked/Data",stage:"prepared"}')
+    ov_migration_save symlinkdestinationvault symlinkdestination "$migration"
+    ov_vault_is_open() { return 0; }
+    rsync() { touch "$WORK/unexpected-symlink-destination-copy"; return 1; }
+    if (ov_migration_finish "$record" "$migration") > "$WORK/symlink-destination.json" 2>/dev/null; then
+        printf 'Expected symlink destination rejection\n' >&2; exit 1
+    fi
+    assert_equal "$(jq -r .error.code "$WORK/symlink-destination.json")" unsafe_path
+    assert_equal "$(cat "$source/data")" 'original stays here'
+    assert_equal "$(cat "$external/Data/data")" 'external stays unchanged'
+    [[ -L $mountpoint/Linked && ! -e $staging && ! -e $WORK/unexpected-symlink-destination-copy ]]
+    assert_equal "$(jq -r .stage "$OV_ROOT/migrations/symlinkdestinationvault/symlinkdestination.json")" prepared
+    printf 'ok - symlink destination parents are rejected before copying or moving original data\n'
+)
+
+test_closed_recovery_rechecks_destination() (
+    local initial_stage source mountpoint staging external record migration mid
+    local MOCK_RECOVERY_OPEN=false
+    for initial_stage in prepared staged; do
+        mid="closedrecovery$initial_stage"
+        source="$OV_HOME/Closed recovery $initial_stage"
+        mountpoint="$OV_HOME/closed-recovery-vault-$initial_stage"
+        staging="$OV_HOME/.octovault-staging-$mid"
+        external="$OV_HOME/closed-recovery-external-$initial_stage"
+        mkdir -p "$mountpoint" "$external/Data"
+        printf 'external remains unchanged\n' > "$external/Data/data"
+        if [[ $initial_stage == prepared ]]; then
+            mkdir -p "$source"
+            printf 'original recovery data\n' > "$source/data"
+        else
+            mkdir -p "$staging"
+            printf 'original recovery data\n' > "$staging/data"
+        fi
+        record=$(jq -n --arg mount "$mountpoint" '{id:"closedrecoveryvault",mountpoint:$mount}')
+        migration=$(jq -n --arg mid "$mid" --arg source "$source" --arg staging "$staging" --arg stage "$initial_stage" \
+            '{migration_id:$mid,source:$source,staging:$staging,relative:"Linked/Data",stage:$stage}')
+        ov_migration_save closedrecoveryvault "$mid" "$migration"
+        MOCK_RECOVERY_OPEN=false
+        ov_vault_is_open() { [[ $MOCK_RECOVERY_OPEN == true ]]; }
+        ov_vault_open_record() {
+            # The locked user mountpoint was empty. Opening reveals an unsafe
+            # destination parent stored inside the encrypted filesystem.
+            ln -s "$external" "$mountpoint/Linked"
+            MOCK_RECOVERY_OPEN=true
+        }
+        rsync() { touch "$WORK/unexpected-closed-recovery-copy"; return 1; }
+        if (ov_migration_finish "$record" "$migration") > "$WORK/closed-recovery-$initial_stage.json" 2>/dev/null; then
+            printf 'Expected revealed symlink destination rejection for %s\n' "$initial_stage" >&2; exit 1
+        fi
+        assert_equal "$(jq -r .error.code "$WORK/closed-recovery-$initial_stage.json")" unsafe_path
+        assert_equal "$(cat "$external/Data/data")" 'external remains unchanged'
+        [[ -L $mountpoint/Linked && ! -e $WORK/unexpected-closed-recovery-copy ]]
+        if [[ $initial_stage == prepared ]]; then
+            assert_equal "$(cat "$source/data")" 'original recovery data'
+            [[ ! -e $staging && ! -L $staging ]]
+        else
+            assert_equal "$(cat "$staging/data")" 'original recovery data'
+            [[ -d $source && ! -e $source/data ]]
+        fi
+        assert_equal "$(jq -r .stage "$OV_ROOT/migrations/closedrecoveryvault/$mid.json")" "$initial_stage"
+    done
+    printf 'ok - prepared and legacy recovery recheck destination symlinks revealed when unlocking\n'
+)
+
+test_capacity_before_copy() (
+    local source="$OV_HOME/Too large" mountpoint="$OV_HOME/small-vault"
+    local staging="$OV_HOME/.octovault-staging-capacity" record migration
+    mkdir -p "$source" "$mountpoint"
+    printf 'does not fit\n' > "$source/data"
+    record=$(jq -n --arg mount "$mountpoint" '{id:"capacityvault",mountpoint:$mount}')
+    migration=$(jq -n --arg source "$source" --arg staging "$staging" \
+        '{migration_id:"capacity",source:$source,staging:$staging,relative:"Data",stage:"prepared"}')
+    ov_migration_save capacityvault capacity "$migration"
+    ov_vault_is_open() { return 0; }
+    df() { printf 'Avail\n0\n'; }
+    rsync() { touch "$WORK/unexpected-capacity-copy"; return 1; }
+    if (ov_migration_finish "$record" "$migration") > "$WORK/capacity-failure.json" 2>/dev/null; then
+        printf 'Expected insufficient capacity rejection\n' >&2; exit 1
+    fi
+    assert_equal "$(jq -r .error.code "$WORK/capacity-failure.json")" insufficient_space
+    assert_equal "$(cat "$source/data")" 'does not fit'
+    [[ ! -e $staging && ! -e $mountpoint/Data && ! -e $WORK/unexpected-capacity-copy ]]
+    assert_equal "$(jq -r .stage "$OV_ROOT/migrations/capacityvault/capacity.json")" prepared
+    printf 'ok - insufficient capacity is rejected before copying or moving the original\n'
+)
+
+test_legacy_staging_recovery() (
+    local source="$OV_HOME/Legacy Documents" mountpoint="$OV_HOME/legacy-vault"
+    local staging="$OV_HOME/.octovault-staging-legacy" record migration
+    mkdir -p "$staging" "$mountpoint"
+    printf 'legacy original\n' > "$staging/data"
+    record=$(jq -n --arg mount "$mountpoint" '{id:"legacyvault",mountpoint:$mount}')
+    migration=$(jq -n --arg source "$source" --arg staging "$staging" \
+        '{migration_id:"legacy",source:$source,staging:$staging,relative:"Data",stage:"staged"}')
+    ov_migration_save legacyvault legacy "$migration"
+    ov_vault_is_open() { return 0; }
+    rsync() {
+        [[ -d $source && ! -e $source/data ]] || exit 81
+        touch "$WORK/legacy-placeholder-before-copy"
+        return 23
+    }
+    if (ov_migration_finish "$record" "$migration") > "$WORK/legacy-failure.json" 2>/dev/null; then
+        printf 'Expected interrupted legacy copy\n' >&2; exit 1
+    fi
+    assert_equal "$(jq -r .error.code "$WORK/legacy-failure.json")" migration_failed
+    jq -e --arg staging "$staging" \
+        '.error.retained_paths | index($staging) != null' "$WORK/legacy-failure.json" >/dev/null
+    [[ -d $source && -f $WORK/legacy-placeholder-before-copy ]]
+    assert_equal "$(cat "$staging/data")" 'legacy original'
+    assert_equal "$(jq -r .stage "$OV_ROOT/migrations/legacyvault/legacy.json")" staged
+    printf 'ok - legacy recovery recreates the original placeholder before retrying a failed copy\n'
+)
+
+test_prepared_rollback() (
+    local source="$OV_HOME/Rollback Documents" mountpoint="$OV_HOME/rollback-vault"
+    local staging="$OV_HOME/.octovault-staging-preparedrollback" migration
+    mkdir -p "$source" "$mountpoint/Data"
+    printf 'untouched original\n' > "$source/data"
+    printf 'retained encrypted partial\n' > "$mountpoint/Data/partial"
+    ov_save vaults preparedrollbackvault "$(jq -n --arg mount "$mountpoint" '{mountpoint:$mount}')"
+    migration=$(jq -n --arg source "$source" --arg staging "$staging" \
+        '{migration_id:"preparedrollback",source:$source,staging:$staging,relative:"Data",stage:"prepared"}')
+    ov_migration_save preparedrollbackvault preparedrollback "$migration"
+    OV_PARAMS='{"id":"preparedrollbackvault","migration_id":"preparedrollback","action":"rollback"}'
+    ov_migration_recover > "$WORK/prepared-rollback.json"
+    assert_equal "$(jq -r .data.stage "$WORK/prepared-rollback.json")" rolled_back
+    assert_equal "$(cat "$source/data")" 'untouched original'
+    assert_equal "$(cat "$mountpoint/Data/partial")" 'retained encrypted partial'
+    [[ ! -e $staging ]]
+    assert_equal "$(jq -r .stage "$OV_ROOT/migrations/preparedrollbackvault/preparedrollback.json")" rolled_back
+    printf 'ok - rollback after an initial copy failure preserves the original and encrypted partial copy\n'
+)
+
+test_published_mapping_blocks_rollback() (
+    local source="$OV_HOME/Published Documents" mountpoint="$OV_HOME/published-vault"
+    local staging="$OV_HOME/.octovault-staging-publishedrollback" migration
+    mkdir -p "$staging" "$mountpoint/Data"
+    printf 'staged original\n' > "$staging/data"
+    printf 'encrypted data\n' > "$mountpoint/Data/data"
+    ov_save vaults publishedrollbackvault "$(jq -n --arg mount "$mountpoint" '{mountpoint:$mount}')"
+    migration=$(jq -n --arg source "$source" --arg staging "$staging" \
+        '{migration_id:"publishedrollback",source:$source,staging:$staging,relative:"Data",stage:"copied"}')
+    ov_migration_save publishedrollbackvault publishedrollback "$migration"
+    # Simulate a crash after publishing bind-hooks but before saving mapped.
+    ov_migration_write_bind "$mountpoint" Data 'Published Documents'
+    ov_vault_is_exposed() { return 0; }
+    OV_PARAMS='{"id":"publishedrollbackvault","migration_id":"publishedrollback","action":"rollback"}'
+    if (ov_migration_recover) > "$WORK/published-rollback.json" 2>/dev/null; then
+        printf 'Expected a published mapping to block rollback\n' >&2; exit 1
+    fi
+    jq -e '.ok == false and (.error.code | length > 0)' "$WORK/published-rollback.json" >/dev/null
+    [[ ! -e $source && ! -L $source ]]
+    assert_equal "$(cat "$staging/data")" 'staged original'
+    assert_equal "$(cat "$mountpoint/Data/data")" 'encrypted data'
+    assert_equal "$(jq -r .stage "$OV_ROOT/migrations/publishedrollbackvault/publishedrollback.json")" copied
+    printf 'ok - rollback cannot restore plaintext beneath an already published folder mapping\n'
+)
+
+test_symlink_staging_blocks_rollback() (
+    local source="$OV_HOME/Symlink Documents" mountpoint="$OV_HOME/symlink-recovery-vault"
+    local staging="$OV_HOME/.octovault-staging-symlinkrollback" original="$OV_HOME/unrelated-original" migration
+    mkdir -p "$original" "$mountpoint"
+    printf 'untouched unrelated data\n' > "$original/data"
+    ln -s "$original" "$staging"
+    ov_save vaults symlinkrollbackvault "$(jq -n --arg mount "$mountpoint" '{mountpoint:$mount}')"
+    migration=$(jq -n --arg source "$source" --arg staging "$staging" \
+        '{migration_id:"symlinkrollback",source:$source,staging:$staging,relative:"Data",stage:"staged"}')
+    ov_migration_save symlinkrollbackvault symlinkrollback "$migration"
+    OV_PARAMS='{"id":"symlinkrollbackvault","migration_id":"symlinkrollback","action":"rollback"}'
+    if (ov_migration_recover) > "$WORK/symlink-rollback.json" 2>/dev/null; then
+        printf 'Expected symlink staging to block rollback\n' >&2; exit 1
+    fi
+    jq -e '.ok == false and (.error.code | length > 0)' "$WORK/symlink-rollback.json" >/dev/null
+    [[ ! -e $source && ! -L $source && -L $staging ]]
+    assert_equal "$(cat "$original/data")" 'untouched unrelated data'
+    assert_equal "$(jq -r .stage "$OV_ROOT/migrations/symlinkrollbackvault/symlinkrollback.json")" staged
+    printf 'ok - rollback rejects a replaced staging symlink and preserves unrelated data\n'
+)
+
+test_migration_source_safety() (
+    local source="$OV_HOME/Safety Documents" mountpoint="$OV_HOME/safety-vault" record
+    local MOCK_NESTED_MOUNT=false
+    mkdir -p "$source/child" "$mountpoint"
+    printf 'must not move\n' > "$source/data"
+    record=$(jq -n --arg mount "$mountpoint" --arg file "$OV_HOME/safety.tomb" \
+        --arg key "$OV_HOME/safety.key" '{mountpoint:$mount,file:$file,key_file:$key}')
+    ov_vault_is_open() { return 0; }
+    ov_vault_password() { touch "$WORK/unexpected-safety-authentication"; ov_fail test_failure 'Validation unexpectedly passed.'; }
+    findmnt() {
+        [[ $* == *'--json --list --output TARGET'* ]] || return 1
+        if [[ $MOCK_NESTED_MOUNT == true ]]; then
+            jq -n --arg target "$source/child" '{filesystems:[{target:$target}]}'
+        else printf '{"filesystems":[]}\n'; fi
+    }
+    assert_source_rejected() {
+        local expected=$1
+        if (ov_migration_add) > "$WORK/source-safety-failure.json" 2>/dev/null; then
+            printf 'Expected unsafe migration source rejection\n' >&2; exit 1
+        fi
+        assert_equal "$(jq -r .error.code "$WORK/source-safety-failure.json")" "$expected"
+        assert_equal "$(cat "$source/data")" 'must not move'
+        [[ ! -e $WORK/unexpected-safety-authentication ]]
+        [[ ! -d $OV_ROOT/migrations/safetyvault ]]
+    }
+    OV_PARAMS=$(jq -n --arg source "$source" '{id:"safetyvault",source:$source,relative:"NewData"}')
+    ov_save vaults safetyvault "$record"
+    MOCK_NESTED_MOUNT=true; assert_source_rejected mounted; MOCK_NESTED_MOUNT=false
+    ov_save vaults safetyvault "$(jq --arg file "$source/live.tomb" '.file=$file' <<< "$record")"
+    assert_source_rejected invalid_source
+    ov_save vaults safetyvault "$(jq --arg key "$source/live.key" '.key_file=$key' <<< "$record")"
+    assert_source_rejected invalid_source
+    ov_save vaults safetyvault "$(jq --arg cipher "$source/live.cipher" '.cipher_file=$cipher' <<< "$record")"
+    assert_source_rejected invalid_source
+    ov_save vaults safetyvault "$record"
+    ov_migration_write_bind "$mountpoint" Existing 'Safety Documents/child'
+    assert_source_rejected exists
+    printf 'Existing Elsewhere\n' > "$mountpoint/bind-hooks"
+    OV_PARAMS=$(jq -n --arg source "$source" '{id:"safetyvault",source:$source,relative:"Existing/child"}')
+    assert_source_rejected exists
+    printf 'ok - nested mounts, live container, key or cipher self-inclusion, and overlapping mappings are rejected before moving originals\n'
 )
 
 test_device_identity() (
@@ -597,5 +864,5 @@ PINENTRY
 }
 
 if [[ ${1:-} == --integration ]]; then integration
-else test_validation; test_native_binds; test_compare; test_migration; test_interrupted_migration; test_device_identity; test_mount_protections; test_unknown_state; test_secret_arguments; test_container_pin; test_guided_creation
+else test_validation; test_native_binds; test_compare; test_migration; test_interrupted_migration; test_failed_copy_preserves_original; test_symlink_destination_preserves_original; test_closed_recovery_rechecks_destination; test_capacity_before_copy; test_legacy_staging_recovery; test_prepared_rollback; test_published_mapping_blocks_rollback; test_symlink_staging_blocks_rollback; test_migration_source_safety; test_device_identity; test_mount_protections; test_unknown_state; test_secret_arguments; test_container_pin; test_guided_creation
 fi

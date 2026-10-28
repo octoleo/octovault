@@ -541,7 +541,13 @@ ov_vault_status() {
             *) status=unknown ;;
         esac
     fi
-    jq --arg status "$status" --argjson usage "$usage" '. + {status:$status,usage:$usage}' <<< "$record"
+    local pending='[]' id
+    id=$(ov_vault_field "$record" id)
+    if [[ -n $id ]]; then
+        pending=$(ov_migration_list "$id" | jq '[.[] | select(.stage != "complete" and .stage != "rolled_back")]')
+    fi
+    jq --arg status "$status" --argjson usage "$usage" --argjson pending "$pending" \
+        '. + {status:$status,usage:$usage,pending_migrations:$pending}' <<< "$record"
 }
 
 ov_vault_validate_record() {
@@ -1236,10 +1242,76 @@ ov_migration_stage() {
 }
 
 ov_migration_write_bind() {
-    local mountpoint=$1 relative=$2 target=$3 line escaped_relative escaped_target
+    local mountpoint=$1 relative=$2 target=$3 line escaped_relative escaped_target temporary
     escaped_relative=${relative// /\\ }; escaped_target=${target// /\\ }
     line="$escaped_relative $escaped_target"
-    printf '%s\n' "$line" | ov_as_user tee -a -- "$mountpoint/bind-hooks" >/dev/null || return 1
+    # Publish a complete file, including a separator when an imported native
+    # bind-hooks file has no final newline. Never append a partial record.
+    [[ ! -L $mountpoint/bind-hooks ]] || return 1
+    temporary=$(ov_as_user mktemp "$mountpoint/.octovault-binds.XXXXXXXX") || return 1
+    if ! {
+        if [[ -s $mountpoint/bind-hooks ]]; then
+            ov_as_user cat -- "$mountpoint/bind-hooks" || return 1
+            printf '\n'
+        fi
+        printf '%s\n' "$line"
+    } |
+        ov_as_user tee -- "$temporary" >/dev/null; then
+        ov_as_user rm -f -- "$temporary"; return 1
+    fi
+    if ! ov_vault_read_binds "$temporary" >/dev/null || ! sync -f "$temporary" ||
+        ! ov_as_user mv -fT -- "$temporary" "$mountpoint/bind-hooks"; then
+        ov_as_user rm -f -- "$temporary"; return 1
+    fi
+}
+
+ov_migration_capacity() {
+    local source=$1 mountpoint=$2 bytes available
+    # rsync without --sparse allocates the apparent size of sparse files. Scan
+    # through the owner's identity so unreadable trees fail before any rename.
+    bytes=$(ov_as_user du --apparent-size --block-size=1 --summarize -- "$source") ||
+        ov_fail permission_denied "Some selected files could not be read. Your original location has not been moved."
+    bytes=${bytes%%$'\t'*}
+    available=$(df -B1 --output=avail -- "$mountpoint" | awk 'NR==2 {print $1}') || return 1
+    [[ $bytes =~ ^[0-9]+$ && $available =~ ^[0-9]+$ ]] || return 1
+    ((bytes <= available)) ||
+        ov_fail insufficient_space "The selected data is larger than the free space inside this vault. Increase the vault capacity or choose less data. Your original location has not been moved."
+}
+
+ov_migration_copy() {
+    local original=$1 target=$2
+    # Recovery may have just opened the vault, revealing children that were
+    # hidden beneath its closed mountpoint. Recheck before any destination write.
+    [[ $(realpath -m -- "$target") == "$target" && ! -L $target ]] ||
+        ov_fail unsafe_path "The encrypted destination or one of its parent folders is a symbolic link. The original data has been retained."
+    ov_progress copy "Copying into the encrypted vault; the original data is retained" 25
+    ov_as_user mkdir -p -- "$(dirname -- "$target")" || ov_fail migration_failed "Could not create the destination directory. The original data has been retained."
+    if [[ -d $original ]]; then
+        ov_as_user mkdir -p -- "$target" || ov_fail migration_failed "Could not create the destination directory. The original data has been retained."
+        ov_as_user rsync -aHAX -- "$original/" "$target/" >&2 ||
+            ov_fail migration_failed "Copy failed. The original data has been retained; use Folder protection & recovery to retry or restore it."
+    else
+        ov_as_user rsync -aHAX -- "$original" "$target" >&2 ||
+            ov_fail migration_failed "Copy failed. The original data has been retained; use Folder protection & recovery to retry or restore it."
+    fi
+    ov_progress verify "Checking the encrypted copy against the original" 45
+    ov_migration_compare "$original" "$target" ||
+        ov_fail verification_failed "The copied data did not match. The original data has been retained; close applications changing these files before retrying."
+}
+
+ov_migration_placeholder() {
+    local source=$1 staging=$2
+    # Legacy interrupted moves may have no original location. New moves create
+    # this placeholder immediately after rename, before close/reopen can fail.
+    if [[ ! -e $source && ! -L $source ]]; then
+        if [[ -d $staging ]]; then
+            ov_as_user mkdir -- "$source" || ov_fail migration_failed "Could not create the empty original folder. The staged original is retained; use Folder protection & recovery."
+        else
+            ov_as_user touch -- "$source" || ov_fail migration_failed "Could not create the empty original file. The staged original is retained; use Folder protection & recovery."
+        fi
+    fi
+    [[ ! -L $source && ( -d $staging && -d $source || -f $staging && -f $source ) ]] ||
+        ov_fail recovery_needed "The original location has changed type. The staged original has been retained."
 }
 
 ov_migration_finish() {
@@ -1247,34 +1319,43 @@ ov_migration_finish() {
     stage=$(jq -r .stage <<< "$migration"); source=$(jq -r .source <<< "$migration")
     staging=$(jq -r .staging <<< "$migration"); relative=$(jq -r .relative <<< "$migration")
     mountpoint=$(ov_vault_field "$record" mountpoint); target="$mountpoint/$relative"
+    ov_failure_retain "$source"; ov_failure_retain "$staging"; ov_failure_retain "$target"
+    [[ $(realpath -m -- "$target") == "$target" && ! -L $target ]] ||
+        ov_fail unsafe_path "The encrypted destination or one of its parent folders is a symbolic link. The original data has been retained."
     if [[ $stage == prepared ]]; then
-        # A crash may have happened after rename but before saving its stage.
-        if [[ ! -e $staging && -e $source ]]; then
-            ov_as_user mv -T -- "$source" "$staging" || ov_fail migration_failed "Could not stage the original."
+        # Keep the familiar original location throughout the expensive copy.
+        # A legacy journal or crash after rename is resumed from staging below.
+        if [[ ! -e $staging && ! -L $staging ]]; then
+            [[ -e $source && ! -L $source ]] || ov_fail recovery_needed "The original and staged data cannot be found."
+            ov_vault_is_open "$record" || ov_vault_open_record "$record"
+            # A partial destination from a previous attempt already consumes
+            # space; rsync can reuse it, so capacity is checked on the first try.
+            [[ -e $target ]] || ov_migration_capacity "$source" "$mountpoint"
+            ov_migration_copy "$source" "$target"
+            ov_progress map "Preparing the original location to show the protected data" 60
+            ov_as_user mv -nT -- "$source" "$staging" || ov_fail migration_failed "Could not stage the verified original. It remains at the original location."
+            [[ ! -e $source && ! -L $source && -e $staging ]] || ov_fail recovery_needed "The staging location changed. No original data was removed."
+            ov_migration_placeholder "$source" "$staging"
+            ov_migration_compare "$staging" "$target" ||
+                ov_fail verification_failed "The original data changed while it was being moved. The staged original has been retained; close applications using it and resume the interrupted move."
+            ov_migration_stage "$record" "$migration" copied; migration=$OV_MIGRATION; stage=copied
+        else
+            [[ -e $staging && ! -L $staging ]] || ov_fail recovery_needed "The staged original cannot be found safely."
+            ov_migration_stage "$record" "$migration" staged; migration=$OV_MIGRATION; stage=staged
         fi
-        [[ -e $staging ]] || ov_fail recovery_needed "The staged original cannot be found."
-        ov_migration_stage "$record" "$migration" staged; migration=$OV_MIGRATION; stage=staged
     fi
     if [[ $stage == staged ]]; then
+        ov_migration_placeholder "$source" "$staging"
         ov_vault_is_open "$record" || ov_vault_open_record "$record"
-        ov_as_user mkdir -p -- "$(dirname -- "$target")" || ov_fail migration_failed "Could not create the destination directory."
-        if [[ -d $staging ]]; then
-            ov_as_user mkdir -p -- "$target"
-            ov_as_user rsync -aHAX -- "$staging/" "$target/" >&2 || ov_fail migration_failed "Copy failed; the staged original has been retained."
-        else
-            ov_as_user rsync -aHAX -- "$staging" "$target" >&2 || ov_fail migration_failed "Copy failed; the staged original has been retained."
-        fi
-        ov_migration_compare "$staging" "$target" || ov_fail verification_failed "The copied data did not match; the staged original has been retained."
+        ov_migration_copy "$staging" "$target"
         ov_migration_stage "$record" "$migration" copied; migration=$OV_MIGRATION; stage=copied
     fi
     if [[ $stage == copied ]]; then
         ov_vault_is_open "$record" || ov_vault_open_record "$record"
         # A preexisting or newly written underlying location is never replaced.
-        if [[ ! -e $source && ! -L $source ]]; then
-            if [[ -d $staging ]]; then ov_as_user mkdir -- "$source"; else ov_as_user touch -- "$source"; fi
-        fi
-        [[ -d $staging && -d $source || -f $staging && -f $source ]] || ov_fail recovery_needed "The placeholder type changed; the staged original was retained."
+        ov_migration_placeholder "$source" "$staging"
         local found=false a b
+        ov_vault_read_binds "$mountpoint/bind-hooks" >/dev/null || ov_fail invalid_mapping "The folder mapping file is invalid. The staged original has been retained."
         while IFS= read -r -d '' a && IFS= read -r -d '' b; do
             if [[ $a == "$relative" && $b == "${source#"$OV_HOME/"}" ]]; then found=true; break; fi
         done < <(ov_vault_read_binds "$mountpoint/bind-hooks")
@@ -1282,14 +1363,17 @@ ov_migration_finish() {
         ov_migration_stage "$record" "$migration" mapped; migration=$OV_MIGRATION; stage=mapped
     fi
     if [[ $stage == mapped ]]; then
+        ov_progress check_lock "Testing that the vault locks safely" 70
         ov_vault_close_record "$record" false
         ov_migration_stage "$record" "$migration" closed; migration=$OV_MIGRATION; stage=closed
     fi
     if [[ $stage == closed ]]; then
+        ov_progress check_unlock "Unlocking again to test the original location" 80
         ov_vault_open_record "$record"
         ov_migration_stage "$record" "$migration" reopened; migration=$OV_MIGRATION; stage=reopened
     fi
     if [[ $stage == reopened ]]; then
+        ov_progress verify_mapping "Verifying the protected data at its original location" 90
         ov_vault_is_open "$record" || ov_vault_open_record "$record"
         ov_vault_mapping_matches "$record" "$source" "$relative" || ov_fail verification_failed "The expected native mapping is not mounted. The staged original is retained."
         ov_migration_compare "$staging" "$source" || ov_fail verification_failed "Reopened content does not match. The staged original is retained."
@@ -1309,7 +1393,7 @@ ov_migration_finish() {
 }
 
 ov_migration_add() {
-    local id record source relative staging migration migration_id mountpoint
+    local id record source relative staging migration migration_id mountpoint protected mounts
     id=$(ov_require id); ov_load vaults "$id"; record=$OV_RECORD
     ov_vault_is_open "$record" || ov_fail locked "Open this vault before adding files."
     source=$(ov_vault_user_path "$(ov_require source)"); relative=$(ov_vault_relative "$(ov_require relative)")
@@ -1317,12 +1401,27 @@ ov_migration_add() {
         ov_fail invalid_source "Native folder mappings must be inside your home directory."
     [[ -f $source || -d $source ]] || ov_fail invalid_source "Choose an existing regular file or directory."
     findmnt -rn --mountpoint "$source" >/dev/null 2>&1 && ov_fail mounted "The selected path is already a mountpoint."
+    # Renaming a parent containing an existing bind moves those mounts too.
+    # Never stage a whole Documents tree after protecting one of its children.
+    mounts=$(findmnt --json --list --output TARGET) || ov_fail state_unknown "Mounted folders could not be checked. Your original location has not been moved."
+    if jq -e --arg source "$source/" 'any(.filesystems[]?; .target | startswith($source))' <<< "$mounts" >/dev/null; then
+        ov_fail mounted "The selected folder contains a mounted or already protected location. Protect the whole folder before adding its individual files or subfolders. Your original location has not been moved."
+    fi
     mountpoint=$(ov_vault_field "$record" mountpoint)
     [[ $source != "$mountpoint" && $source != "$mountpoint/"* && $mountpoint != "$source/"* ]] || ov_fail invalid_source "A vault cannot be migrated into itself."
+    for protected in "$(ov_vault_field "$record" file)" "$(ov_vault_field "$record" key_file)" "$(ov_vault_field "$record" cipher_file)" "$OV_HOME/.local/share/octovault" "$OV_ROOT"; do
+        [[ -z $protected || ( $protected != "$source" && $protected != "$source/"* ) ]] ||
+            ov_fail invalid_source "The selected location contains this vault file, its unlocking key, or OctoVault's settings. Choose a folder that does not contain these files."
+    done
     [[ ! -e $mountpoint/$relative && ! -L $mountpoint/$relative ]] || ov_fail exists "The destination already exists inside the vault."
     local a b
+    ov_vault_relative "${source#"$OV_HOME/"}" >/dev/null
+    ov_vault_read_binds "$mountpoint/bind-hooks" >/dev/null || ov_fail invalid_mapping "The existing folder mapping file is invalid. Your original location has not been moved."
     while IFS= read -r -d '' a && IFS= read -r -d '' b; do
-        [[ $b != "${source#"$OV_HOME/"}" && $a != "$relative" ]] || ov_fail exists "This location is already mapped."
+        protected=${source#"$OV_HOME/"}
+        [[ $b != "$protected" && $b != "$protected/"* && $protected != "$b/"* &&
+           $a != "$relative" && $a != "$relative/"* && $relative != "$a/"* ]] ||
+            ov_fail exists "This location overlaps an existing protected folder. Protect a whole folder or its individual items, rather than both."
     done < <(ov_vault_read_binds "$mountpoint/bind-hooks")
     migration_id=$(ov_new_id); staging="$(dirname -- "$source")/.octovault-staging-$migration_id"
     [[ ! -e $staging && ! -L $staging ]] || ov_fail exists "The migration staging location already exists."
@@ -1331,14 +1430,14 @@ ov_migration_add() {
     ov_migration_save "$id" "$migration_id" "$migration"
     ov_vault_password
     local OV_EVENT_RUNNING=1
-    ov_progress migrate "Staging and copying your files" 10
+    ov_progress migrate "Preparing to copy and verify your files" 10
     ov_migration_finish "$record" "$migration"
     ov_progress complete "Files verified after reopening; staging removed" 100
     ov_ok "$OV_MIGRATION"
 }
 
 ov_migration_recover() {
-    local id mid action record migration path source staging stage
+    local id mid action record migration path source staging stage mountpoint relative a b
     id=$(ov_require id); mid=$(ov_require migration_id); action=$(ov_param action resume)
     ov_id "$mid"; ov_load vaults "$id"; record=$OV_RECORD
     path="$(ov_migration_dir "$id")/$mid.json"
@@ -1351,8 +1450,27 @@ ov_migration_recover() {
             source=$(jq -r .source <<< "$migration"); staging=$(jq -r .staging <<< "$migration")
             [[ $stage == prepared || $stage == staged || $stage == copied ]] ||
                 ov_fail recovery_needed "A mapped migration must be resumed; automatic rollback would change underlying locations."
-            [[ ! -e $source && ! -L $source && -e $staging ]] || ov_fail conflict "The original location is occupied, so rollback will not overwrite it."
-            ov_as_user mv -T -- "$staging" "$source" || ov_fail recovery_failed "The original could not be restored."
+            if [[ $stage == copied ]]; then
+                # A crash may have published bind-hooks before saving 'mapped'.
+                # Inspect the actual metadata before restoring an original that
+                # a later unlock could hide beneath the copied data.
+                ov_vault_is_exposed "$record" || ov_fail recovery_needed "Unlock this vault before restoring a copied move, so its folder mappings can be checked. You can also resume the interrupted move."
+                mountpoint=$(ov_vault_field "$record" mountpoint); relative=$(jq -r .relative <<< "$migration")
+                ov_vault_read_binds "$mountpoint/bind-hooks" >/dev/null || ov_fail invalid_mapping "The folder mapping file is invalid. The staged original has been retained."
+                while IFS= read -r -d '' a && IFS= read -r -d '' b; do
+                    [[ $a != "$relative" && $b != "${source#"$OV_HOME/"}" ]] ||
+                        ov_fail recovery_needed "This move already has a folder mapping. Resume it so the staged original is verified safely."
+                done < <(ov_vault_read_binds "$mountpoint/bind-hooks")
+            fi
+            if [[ $stage == prepared && -e $source && ! -L $source && ! -e $staging && ! -L $staging ]]; then
+                # New migrations copy before staging. An interrupted copy has
+                # left the original untouched; the encrypted partial copy stays.
+                ov_migration_stage "$record" "$migration" rolled_back; ov_ok "$OV_MIGRATION"; return
+            fi
+            [[ ! -e $source && ! -L $source && ! -L $staging && ( -d $staging || -f $staging ) ]] ||
+                ov_fail conflict "The original location is occupied or the staged original has changed, so rollback will not overwrite it."
+            ov_as_user mv -nT -- "$staging" "$source" || ov_fail recovery_failed "The original could not be restored."
+            [[ ! -e $staging && ! -L $staging ]] || ov_fail conflict "The original location became occupied. The staged original was retained."
             ov_migration_stage "$record" "$migration" rolled_back; ov_ok "$OV_MIGRATION"
             ;;
         *) ov_fail invalid_action "Recovery action must be resume or rollback." ;;

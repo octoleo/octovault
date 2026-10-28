@@ -45,11 +45,33 @@ Personal repositories and their destinations and plans must all use personal sco
 
 The underlying repository can also be accessed directly with Restic and the saved credentials. Likewise, a vault can be opened directly with a compatible Tomb version and its key. OctoVault records add management information; they are not a proprietary data format required to decrypt the content.
 
-## Interrupted folder migration
+## Interrupted folder protection
 
-Do not delete the staging original or overwrite either side. OctoVault records the migration stage and retains the original until it has copied the data, installed the mapping, reopened the vault, and verified the mounted result. Use the migration recovery action to inspect and finish or roll back the recorded operation. If a close or reopen failed because files are busy or credentials were unavailable, resolve that condition first.
+A missing original folder, such as `~/Documents`, together with a nearby `.octovault-staging-…` folder means that folder protection may have stopped partway through. The staging folder contains the retained original data and is not encrypted by the vault. Its presence does not prove that the encrypted copy or its mapping has been completed. The vault can be open even when protection of a selected folder has failed.
 
-When the vault is closed, its mapped original path is an ordinary underlying folder or file. New content written there is independent of the content in the vault. OctoVault deliberately does not delete or merge it. Review both views independently before any manual reconciliation.
+Do not delete or rename the staging folder, overwrite either copy, or select it for a second protection operation. Avoid editing either copy until you have compared the recorded state. If the staging folder is your only accessible copy, preserve an independent copy of it before attempting recovery. Keep its permissions restrictive because it contains ordinary readable files.
+
+Open the vault's **Folder protection & recovery** action. Match the record's original path and retained-original path to the affected folder. **Resume protection…** continues the recorded operation and removes staging only after the reopened mapping and content have been verified. **Restore original location…** is available only when the recorded state permits safe rollback; it refuses to overwrite an occupied original path. Once a mapping has been installed, resume is required instead of automatic rollback. Resolve full storage, file permissions, files in use, or unavailable unlock credentials before resuming.
+
+The CLI can inspect the same records without changing them:
+
+```bash
+octovault --json vault list
+octovault --json migration list --id VAULT_ID
+octovault diagnostic list
+```
+
+Use the actual vault `id` and the operation's `migration_id` returned by these commands. To continue a selected operation, run `octovault migration recover --id VAULT_ID --migration-id MIGRATION_ID --action resume --password` for a passphrase-protected key. `--password` prompts securely. OpenPGP-protected keys use their normal GnuPG or token authentication. The alternative `--action rollback` is accepted only for stages that can safely restore the original; recovery never overwrites an existing original path.
+
+If the record is missing, the recorded path no longer matches the files on disk, or recovery reports a conflict, preserve all surviving copies and inspect the actual mount state before any manual move. A retained staging folder must not be treated as disposable cache. Do not create a new vault or remove the existing registration merely to clear the error.
+
+After successful protection, locking should reveal the ordinary underlying folder at the original path. New content written there is independent of the content in the vault. OctoVault deliberately does not delete or merge it. Review both views independently before any manual reconciliation.
+
+## The vault opens, but Browse files fails
+
+An error containing `Portal operation not allowed: Unable to open /proc/PID/root` concerns desktop file-manager launching. It does not by itself mean that vault creation, decryption, or the container filesystem failed. The application protects its process from inspection because it handles secrets; desktop portals can reject requests from that protected process. Folder-protection recovery is a separate operation and must still be checked when the original path is missing.
+
+Current versions open the vault folder through the desktop file manager directly, with a direct directory-application fallback. Keep the container, key, and any staging original. If an older version shows this portal error, open your file manager as your regular account and enter the unlocked vault folder shown in the vault's details. Do not use `sudo` to start the file manager, weaken process protection, or change global portal settings as a workaround.
 
 ## Busy vaults
 

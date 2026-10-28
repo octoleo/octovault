@@ -389,9 +389,33 @@ static void test_destination_guidance(void)
     json_object_unref(params);json_object_unref(original);
 }
 
+static void test_migration_recovery_contract(void)
+{
+    JsonObject*migration=json_object_new();
+    json_object_set_string_member(migration,"vault_id","vault-example");
+    json_object_set_string_member(migration,"migration_id","protection-example");
+    json_object_set_string_member(migration,"id","wrong-legacy-field");
+    const char*actions[]={"resume","rollback"};
+    for(guint i=0;i<G_N_ELEMENTS(actions);i++){
+        JsonObject*params=migration_recovery_parameters("vault-example",migration,actions[i]);
+        g_assert_cmpstr(str(params,"id"),==,"vault-example");
+        g_assert_cmpstr(str(params,"migration_id"),==,"protection-example");
+        g_assert_cmpstr(str(params,"action"),==,actions[i]);
+        json_object_unref(params);
+    }
+    g_assert_true(migration_can_restore("prepared"));
+    g_assert_true(migration_can_restore("staged"));
+    g_assert_true(migration_can_restore("copied"));
+    g_assert_false(migration_can_restore("mapped"));
+    g_assert_false(migration_can_restore("reopened"));
+    g_assert_false(migration_can_restore("complete"));
+    json_object_unref(migration);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
+    g_test_add_func("/ui/migration-recovery-contract",test_migration_recovery_contract);
     g_test_add_func("/ui/request-round-trip", test_request_round_trip);
     g_test_add_func("/ui/nested-policies", test_nested_policies);
     g_test_add_func("/ui/restore-retention-contract", test_restore_and_retention_contract);
