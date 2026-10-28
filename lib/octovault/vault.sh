@@ -1265,19 +1265,6 @@ ov_migration_write_bind() {
     fi
 }
 
-ov_migration_capacity() {
-    local source=$1 mountpoint=$2 bytes available
-    # rsync without --sparse allocates the apparent size of sparse files. Scan
-    # through the owner's identity so unreadable trees fail before any rename.
-    bytes=$(ov_as_user du --apparent-size --block-size=1 --summarize -- "$source") ||
-        ov_fail permission_denied "Some selected files could not be read. Your original location has not been moved."
-    bytes=${bytes%%$'\t'*}
-    available=$(df -B1 --output=avail -- "$mountpoint" | awk 'NR==2 {print $1}') || return 1
-    [[ $bytes =~ ^[0-9]+$ && $available =~ ^[0-9]+$ ]] || return 1
-    ((bytes <= available)) ||
-        ov_fail insufficient_space "The selected data is larger than the free space inside this vault. Increase the vault capacity or choose less data. Your original location has not been moved."
-}
-
 ov_migration_copy() {
     local original=$1 target=$2
     # Recovery may have just opened the vault, revealing children that were
@@ -1328,9 +1315,6 @@ ov_migration_finish() {
         if [[ ! -e $staging && ! -L $staging ]]; then
             [[ -e $source && ! -L $source ]] || ov_fail recovery_needed "The original and staged data cannot be found."
             ov_vault_is_open "$record" || ov_vault_open_record "$record"
-            # A partial destination from a previous attempt already consumes
-            # space; rsync can reuse it, so capacity is checked on the first try.
-            [[ -e $target ]] || ov_migration_capacity "$source" "$mountpoint"
             ov_migration_copy "$source" "$target"
             ov_progress map "Preparing the original location to show the protected data" 60
             ov_as_user mv -nT -- "$source" "$staging" || ov_fail migration_failed "Could not stage the verified original. It remains at the original location."

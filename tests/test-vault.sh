@@ -255,7 +255,7 @@ test_closed_recovery_rechecks_destination() (
     printf 'ok - prepared and legacy recovery recheck destination symlinks revealed when unlocking\n'
 )
 
-test_capacity_before_copy() (
+test_full_vault_preserves_original() (
     local source="$OV_HOME/Too large" mountpoint="$OV_HOME/small-vault"
     local staging="$OV_HOME/.octovault-staging-capacity" record migration
     mkdir -p "$source" "$mountpoint"
@@ -265,16 +265,16 @@ test_capacity_before_copy() (
         '{migration_id:"capacity",source:$source,staging:$staging,relative:"Data",stage:"prepared"}')
     ov_migration_save capacityvault capacity "$migration"
     ov_vault_is_open() { return 0; }
-    df() { printf 'Avail\n0\n'; }
-    rsync() { touch "$WORK/unexpected-capacity-copy"; return 1; }
+    # rsync uses exit 11 for a file I/O error, including a full destination.
+    rsync() { return 11; }
     if (ov_migration_finish "$record" "$migration") > "$WORK/capacity-failure.json" 2>/dev/null; then
-        printf 'Expected insufficient capacity rejection\n' >&2; exit 1
+        printf 'Expected full-vault copy failure\n' >&2; exit 1
     fi
-    assert_equal "$(jq -r .error.code "$WORK/capacity-failure.json")" insufficient_space
+    assert_equal "$(jq -r .error.code "$WORK/capacity-failure.json")" migration_failed
     assert_equal "$(cat "$source/data")" 'does not fit'
-    [[ ! -e $staging && ! -e $mountpoint/Data && ! -e $WORK/unexpected-capacity-copy ]]
+    [[ ! -e $staging && -d $mountpoint/Data ]]
     assert_equal "$(jq -r .stage "$OV_ROOT/migrations/capacityvault/capacity.json")" prepared
-    printf 'ok - insufficient capacity is rejected before copying or moving the original\n'
+    printf 'ok - a full vault stops copying without moving or removing the original\n'
 )
 
 test_legacy_staging_recovery() (
@@ -712,6 +712,46 @@ PROBE
     [[ -f $source/data && ! -e $source/local ]]
     OV_OP=vault.close; ov_vault_dispatch >/dev/null
     assert_equal "$(cat "$source/local")" independent
+    # Reproduce an older interrupted move: originals in adjacent staging,
+    # partial encrypted data, no original Documents path, and a closed vault.
+    local recovered="$OV_HOME/Recovered Documents" staged="$OV_HOME/.octovault-staging-legacy-resume" migration
+    ov_as_user mkdir -m 0700 "$staged"
+    printf 'retained original\n' | ov_as_user tee "$staged/data" >/dev/null
+    OV_OP=vault.open; ov_vault_dispatch >/dev/null
+    ov_as_user mkdir "$protected_mount/RecoveredDocuments"
+    printf 'partial\n' | ov_as_user tee "$protected_mount/RecoveredDocuments/data" >/dev/null
+    OV_OP=vault.close; ov_vault_dispatch >/dev/null
+    migration=$(jq -n --arg id "$id" --arg source "$recovered" --arg staging "$staged" \
+        '{schema_version:1,vault_id:$id,migration_id:"legacy-resume",source:$source,staging:$staging,relative:"RecoveredDocuments",stage:"staged"}')
+    ov_migration_save "$id" legacy-resume "$migration"
+    OV_PARAMS=$(jq -n --arg id "$id" '{id:$id,migration_id:"legacy-resume",action:"resume",password:"OctoVault-CI-only-passphrase"}')
+    OV_OP=migration.recover; ov_vault_dispatch > "$WORK/recovered.json"
+    assert_equal "$(jq -r .data.stage "$WORK/recovered.json")" complete
+    assert_equal "$(cat "$recovered/data")" 'retained original'
+    [[ ! -e $staged ]]
+    ov_vault_mount_safe "$recovered"
+    OV_PARAMS=$(jq -n --arg id "$id" '{id:$id,password:"OctoVault-CI-only-passphrase"}')
+    OV_OP=vault.close; ov_vault_dispatch >/dev/null
+    [[ -d $recovered && ! -e $recovered/data ]]
+    OV_OP=vault.open; ov_vault_dispatch >/dev/null
+    assert_equal "$(cat "$recovered/data")" 'retained original'
+    OV_OP=vault.close; ov_vault_dispatch >/dev/null
+    # Restoring the original instead needs no passphrase and does not open the
+    # vault or overwrite another location.
+    local restored="$OV_HOME/Restored Documents" restore_staging="$OV_HOME/.octovault-staging-legacy-restore"
+    ov_as_user mkdir -m 0700 "$restore_staging"
+    printf 'restored original\n' | ov_as_user tee "$restore_staging/data" >/dev/null
+    migration=$(jq -n --arg id "$id" --arg source "$restored" --arg staging "$restore_staging" \
+        '{schema_version:1,vault_id:$id,migration_id:"legacy-restore",source:$source,staging:$staging,relative:"RestoredDocuments",stage:"staged"}')
+    ov_migration_save "$id" legacy-restore "$migration"
+    OV_PARAMS=$(jq -n --arg id "$id" '{id:$id,migration_id:"legacy-restore",action:"rollback"}')
+    OV_OP=migration.recover; ov_vault_dispatch > "$WORK/restored.json"
+    assert_equal "$(jq -r .data.stage "$WORK/restored.json")" rolled_back
+    assert_equal "$(cat "$restored/data")" 'restored original'
+    [[ ! -e $restore_staging ]]
+    ov_load vaults "$id"; assert_fails ov_vault_is_open "$OV_RECORD"
+    OV_PARAMS=$(jq -n --arg id "$id" '{id:$id,password:"OctoVault-CI-only-passphrase"}')
+    printf 'ok - real legacy interrupted-move resume and original-folder restoration after update\n'
     # Imported native metadata must never cause root writes through symlinks;
     # executable native hooks stay dormant until the user explicitly trusts them.
     local mountpoint guard="$WORK/root-owned-guard"
@@ -864,5 +904,5 @@ PINENTRY
 }
 
 if [[ ${1:-} == --integration ]]; then integration
-else test_validation; test_native_binds; test_compare; test_migration; test_interrupted_migration; test_failed_copy_preserves_original; test_symlink_destination_preserves_original; test_closed_recovery_rechecks_destination; test_capacity_before_copy; test_legacy_staging_recovery; test_prepared_rollback; test_published_mapping_blocks_rollback; test_symlink_staging_blocks_rollback; test_migration_source_safety; test_device_identity; test_mount_protections; test_unknown_state; test_secret_arguments; test_container_pin; test_guided_creation
+else test_validation; test_native_binds; test_compare; test_migration; test_interrupted_migration; test_failed_copy_preserves_original; test_symlink_destination_preserves_original; test_closed_recovery_rechecks_destination; test_full_vault_preserves_original; test_legacy_staging_recovery; test_prepared_rollback; test_published_mapping_blocks_rollback; test_symlink_staging_blocks_rollback; test_migration_source_safety; test_device_identity; test_mount_protections; test_unknown_state; test_secret_arguments; test_container_pin; test_guided_creation
 fi

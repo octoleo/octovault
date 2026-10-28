@@ -10,7 +10,7 @@ Download the `.deb` matching **your Ubuntu release and CPU architecture** from [
 
 ```bash
 sha256sum --check SHA256SUMS-ubuntu26.04
-sudo apt install ./octovault_1.2.0_ubuntu26.04_amd64.deb
+sudo apt install ./octovault_1.2.1_ubuntu26.04_amd64.deb
 ```
 
 APT installs the required encryption, backup, desktop, and system-integration dependencies. The checksum detects damaged or changed downloads; it is not an independent publisher signature. A downloaded Debian package does not enroll the computer into an automatic update repository.
@@ -58,7 +58,7 @@ To protect an existing folder or file:
 
 1. Create the empty vault, then unlock it.
 2. Close applications using the folder or file. Choose **Protect a folder or file…** and select the existing path, such as `~/Documents`.
-3. Choose its **Name inside the encrypted vault**, such as `Documents`. This is a relative name within the container, separate from the container's filename and the original path.
+3. OctoVault keeps the folder or file name automatically, such as `Documents`. **Advanced options** lets you choose a different name inside the vault when needed.
 4. Let OctoVault finish copying, mapping, closing, reopening, and checking the files. Keep the application running until it reports completion. A temporary original remains available until the verification succeeds.
 5. Work through `~/Documents` while the vault is unlocked. Lock the vault to hide that protected view; unlock it to show those same protected files at `~/Documents` again.
 

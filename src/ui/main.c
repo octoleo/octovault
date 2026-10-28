@@ -871,7 +871,7 @@ static const Spec migration_add[]={
  S("source","_Folder or file to protect","path",NULL,"Choose its current location inside your home folder, for example /home/you/Documents. Close applications using it first.",TRUE),
  S("relative","_Name inside the encrypted vault","text",NULL,"Usually keep the suggested name. You can use a subfolder, such as Work/Documents; this does not rename the original location.",TRUE),
  S("password","Key _passphrase for verification","password",NULL,"OctoVault locks and unlocks the vault once to check that the protected files return to their original location.",FALSE),END};
-static const Spec migration_recover[]={S("migration_id","_Protection record","text",NULL,"Use Folder protection & recovery to choose the interrupted operation.",TRUE),S("action","_Recovery action","choice","resume|rollback","Resume finishes protection and verifies the mapping. Restore original location is available before a mapping has been installed; it never overwrites existing files.",TRUE),S("password","Key _passphrase","password",NULL,NULL,FALSE),END};
+static const Spec migration_recover[]={S("password","Key _passphrase","password",NULL,NULL,FALSE),END};
 static const Spec destination_fields[]={
  S("name","_Destination name","text",NULL,NULL,TRUE),S("type","_Store backups on","choice","local|sftp|s3|rest",NULL,TRUE),
  S("endpoint","S3 or REST _endpoint","text",NULL,"Use HTTPS for remote destinations.",FALSE),S("region","S3 _region","text",NULL,NULL,FALSE),S("bucket","S3 _bucket","text",NULL,NULL,FALSE),
@@ -966,6 +966,7 @@ static Field *find_field(Form *form,const char *key){
   return NULL;
 }
 static gboolean advanced_field(const char*operation,const char*key){
+  if(!strcmp(operation,"migration.add"))return !strcmp(key,"relative");
   if(g_str_has_prefix(operation,"vault.")){
     if(!strcmp(key,"open_on")||!strcmp(key,"close_on")||!strcmp(key,"force_close")||!strcmp(key,"trust_native_hooks")||g_str_has_prefix(key,"hooks."))return TRUE;
     if(!strcmp(key,"cipher_file"))return TRUE;
@@ -992,6 +993,10 @@ static JsonNode *field_default(const Spec*spec){
   return n;
 }
 static JsonNode *hidden_advanced_value(Form*form,const Spec*spec){
+  if(!g_strcmp0(form->operation,"migration.add")&&!strcmp(spec->key,"relative")){
+    JsonNode*n=json_node_new(JSON_NODE_VALUE);Field*field=find_field(form,"relative");
+    json_node_set_string(n,gtk_editable_get_text(GTK_EDITABLE(field->widget)));return n;
+  }
   JsonNode*original=strcmp(spec->kind,"password")?lookup(form->original,spec->key):NULL;
   return original?json_node_copy(original):field_default(spec);
 }
@@ -1450,8 +1455,12 @@ static void open_form(App*app,const char*operation,const char*title,JsonObject*r
   if(app->active&&!( !strcmp(operation,"vault.close")&&!strcmp(app->active->op,"backup.run"))){error_window(app,"An operation is already running","Wait for the current operation to complete or cancel it first.");return;}
   Form*f=g_new0(Form,1);f->app=app;f->operation=g_strdup(operation);f->base=json_object_new();f->original=copy_object(record);f->fields=g_ptr_array_new_with_free_func(field_free);f->acknowledge=!strcmp(operation,"repository.create");f->automatic=app->automatic_prompt&&!strcmp(operation,"vault.open");
   if(record&&*str(record,"id"))json_object_set_string_member(f->base,"id",str(record,"id"));
-  gboolean creating=!strcmp(operation,"vault.create");
-  GtkWindow*w=dialog_window(app,title,720,760);f->window=w;g_object_set_data_full(G_OBJECT(w),"form",f,form_free);
+  if(!strcmp(operation,"migration.recover")){
+    json_object_set_string_member(f->base,"migration_id",str(record,"migration_id"));
+    json_object_set_string_member(f->base,"action",str(record,"action"));
+  }
+  gboolean creating=!strcmp(operation,"vault.create"),recovering=!strcmp(operation,"migration.recover");
+  GtkWindow*w=dialog_window(app,title,recovering?600:720,recovering?360:760);f->window=w;g_object_set_data_full(G_OBJECT(w),"form",f,form_free);
   GtkBox*root=GTK_BOX(gtk_box_new(GTK_ORIENTATION_VERTICAL,12));margin(GTK_WIDGET(root),24);append_text(root,title,"title-2");
   if(record&&*str(record,"name"))append_text(root,str(record,"name"),"dim-label");
   const Spec*spec=specifications(operation);gboolean has_advanced=FALSE;
@@ -1461,12 +1470,13 @@ static void open_form(App*app,const char*operation,const char*title,JsonObject*r
   if(strstr(operation,".remove"))append_text(content,"This removes the registration and its managed automation. Your encrypted container or remote backup data will remain intact.",NULL);
   else if(creating)append_text(content,"Create an empty encrypted .tomb file. Then unlock it and choose Protect a folder or file to move your data into it.",NULL);
   else if(!strcmp(operation,"migration.add")){
-    append_text(content,"Keep using the same folder or file location","heading");
-    append_text(content,"OctoVault copies your data into this unlocked vault, keeps a temporary original, and links the original location to the encrypted copy. It then locks and unlocks the vault to verify the files before removing the temporary original.",NULL);
-    append_text(content,"When locked, the original location remains as an empty folder or file. Anything you add there while locked stays outside the vault and reappears the next time you lock it.","dim-label");
-    append_text(content,"Close applications using this data before continuing. Protection moves the working files; keep a separate backup.",NULL);
+    append_text(content,"Your files move into this vault and stay available at their original location while unlocked. Locking reveals an empty placeholder; anything added there while locked stays outside the vault.",NULL);
+    append_text(content,"OctoVault verifies the move automatically. Close applications using these files before continuing.","dim-label");
   }
-  else if(!strcmp(operation,"migration.recover"))append_text(content,"An interrupted protection operation can leave its original data in a temporary .octovault-staging-… folder. Keep that folder until recovery has completed. Resume finishes the copy and mapping; Restore original location returns the retained original when the recorded stage permits it.",NULL);
+  else if(!strcmp(operation,"migration.recover")){
+    append_text(content,!strcmp(str(record,"action"),"rollback")?"Return the retained original files to their original location.":"Finish protecting these files and restore access at their original location.",NULL);
+    if(*str(record,"source"))append_text(content,str(record,"source"),"heading");
+  }
   else if(!strcmp(operation,"repository.create"))append_text(content,"A strong random repository password will be generated. After creation, save the complete recovery record in your password manager.",NULL);
   else if(!strcmp(operation,"repository.prune"))append_text(content,"Pruning permanently removes data no longer referenced by retained snapshots. Other jobs for this repository must finish first.",NULL);
   else if(!strcmp(operation,"repository.recovery"))append_text(content,"This reveals repository access credentials. Continue only when you can save or inspect them privately.",NULL);
@@ -1474,7 +1484,8 @@ static void open_form(App*app,const char*operation,const char*title,JsonObject*r
   else if(!strcmp(operation,"vault.open")&&record&&!strcmp(str(record,"auth"),"gpg"))append_text(content,"GnuPG will ask for your software OpenPGP key's passphrase or your security key's PIN when needed. OctoVault remembers the vault key's location and does not save your passphrase or PIN.",NULL);
   else if(specifications(operation)==empty_fields)append_text(content,"Continue to run this operation. Its progress and result will appear in OctoVault.",NULL);
   for(guint i=0;spec[i].key;i++){
-    if(!strcmp(operation,"vault.open")&&record&&!strcmp(str(record,"auth"),"gpg")&&!strcmp(spec[i].key,"password"))continue;
+    if(!strcmp(operation,"vault.open")&&record&&openpgp_auth(str(record,"auth"))&&!strcmp(spec[i].key,"password"))continue;
+    if(!strcmp(operation,"migration.recover")&&!strcmp(spec[i].key,"password")&&(!strcmp(str(record,"action"),"rollback")||openpgp_auth(str(record,"auth"))))continue;
     if(creating&&!strcmp(spec[i].key,"open_on")){
       append_text(content,"Unlocking opens the container as a folder managed by OctoVault. Browse files opens that folder. Protected folders also appear at their original locations; no mount path or custom script is needed.","dim-label");
     }
@@ -1490,7 +1501,7 @@ static void open_form(App*app,const char*operation,const char*title,JsonObject*r
   f->authorize=gtk_button_new_with_label("Authorize");gtk_widget_set_halign(f->authorize,GTK_ALIGN_START);gtk_widget_set_visible(f->authorize,FALSE);g_signal_connect(f->authorize,"clicked",G_CALLBACK(access_authorize_clicked),app);gtk_box_append(root,f->authorize);
   GtkBox*buttons=GTK_BOX(gtk_box_new(GTK_ORIENTATION_HORIZONTAL,10));gtk_widget_set_halign(GTK_WIDGET(buttons),GTK_ALIGN_END);gtk_box_append(root,GTK_WIDGET(buttons));
   GtkWidget*cancel=gtk_button_new_with_mnemonic("_Cancel");gtk_box_append(buttons,cancel);g_signal_connect(cancel,"clicked",G_CALLBACK(close_window),w);
-  GtkWidget*submit=gtk_button_new_with_mnemonic(creating?"_Create empty vault":!strcmp(operation,"migration.add")?"_Protect and verify":"_Continue");gtk_widget_add_css_class(submit,strstr(operation,".remove")||!strcmp(operation,"repository.prune")?"destructive-action":"suggested-action");gtk_box_append(buttons,submit);g_signal_connect(submit,"clicked",G_CALLBACK(submit_form),f);
+  GtkWidget*submit=gtk_button_new_with_mnemonic(creating?"_Create empty vault":!strcmp(operation,"migration.add")?"_Protect":!strcmp(operation,"migration.recover")?(!strcmp(str(record,"action"),"rollback")?"_Restore original location":"_Resume protection"):"_Continue");gtk_widget_add_css_class(submit,strstr(operation,".remove")||!strcmp(operation,"repository.prune")?"destructive-action":"suggested-action");gtk_box_append(buttons,submit);g_signal_connect(submit,"clicked",G_CALLBACK(submit_form),f);
   gtk_window_set_child(w,GTK_WIDGET(root));gtk_window_present(w);
 }
 
@@ -1567,18 +1578,28 @@ static void files_window(App*app,const char*repository,const char*snapshot,JsonN
   if(!count)append_text(root,"No files were returned for this snapshot path.","dim-label");
   GtkWidget*close=gtk_button_new_with_mnemonic("_Close");gtk_widget_set_halign(close,GTK_ALIGN_END);gtk_box_append(root,close);g_signal_connect(close,"clicked",G_CALLBACK(close_window),w);gtk_window_set_child(w,GTK_WIDGET(root));gtk_window_present(w);
 }
-static JsonObject *migration_recovery_parameters(const char*vault,JsonObject*migration,const char*action){
+static JsonObject *migration_recovery_parameters(App*app,const char*vault,JsonObject*migration,const char*action){
   JsonObject*p=json_object_new();json_object_set_string_member(p,"id",vault);
   json_object_set_string_member(p,"migration_id",str(migration,"migration_id"));
-  json_object_set_string_member(p,"action",action);return p;
+  json_object_set_string_member(p,"action",action);json_object_set_string_member(p,"source",str(migration,"source"));
+  if(app&&app->collections[0]&&JSON_NODE_HOLDS_ARRAY(app->collections[0])){
+    JsonArray*vaults=json_node_get_array(app->collections[0]);
+    for(guint i=0;i<json_array_get_length(vaults);i++){
+      JsonNode*n=json_array_get_element(vaults,i);if(!JSON_NODE_HOLDS_OBJECT(n))continue;JsonObject*record=json_node_get_object(n);
+      if(!strcmp(str(record,"id"),vault)){
+        const char*keys[]={"name","auth","execution_scope"};for(guint j=0;j<G_N_ELEMENTS(keys);j++)json_object_set_string_member(p,keys[j],str(record,keys[j]));break;
+      }
+    }
+  }
+  return p;
 }
 static gboolean migration_can_restore(const char*stage){
-  return !strcmp(stage,"prepared")||!strcmp(stage,"staged")||!strcmp(stage,"copied");
+  return !strcmp(stage,"prepared")||!strcmp(stage,"staged");
 }
 static void migrations_window(App*app,const char*vault,JsonNode*node){
   if(!JSON_NODE_HOLDS_ARRAY(node)){result_window(app,"Folder protection & recovery",node,FALSE,FALSE);return;}
   GtkWindow*w=dialog_window(app,"Folder protection & recovery",720,600);GtkBox*root=GTK_BOX(gtk_box_new(GTK_ORIENTATION_VERTICAL,14));margin(GTK_WIDGET(root),24);append_text(root,"Folder protection & recovery","title-2");
-  append_text(root,"If protection stops, the original data is kept until it has been verified. Use the recorded paths below to resume protection or restore the original location. Keep any temporary original until recovery finishes.",NULL);
+  append_text(root,"Choose Resume protection to finish the move, or Restore original location to put the original files back.",NULL);
   GtkWidget*scroll=gtk_scrolled_window_new();gtk_widget_set_vexpand(scroll,TRUE);gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll),GTK_POLICY_NEVER,GTK_POLICY_AUTOMATIC);gtk_box_append(root,scroll);GtkBox*list=GTK_BOX(gtk_box_new(GTK_ORIENTATION_VERTICAL,12));gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroll),GTK_WIDGET(list));
   JsonArray*a=json_node_get_array(node);if(!json_array_get_length(a))append_text(list,"No folder or file protection has been recorded for this vault.","dim-label");
   for(guint i=0;i<json_array_get_length(a);i++){
@@ -1590,12 +1611,12 @@ static void migrations_window(App*app,const char*vault,JsonNode*node){
     char*destination=g_strdup_printf("Inside the encrypted vault: %s",str(migration,"relative"));append_text(box,destination,"dim-label");g_free(destination);
     if(pending){
       if(!strcmp(state,"prepared"))append_text(box,"The first copy has not been confirmed. The original may still be at its current location.","dim-label");
-      if(*str(migration,"staging")){char*staging=g_strdup_printf("Temporary original (if already staged): %s",str(migration,"staging"));GtkWidget*path=label(staging,NULL);gtk_label_set_selectable(GTK_LABEL(path),TRUE);gtk_box_append(box,path);g_free(staging);}
-      JsonObject*p=migration_recovery_parameters(vault,migration,"resume");gtk_box_append(box,action_button(app,"Resume protection…","migration.recover",p,"suggested-action"));json_object_unref(p);
-      if(migration_can_restore(state)){p=migration_recovery_parameters(vault,migration,"rollback");gtk_box_append(box,action_button(app,"Restore original location…","migration.recover",p,NULL));json_object_unref(p);}
-      else append_text(box,"A folder mapping has already been installed. Resume protection to verify it and finish safely.","dim-label");
+      if(*str(migration,"staging")){char*staging=g_strdup_printf("Temporary holding location: %s",str(migration,"staging"));GtkWidget*path=label(staging,NULL);gtk_label_set_selectable(GTK_LABEL(path),TRUE);gtk_box_append(box,path);g_free(staging);}
+      JsonObject*p=migration_recovery_parameters(app,vault,migration,"resume");gtk_box_append(box,action_button(app,"Resume protection…","migration.recover",p,"suggested-action"));json_object_unref(p);
+      if(migration_can_restore(state)){p=migration_recovery_parameters(app,vault,migration,"rollback");gtk_box_append(box,action_button(app,"Restore original location…","migration.recover",p,NULL));json_object_unref(p);}
+      else append_text(box,"Resume protection to restore access and finish the move.","dim-label");
     }
-    char*details=g_strdup_printf("Protection record: %s · Stage: %s",str(migration,"migration_id"),state);append_text(box,details,"dim-label");g_free(details);
+
   }
   GtkWidget*close=gtk_button_new_with_mnemonic("_Close");gtk_widget_set_halign(close,GTK_ALIGN_END);gtk_box_append(root,close);g_signal_connect(close,"clicked",G_CALLBACK(close_window),w);gtk_window_set_child(w,GTK_WIDGET(root));gtk_window_present(w);
 }
@@ -1612,7 +1633,7 @@ static void vault_created_window(App*app,JsonObject*record){
   append_text(content,"No files have been moved yet. Unlock this vault, then choose Protect a folder or file on its card. OctoVault creates the folder mappings for you; no custom scripts are needed.",NULL);
   const char*keys[]={"file","key_file","mountpoint"};const char*titles[]={"Encrypted container (your protected data)","Separate encrypted key file or carrier","Vault folder while unlocked"};
   for(guint i=0;i<G_N_ELEMENTS(keys);i++)if(*str(record,keys[i])){append_text(content,titles[i],"heading");GtkWidget*path=label(str(record,keys[i]),"dim-label");gtk_label_set_selectable(GTK_LABEL(path),TRUE);gtk_box_append(content,path);}
-  append_text(content,"Lock the vault before copying its .tomb file for backup. Keep a separate recovery copy of its encrypted key or carrier. You need both, plus your passphrase or OpenPGP key, to recover the vault on another computer.",NULL);
+  append_text(content,"The .tomb file stores your protected data. The separate key file or carrier unlocks it with your passphrase or OpenPGP key; it does not contain your documents.",NULL);
   GtkBox*buttons=GTK_BOX(gtk_box_new(GTK_ORIENTATION_HORIZONTAL,10));gtk_widget_set_halign(GTK_WIDGET(buttons),GTK_ALIGN_END);gtk_box_append(root,GTK_WIDGET(buttons));GtkWidget*done=gtk_button_new_with_label("Done");gtk_box_append(buttons,done);g_signal_connect(done,"clicked",G_CALLBACK(close_window),w);
   GtkWidget*unlock=gtk_button_new_with_label("Unlock vault…");gtk_widget_add_css_class(unlock,"suggested-action");gtk_box_append(buttons,unlock);g_signal_connect(unlock,"clicked",G_CALLBACK(created_unlock_clicked),app);gtk_window_set_child(w,GTK_WIDGET(root));gtk_window_present(w);
 }
@@ -1675,7 +1696,7 @@ static void show_record(App*app,JsonObject*record,gint collection){
     GtkWidget*protect=action_button(app,"Protect a folder or file…","migration.add",record,NULL);gtk_widget_set_sensitive(protect,opened);if(!opened)gtk_widget_set_tooltip_text(protect,"Unlock this vault before protecting a folder or file.");gtk_box_append(buttons,protect);
     add_menu_action(menu,app,"Details","vault.get",record);add_menu_action(menu,app,"Automation & scripts…","vault.update",record);
     add_menu_action(menu,app,"Change passphrase…","vault.passwd",record);add_menu_action(menu,app,"Replace key…","vault.setkey",record);add_menu_action(menu,app,"Export key…","vault.key-export",record);add_menu_action(menu,app,"Increase capacity…","vault.resize",record);
-    add_menu_action(menu,app,"Folder protection & recovery","migration.list",record);add_menu_action(menu,app,"Recover interrupted protection…","migration.recover",record);add_menu_action(menu,app,"Build search index","vault.index",record);add_menu_action(menu,app,"Search protected files…","vault.search",record);add_menu_action(menu,app,"Remove registration…","vault.remove",record);
+    add_menu_action(menu,app,"Folder protection & recovery","migration.list",record);add_menu_action(menu,app,"Build search index","vault.index",record);add_menu_action(menu,app,"Search protected files…","vault.search",record);add_menu_action(menu,app,"Remove registration…","vault.remove",record);
   }else if(collection==1){
     gtk_box_append(buttons,action_button(app,"Test connection","destination.test",record,"suggested-action"));gtk_box_append(buttons,action_button(app,"Edit…","destination.save",record,NULL));
     add_menu_action(menu,app,"Connection details","destination.get",record);add_menu_action(menu,app,"Remove destination…","destination.remove",record);
@@ -1823,7 +1844,7 @@ static gboolean drain_unlocks(gpointer data){
 }
 static void smoke_action_menu(App*app){
   GtkBox*menu=GTK_BOX(gtk_box_new(GTK_ORIENTATION_VERTICAL,2));margin(GTK_WIDGET(menu),6);
-  add_menu_action(menu,app,"Recover interrupted protection…","migration.recover",NULL);
+  add_menu_action(menu,app,"Folder protection & recovery","migration.list",NULL);
   GtkWidget*scroll=action_menu_scroll(menu);g_object_ref_sink(scroll);
   int menu_min=0,menu_natural=0,scroll_min=0,scroll_natural=0;
   gtk_widget_measure(GTK_WIDGET(menu),GTK_ORIENTATION_HORIZONTAL,-1,&menu_min,&menu_natural,NULL,NULL);
@@ -1835,9 +1856,27 @@ static void smoke_action_menu(App*app){
 static void smoke_protection_form(App*app){
   open_form(app,"migration.add","Protect a folder or file",NULL);GListModel*windows=gtk_window_get_toplevels();GtkWindow*w=g_list_model_get_item(windows,g_list_model_get_n_items(windows)-1);Form*f=g_object_get_data(G_OBJECT(w),"form");Field*source=find_field(f,"source"),*relative=find_field(f,"relative");
   gtk_editable_set_text(GTK_EDITABLE(source->widget),"/home/person/Documents");g_assert_cmpstr(gtk_editable_get_text(GTK_EDITABLE(relative->widget)),==,"Documents");g_assert_nonnull(strstr(gtk_label_get_text(f->location_preview),"/home/person/Documents"));
+  g_assert_false(gtk_widget_get_visible(relative->row));gboolean accepted=FALSE;JsonObject*params=form_parameters(f,&accepted);g_assert_true(accepted);g_assert_cmpstr(str(params,"relative"),==,"Documents");json_object_unref(params);
   gtk_editable_set_text(GTK_EDITABLE(source->widget),"/home/person/Pictures");g_assert_cmpstr(gtk_editable_get_text(GTK_EDITABLE(relative->widget)),==,"Pictures");
-  gtk_editable_set_text(GTK_EDITABLE(relative->widget),"Private/Photos");gtk_editable_set_text(GTK_EDITABLE(source->widget),"/home/person/Photos");g_assert_cmpstr(gtk_editable_get_text(GTK_EDITABLE(relative->widget)),==,"Private/Photos");g_assert_nonnull(strstr(gtk_label_get_text(f->location_preview),"Private/Photos"));
+  gtk_check_button_set_active(f->advanced,TRUE);g_assert_true(gtk_widget_get_visible(relative->row));gtk_editable_set_text(GTK_EDITABLE(relative->widget),"Private/Photos");gtk_editable_set_text(GTK_EDITABLE(source->widget),"/home/person/Photos");g_assert_cmpstr(gtk_editable_get_text(GTK_EDITABLE(relative->widget)),==,"Private/Photos");g_assert_nonnull(strstr(gtk_label_get_text(f->location_preview),"Private/Photos"));
+  gtk_check_button_set_active(f->advanced,FALSE);g_assert_false(gtk_widget_get_visible(relative->row));params=form_parameters(f,&accepted);g_assert_true(accepted);g_assert_cmpstr(str(params,"relative"),==,"Private/Photos");json_object_unref(params);
   gtk_window_destroy(w);g_object_unref(w);
+}
+static void smoke_recovery_form(App*app){
+  JsonNode*saved_vaults=app->collections[0];app->collections[0]=json_node_new(JSON_NODE_ARRAY);JsonArray*vaults=json_array_new();json_node_take_array(app->collections[0],vaults);
+  JsonObject*vault=json_object_new();json_object_set_string_member(vault,"id","selected-vault");json_object_set_string_member(vault,"name","Documents vault");json_object_set_string_member(vault,"execution_scope","personal");json_array_add_object_element(vaults,vault);
+  JsonObject*migration=json_object_new();json_object_set_string_member(migration,"migration_id","legacy-protection");json_object_set_string_member(migration,"source","/home/person/Documents");
+  const char*actions[]={"resume","rollback"};const char*methods[]={"key","gpg"};
+  for(guint i=0;i<G_N_ELEMENTS(actions);i++)for(guint j=0;j<G_N_ELEMENTS(methods);j++){
+    json_object_set_string_member(vault,"auth",methods[j]);JsonObject*record=migration_recovery_parameters(app,"selected-vault",migration,actions[i]);
+    open_form(app,"migration.recover",!strcmp(actions[i],"rollback")?"Restore original location":"Resume protection",record);json_object_unref(record);
+    GListModel*windows=gtk_window_get_toplevels();GtkWindow*w=g_list_model_get_item(windows,g_list_model_get_n_items(windows)-1);Form*f=g_object_get_data(G_OBJECT(w),"form");
+    g_assert_null(find_field(f,"migration_id"));g_assert_null(find_field(f,"action"));g_assert_cmpstr(str(f->original,"name"),==,"Documents vault");
+    gboolean needs_passphrase=!strcmp(actions[i],"resume")&&!strcmp(methods[j],"key");g_assert_cmpint(find_field(f,"password")!=NULL,==,needs_passphrase);
+    gboolean accepted=FALSE;JsonObject*params=form_parameters(f,&accepted);g_assert_true(accepted);g_assert_cmpstr(str(params,"id"),==,"selected-vault");g_assert_cmpstr(str(params,"migration_id"),==,"legacy-protection");g_assert_cmpstr(str(params,"action"),==,actions[i]);g_assert_false(json_object_has_member(params,"source"));json_object_unref(params);
+    gtk_window_destroy(w);g_object_unref(w);
+  }
+  json_object_unref(migration);json_node_free(app->collections[0]);app->collections[0]=saved_vaults;
 }
 static void smoke_vault_creation(Form*f){
   GError*error=NULL;char*sample_path=NULL;int fd=g_file_open_tmp("octovault-ui-XXXXXX",&sample_path,&error);g_assert_no_error(error);g_assert_cmpint(fd,>=,0);g_assert_true(g_close(fd,&error));g_assert_no_error(error);
@@ -1938,9 +1977,9 @@ static int command_line(GApplication*application,GApplicationCommandLine*command
   }
   if(app->smoke){
     for(guint i=0;i<6;i++)gtk_toggle_button_set_active(app->navigation[i],TRUE);
-    const char *ops[]={"vault.create","vault.import","vault.update","vault.open","vault.close","vault.resize","vault.passwd","vault.setkey","vault.key-export","vault.search","migration.add","migration.recover","destination.save","repository.create","repository.import","repository.check","repository.files","repository.find","repository.diff","repository.restore","repository.forget","repository.password","repository.copy","backup.save"};
+    const char *ops[]={"vault.create","vault.import","vault.update","vault.open","vault.close","vault.resize","vault.passwd","vault.setkey","vault.key-export","vault.search","migration.add","destination.save","repository.create","repository.import","repository.check","repository.files","repository.find","repository.diff","repository.restore","repository.forget","repository.password","repository.copy","backup.save"};
     for(guint i=0;i<G_N_ELEMENTS(ops);i++){open_form(app,ops[i],ops[i],NULL);GListModel*windows=gtk_window_get_toplevels();guint count=g_list_model_get_n_items(windows);if(count>1){GtkWindow*w=g_list_model_get_item(windows,count-1);if(w!=app->window){if(!strcmp(ops[i],"vault.create"))smoke_vault_creation(g_object_get_data(G_OBJECT(w),"form"));gtk_window_destroy(w);}g_object_unref(w);}}
-    smoke_advanced_defaults(app);smoke_protection_form(app);smoke_action_menu(app);backup_setup_smoke(app);smoke_access_lifecycle(app);
+    smoke_advanced_defaults(app);smoke_protection_form(app);smoke_recovery_form(app);smoke_action_menu(app);backup_setup_smoke(app);smoke_access_lifecycle(app);
     gtk_toggle_button_set_active(app->navigation[0],TRUE);
     if(app->screenshot_create){open_form(app,"vault.create","Create vault",NULL);GListModel*windows=gtk_window_get_toplevels();app->screenshot_window=g_list_model_get_item(windows,g_list_model_get_n_items(windows)-1);Form*f=g_object_get_data(G_OBJECT(app->screenshot_window),"form");gtk_editable_set_text(GTK_EDITABLE(find_field(f,"name")->widget),"Personal");}
     if(app->screenshot_backup){open_backup_setup(app);app->screenshot_window=app->backup_setup->window;}
