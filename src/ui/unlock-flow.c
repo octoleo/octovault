@@ -85,7 +85,7 @@ static void fido_submit(Form *form,JsonObject *params,gboolean enrolling){
   wipe((char *)str(request,"pin"));if(enrolling)wipe((char *)str(request,"password"));json_node_free(node);
   GError *error=NULL;form->fido_process=g_subprocess_new(G_SUBPROCESS_FLAGS_STDIN_PIPE|G_SUBPROCESS_FLAGS_STDOUT_PIPE|G_SUBPROCESS_FLAGS_STDERR_PIPE,&error,"/usr/libexec/octovault/fido2",enrolling?"enroll":"unlock",NULL);
   if(!form->fido_process){gtk_label_set_text(form->error,"FIDO2 support is unavailable. Install the complete OctoVault package or use your recovery passphrase.");g_clear_error(&error);wipe(input);g_free(input);return;}
-  FidoCall *call=g_new0(FidoCall,1);call->form=form;call->window=g_object_ref(form->window);call->params=copy_object(params);call->enrolling=enrolling;call->input=input;call->generation=form->app->access_generation;
+  FidoCall *call=g_new0(FidoCall,1);call->form=form;call->window=g_object_ref(form->window);call->params=json_object_new();json_object_set_string_member(call->params,"id",str(params,"id"));if(enrolling)json_object_set_string_member(call->params,"password",str(params,"password"));call->enrolling=enrolling;call->input=input;call->generation=form->app->access_generation;
   clear_form_secrets(form);gtk_widget_set_sensitive(form->submit,FALSE);gtk_label_set_text(form->error,"Touch your security key when it flashes…");
   call->timeout=g_timeout_add_seconds(120,fido_timeout,call);g_subprocess_communicate_utf8_async(form->fido_process,input,NULL,fido_finished,call);
 }

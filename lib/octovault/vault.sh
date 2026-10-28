@@ -444,7 +444,7 @@ ov_vault_managed_key_directory() {
     # privileged writer follows a user-controlled key-directory symlink.
     for path in "$directory" "$directory/$id"; do
         [[ ! -L $path ]] || ov_fail unsafe_path "The managed key folder cannot be a symbolic link."
-        ov_as_user mkdir -p -m 0700 -- "$path" || ov_fail permission_denied "Could not create the private key folder."
+        ov_as_user install -d -m 0700 -- "$path" || ov_fail permission_denied "Could not create the private key folder."
         [[ -d $path && $(stat -c %u -- "$path") == "$OV_UID" ]] || ov_fail unsafe_path "The private key folder must belong to your account."
         ov_as_user chmod 0700 -- "$path" || ov_fail permission_denied "Could not secure the private key folder."
     done
@@ -589,7 +589,7 @@ ov_vault_verify_recovery_passphrase() {
     ov_vault_plain_key "$record"
     ov_secret_fd "$OV_VAULT_PASSWORD"
     ov_vault_temporary
-    mkdir -p -m 0700 "$OV_VAULT_TEMP_DIR/verify-gpg"
+    install -d -m 0700 "$OV_VAULT_TEMP_DIR/verify-gpg"
     timeout --signal=TERM --kill-after=2 30 gpg --no-options --homedir "$OV_VAULT_TEMP_DIR/verify-gpg" \
         --batch --no-tty --pinentry-mode loopback --passphrase-fd "$OV_SECRET_FD" \
         --output /dev/null --decrypt "$OV_VAULT_MATERIALIZED_KEY" >/dev/null 2>&1 || rc=$?
@@ -956,7 +956,7 @@ ov_vault_new_record() {
         open_on:($p.open_on//"login"),prompt_after_unlock:($p.prompt_after_unlock//false),prompt_after_resume:($p.prompt_after_resume//false),drive_uuid:($p.drive_uuid//""),close_on:($p.close_on//["shutdown"]),
         force_close:($p.force_close//false),trust_native_hooks:($p.trust_native_hooks//false),hooks:($p.hooks//{}),created_at:$time,updated_at:$time}' <<< "$OV_PARAMS")
     ov_vault_validate_record "$OV_RECORD"
-    ov_as_user mkdir -p -m 0700 -- "$mountpoint" || ov_fail permission_denied "Could not create the vault mountpoint."
+    ov_as_user install -d -m 0700 -- "$mountpoint" || ov_fail permission_denied "Could not create the vault mountpoint."
     mountpoint=$(ov_vault_user_path "$mountpoint")
     [[ -d $mountpoint && $(stat -c %u -- "$mountpoint") == "$OV_UID" ]] || ov_fail invalid_mount "The mountpoint must be a directory owned by your account."
     [[ $file != "$mountpoint" && $key != "$mountpoint" ]] || ov_fail invalid_path "Container, key and mountpoint must be separate paths."

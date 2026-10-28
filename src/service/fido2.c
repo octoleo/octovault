@@ -60,14 +60,14 @@ fido_dev_info_t *list=fido_dev_info_new(16);size_t count=0;fido_dev_t *selected=
 if(!list||fido_dev_info_manifest(list,16,&count)!=FIDO_OK){fail("device_missing","No FIDO2 security key could be found. Connect your key and try again.");goto done;}
 for(size_t i=0;i<count;i++){
 const fido_dev_info_t *info=fido_dev_info_ptr(list,i);fido_dev_t *d=fido_dev_new();fido_cbor_info_t *ci=fido_cbor_info_new();
-if(!d||!ci){fido_dev_free(&d);fido_cbor_info_free(&ci);continue;}fido_dev_set_timeout(d,45000);gboolean supported=FALSE;
+if(!d||!ci){fido_dev_free(&d);fido_cbor_info_free(&ci);continue;}fido_dev_set_timeout(d,5000);gboolean supported=FALSE;
 if(fido_dev_open(d,fido_dev_info_path(info))==FIDO_OK&&fido_dev_get_cbor_info(d,ci)==FIDO_OK){char **ext=fido_cbor_info_extensions_ptr(ci);for(size_t j=0;j<fido_cbor_info_extensions_len(ci);j++)if(!strcmp(ext[j],"hmac-secret"))supported=TRUE;}
 fido_cbor_info_free(&ci);if(supported){compatible++;if(!selected){selected=d;continue;}}fido_dev_close(d);fido_dev_free(&d);
 }
 if(compatible>1){fido_dev_close(selected);fido_dev_free(&selected);fail("multiple_devices","Connect only the security key you want to use, then try again.");}
 else if(!selected)fail("unsupported_device","No connected key supports FIDO2 hmac-secret. OpenPGP-only and U2F-only keys cannot use this option.");
 else if(!fido_dev_has_pin(selected)){fido_dev_close(selected);fido_dev_free(&selected);fail("pin_not_set","Set a FIDO2 PIN on your security key before adding it to OctoVault.");}
-done:if(list)fido_dev_info_free(&list,16);return selected;
+done:if(list)fido_dev_info_free(&list,16);if(selected)fido_dev_set_timeout(selected,45000);return selected;
 }
 static gboolean create_credential(fido_dev_t *d,const char *pin,Enrollment *e){
 fido_cred_t *c=fido_cred_new();unsigned char challenge[32],user[32];int rc=FIDO_ERR_INTERNAL;gboolean ok=FALSE;

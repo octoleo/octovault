@@ -171,8 +171,9 @@ security key or Replace FIDO2 security key for enrollment.
 When creating a vault, Use the key from another vault selects an existing
 compatible encrypted key. Also unlock other vaults using this key applies
 one passphrase entry to the listed matching vaults during the current unlock
-sequence only. Separate keys prompt separately; the entry is not a saved
-group password.
+sequence only. For different keys with the same passphrase, explicitly select
+Use this passphrase for the remaining vaults. A failed unlock returns to its
+own prompt. The entry is not a saved group password.
 .SH FILES
 .TP
 .B /var/lib/octovault/access.json
