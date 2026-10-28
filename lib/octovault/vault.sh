@@ -1451,6 +1451,14 @@ ov_migration_recover() {
                 # left the original untouched; the encrypted partial copy stays.
                 ov_migration_stage "$record" "$migration" rolled_back; ov_ok "$OV_MIGRATION"; return
             fi
+            [[ ! -L $staging && ( -d $staging || -f $staging ) ]] ||
+                ov_fail conflict "The retained original has changed, so it cannot be restored automatically."
+            # rmdir atomically refuses folders containing any new files. This
+            # also handles the empty placeholder left by a failed resume.
+            if [[ -d $source && ! -L $source && -d $staging ]]; then
+                ov_as_user rmdir -- "$source" ||
+                    ov_fail conflict "The original folder contains other files or is still mounted. Both locations have been retained."
+            fi
             [[ ! -e $source && ! -L $source && ! -L $staging && ( -d $staging || -f $staging ) ]] ||
                 ov_fail conflict "The original location is occupied or the staged original has changed, so rollback will not overwrite it."
             ov_as_user mv -nT -- "$staging" "$source" || ov_fail recovery_failed "The original could not be restored."

@@ -301,7 +301,21 @@ test_legacy_staging_recovery() (
     [[ -d $source && -f $WORK/legacy-placeholder-before-copy ]]
     assert_equal "$(cat "$staging/data")" 'legacy original'
     assert_equal "$(jq -r .stage "$OV_ROOT/migrations/legacyvault/legacy.json")" staged
-    printf 'ok - legacy recovery recreates the original placeholder before retrying a failed copy\n'
+    ov_save vaults legacyvault "$record"
+    OV_PARAMS='{"id":"legacyvault","migration_id":"legacy","action":"rollback"}'
+    printf 'new underlying file\n' > "$source/local"
+    if (ov_migration_recover) > "$WORK/occupied-rollback.json" 2>/dev/null; then
+        printf 'Expected occupied-folder rollback rejection\n' >&2; exit 1
+    fi
+    assert_equal "$(cat "$source/local")" 'new underlying file'
+    assert_equal "$(cat "$staging/data")" 'legacy original'
+    assert_equal "$(jq -r .error.code "$WORK/occupied-rollback.json")" conflict
+    rm -- "$source/local"
+    ov_migration_recover > "$WORK/empty-placeholder-rollback.json"
+    assert_equal "$(jq -r .data.stage "$WORK/empty-placeholder-rollback.json")" rolled_back
+    assert_equal "$(cat "$source/data")" 'legacy original'
+    [[ ! -e $staging ]]
+    printf 'ok - failed legacy resume preserves originals, protects new local files, and restores an empty placeholder\n'
 )
 
 test_prepared_rollback() (
@@ -744,6 +758,7 @@ PROBE
     migration=$(jq -n --arg id "$id" --arg source "$restored" --arg staging "$restore_staging" \
         '{schema_version:1,vault_id:$id,migration_id:"legacy-restore",source:$source,staging:$staging,relative:"RestoredDocuments",stage:"staged"}')
     ov_migration_save "$id" legacy-restore "$migration"
+    ov_as_user mkdir "$restored"
     OV_PARAMS=$(jq -n --arg id "$id" '{id:$id,migration_id:"legacy-restore",action:"rollback"}')
     OV_OP=migration.recover; ov_vault_dispatch > "$WORK/restored.json"
     assert_equal "$(jq -r .data.stage "$WORK/restored.json")" rolled_back
