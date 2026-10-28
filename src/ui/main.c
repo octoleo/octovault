@@ -39,11 +39,16 @@ struct App {
   GPtrArray *activity;
   char *page;
   char *screenshot;
-  gboolean screenshot_create, screenshot_protect, screenshot_menu, screenshot_vault;
+  gboolean screenshot_create, screenshot_protect, screenshot_menu, screenshot_vault, screenshot_unlock, screenshot_lock;
   gboolean screenshot_backup, screenshot_backup_files, screenshot_destination, screenshot_advanced;
   GtkWindow *screenshot_window;
+  GtkWindow *keyboard_test_window;
+  guint keyboard_activations;
   GQueue *pending_unlocks;
   gboolean automatic_prompt;
+  char *shared_password, *shared_key, *current_unlock;
+  GHashTable *shared_vaults;
+  gboolean unlock_authorization_requested;
   JsonObject *priority_lock;
   Operation *active;
   BackupSetup *backup_setup;
@@ -86,7 +91,9 @@ struct Form {
   gboolean acknowledge;
   gboolean automatic;
   gboolean submitted, guided_backup, access_blocked, needs_system;
-  GtkWidget *authorize;
+  GtkWidget *authorize, *submit;
+  GSubprocess *fido_process;
+  gboolean dismissed;
 };
 
 typedef struct { App *app; char *operation, *title; JsonObject *record; } Action;
@@ -118,6 +125,11 @@ static void access_authorize_clicked(GtkButton *button,gpointer data);
 static void access_manage_clicked(GtkButton *button,gpointer data);
 static gboolean access_handle_result(Operation *operation,JsonNode *payload,JsonObject *failure,GError *error);
 static void update_form_visibility(GObject *object,GParamSpec *pspec,gpointer data);
+static void clear_shared_unlock(App *app);
+static void fido_submit(Form *form,JsonObject *params,gboolean enrolling);
+static gboolean has_fido(JsonObject *record);
+static gboolean same_vault_key(JsonObject *a,JsonObject *b);
+static void clear_form_secrets(Form *form);
 
 static const char *str(JsonObject *o, const char *key) {
   if (!o || !json_object_has_member(o, key)) return "";
@@ -141,7 +153,7 @@ static gboolean access_system(App *app){return access_authorized(app)&&!strcmp(s
 static const char *access_startup_scope(App *app){
   if(app->access_startup_attempted||access_authorized(app)||!boolean(app->access_state,"available"))return NULL;
   if(boolean(app->access_state,"delegated_personal"))return "personal";
-  return !app->access_background_launch&&boolean(app->access_state,"can_request_system")?"system":NULL;
+  return (!app->access_background_launch||(app->pending_unlocks&&!g_queue_is_empty(app->pending_unlocks)))&&boolean(app->access_state,"can_request_system")?"system":NULL;
 }
 static gboolean access_read_operation(const char *operation){
   const char *reads[]={"vault.list","vault.get","vault.auth-check","destination.list","destination.get",
@@ -298,7 +310,7 @@ static GtkWindow *dialog_window(App *app,const char *title,int width,int height)
   gtk_window_set_transient_for(w,app->window); gtk_window_set_modal(w,TRUE);
   gtk_window_set_default_size(w,width,height); return w;
 }
-static void close_window(GtkButton *b,gpointer data) { (void)b; gtk_window_destroy(GTK_WINDOW(data)); }
+static void close_window(GtkButton *b,gpointer data) { (void)b; Form *form=g_object_get_data(G_OBJECT(data),"form");if(form){form->dismissed=TRUE;if(!form->submitted)clear_shared_unlock(form->app);if(form->fido_process)g_subprocess_force_exit(form->fido_process);}gtk_window_destroy(GTK_WINDOW(data)); }
 static void notify(App *app,const char *title,const char *body) {
   if(!app->show_notifications || app->smoke) return;
   GNotification *n=g_notification_new(title); g_notification_set_body(n,body);
@@ -416,8 +428,10 @@ static void access_update_header(App *app){
   for(guint i=0;i<g_list_model_get_n_items(windows);i++){
     GtkWindow *window=g_list_model_get_item(windows,i);Form *form=g_object_get_data(G_OBJECT(window),"form");
     if(form&&form->app==app&&form->authorize){
+      if(!app->smoke&&!access_authorized(app)){clear_shared_unlock(app);clear_form_secrets(form);if(form->fido_process)g_subprocess_force_exit(form->fido_process);}
       update_form_visibility(NULL,NULL,form);
-      gboolean permitted=access_can(app,form->operation)&&(!form->needs_system||access_system(app))&&!access_record_requires_system(app,form->operation,form->original);gtk_widget_set_visible(form->authorize,!permitted);
+      const char *permission=!strcmp(form->operation,"ui.fido-enroll")?"vault.update":form->operation;
+      gboolean permitted=access_can(app,permission)&&(!form->needs_system||access_system(app))&&!access_record_requires_system(app,permission,form->original);gtk_widget_set_visible(form->authorize,!permitted);
       if(permitted&&form->access_blocked){form->access_blocked=FALSE;gtk_label_set_text(form->error,"");}
     }
     g_object_unref(window);
@@ -425,7 +439,7 @@ static void access_update_header(App *app){
 }
 static void access_apply(App *app,JsonObject *state){
   if(app->access_state)json_object_unref(app->access_state);
-  app->access_state=copy_object(state);if(access_authorized(app))g_clear_pointer(&app->access_notice,g_free);access_update_header(app);
+  app->access_state=copy_object(state);if(!access_authorized(app))clear_shared_unlock(app);if(access_authorized(app))g_clear_pointer(&app->access_notice,g_free);access_update_header(app);
 }
 static void access_request_unlock(App *app,const char *scope){
   if(app->access_busy||app->active){error_window(app,"Operation in progress","Wait for the current operation to finish before changing authorization.");return;}
@@ -532,7 +546,7 @@ static gboolean access_handle_result(Operation *operation,JsonNode *payload,Json
       JsonObject *state=copy_object(app->access_state);json_object_set_boolean_member(state,"authorized",FALSE);json_object_set_string_member(state,"scope","none");json_object_set_boolean_member(state,"available",!status);access_apply(app,state);json_object_unref(state);
     }
     app->access_startup_pending=FALSE;app->access_open_users=FALSE;
-    if(!status){add_activity(app,message);error_window(app,"Authorization needs attention",message);}
+    if(!status){g_queue_clear_full(app->pending_unlocks,g_free);clear_shared_unlock(app);add_activity(app,message);error_window(app,"Authorization needs attention",message);}
     g_free(remote);if(!status)access_request_status(app,FALSE);
   }else if(payload&&JSON_NODE_HOLDS_OBJECT(payload)){
     JsonObject *data=json_node_get_object(payload);
@@ -626,6 +640,10 @@ static void operation_done(GObject *source,GAsyncResult *result,gpointer data) {
       g_set_error_literal(&error,G_IO_ERROR,G_IO_ERROR_FAILED,*message?message:"The operation could not be completed.");
     }else if(json_object_has_member(root,"data"))payload=json_object_get_member(root,"data");
   }else if(response)g_set_error_literal(&error,G_IO_ERROR,G_IO_ERROR_INVALID_DATA,"The service returned an invalid operation response.");
+  if(error&&!strcmp(o->op,"vault.open")){
+    if(!o->setup_window&&app->shared_password&&!g_queue_find_custom(app->pending_unlocks,o->record_id,(GCompareFunc)g_strcmp0))g_queue_push_head(app->pending_unlocks,g_strdup(o->record_id));
+    clear_shared_unlock(app);
+  }
   if(error&&!g_str_has_prefix(o->op,"access.")){
     char *remote=g_dbus_error_get_remote_error(error);
     const char *code=*str(failure,"code")?str(failure,"code"):remote?remote:"";
@@ -725,7 +743,7 @@ static void detail_nodes(GtkBox *box,const char *name,JsonNode *node,int depth) 
     if(name&&*name){char *h=humanize(name);append_text(box,h,"heading");g_free(h);}
     for(GList *l=members;l;l=l->next){
       const char *key=l->data;
-      if(!strcmp(key,"credential_id")||!strcmp(key,"credentials")||!strcmp(key,"schema_version"))continue;
+      if(!strcmp(key,"fido2")||!strcmp(key,"credential_id")||!strcmp(key,"credentials")||!strcmp(key,"schema_version"))continue;
       detail_nodes(box,key,json_object_get_member(object,key),depth+1);
     }g_list_free(members);
   }else if(JSON_NODE_HOLDS_ARRAY(node)){
@@ -833,14 +851,17 @@ static const Spec vault_create[]={
  S("directory","_Folder for the encrypted vault file","folder",NULL,"The .tomb container stays here when locked and unlocked. This is separate from the folders you want to protect.",TRUE),
  S("size_gb","Size in _gigabytes","number","10","Space reserved for the encrypted container. Choose enough room for the files you plan to protect.",TRUE),
  S("auth","_Unlock method","choice","key|token|gpg|image|text",NULL,TRUE),
+ S("_shared_key","Use the key from another _vault","reference","0","Optional. The same key and its passphrase will unlock both vaults.",FALSE),
  S("use_existing_key","Reuse an existing _vault key file","boolean",NULL,"Leave unchecked for a new vault, including when you already own a YubiKey. Enable only to reuse an encrypted Tomb key file or carrier.",FALSE),
  S("key_file","_Existing key or carrier","file",NULL,"Choose the encrypted key file, image, or text file that already contains your vault key.",TRUE),
  S("image_source","_Choose an image","file",NULL,"Choose a JPEG or BMP. OctoVault hides a new encrypted key in a private copy; your original image stays unchanged.",TRUE),
  S("recipient","OpenPGP _encryption key","text",NULL,"Select the key that will protect this vault. OctoVault tests encryption and unlocking before creating any vault files.",TRUE),
  S("cipher_file","Text cipher _file (optional)","file",NULL,"Only needed if your existing text carrier uses a custom word list. Otherwise leave this blank.",FALSE),
- S("password","_Passphrase","password",NULL,"Remember this passphrase. OctoVault never saves it.",TRUE),
+ S("password","_Passphrase","password",NULL,"Remember this passphrase for recovery. An optional FIDO2 setup can protect an encrypted copy with your security key.",TRUE),
  S("_confirm_password","_Confirm passphrase","password",NULL,NULL,TRUE),
  S("open_on","_Offer to unlock","choice","login|manual|drive|token",NULL,FALSE),S("drive_uuid","Key drive _UUID","text",NULL,"Used for drive-triggered unlocking.",FALSE),
+ S("prompt_after_unlock","Also offer after _screen unlock","boolean",NULL,"Show the unlock prompt when you return to your locked desktop.",FALSE),
+ S("prompt_after_resume","Also offer after _waking from sleep","boolean",NULL,"Show the unlock prompt after the computer wakes, once the desktop is unlocked.",FALSE),
  S("close_on","_Lock automatically","flags","screen-lock|logout|sleep|shutdown",NULL,FALSE),
  S("force_close","Allow force close of _busy applications","boolean",NULL,"Force closing can discard unsaved application work.",FALSE),END};
 static const Spec vault_import[]={
@@ -849,7 +870,9 @@ static const Spec vault_import[]={
  S("key_file","_Existing key or carrier","file",NULL,"Select its encrypted key file, image, or text carrier. Importing never generates a replacement key.",TRUE),
  S("recipient","OpenPGP _encryption key","text",NULL,"Software OpenPGP keys and compatible YubiKeys are supported.",FALSE),
  S("cipher_file","Text cipher _file (optional)","file",NULL,"Choose the original cipher for a custom text carrier; otherwise leave blank.",FALSE),
- S("open_on","_Unlock automatically","choice","login|manual|drive|token",NULL,FALSE),S("drive_uuid","Key drive _UUID","text",NULL,"Used for drive-triggered unlocking.",FALSE),
+ S("open_on","_Offer to unlock","choice","login|manual|drive|token",NULL,FALSE),S("drive_uuid","Key drive _UUID","text",NULL,"Used for drive-triggered unlocking.",FALSE),
+ S("prompt_after_unlock","Also offer after _screen unlock","boolean",NULL,"Show the unlock prompt when you return to your locked desktop.",FALSE),
+ S("prompt_after_resume","Also offer after _waking from sleep","boolean",NULL,"Show the unlock prompt after the computer wakes, once the desktop is unlocked.",FALSE),
  S("close_on","_Lock automatically","flags","screen-lock|logout|sleep|shutdown",NULL,FALSE),
  S("force_close","Allow force close of _busy applications","boolean",NULL,"Force closing can discard unsaved application work.",FALSE),
  S("trust_native_hooks","Trust _scripts stored inside this vault","boolean",NULL,"Allows executable hooks from the vault to run as your account. Leave disabled for untrusted imported vaults.",FALSE),END};
@@ -858,14 +881,17 @@ static const Spec vault_settings[]={
  S("auth","_Authentication","choice","key|token|gpg|image|text","Select the method used by the existing key or carrier below.",TRUE),
  S("key_file","_Key file or image/text carrier","file",NULL,"Select an existing compatible key. Use Replace key to change the vault's encryption key.",TRUE),
  S("recipient","OpenPGP _recipient","text",NULL,NULL,FALSE),S("cipher_file","Text cipher _file","file",NULL,"Leave blank to use OctoVault's included word-list cipher. Existing text keys need their original cipher.",FALSE),
- S("open_on","_Unlock automatically","choice","login|manual|drive|token",NULL,FALSE),
- S("drive_uuid","Key drive _UUID","text",NULL,NULL,FALSE),S("close_on","_Lock automatically","flags","screen-lock|logout|sleep|shutdown",NULL,FALSE),
+ S("open_on","_Offer to unlock","choice","login|manual|drive|token",NULL,FALSE),
+ S("drive_uuid","Key drive _UUID","text",NULL,NULL,FALSE),
+ S("prompt_after_unlock","Also offer after _screen unlock","boolean",NULL,NULL,FALSE),
+ S("prompt_after_resume","Also offer after _waking from sleep","boolean",NULL,NULL,FALSE),S("close_on","_Lock automatically","flags","screen-lock|logout|sleep|shutdown",NULL,FALSE),
  S("force_close","Allow force close of _busy applications","boolean",NULL,"Applications holding this vault open may be terminated.",FALSE),
  S("trust_native_hooks","Trust _scripts stored inside this vault","boolean",NULL,"Allows the vault's own executable hooks to run as your account. Enable only for a vault whose scripts you trust.",FALSE),
  S("hooks.open","After _opening script","file",NULL,"Runs as your user. Only choose scripts you trust.",FALSE),
  S("hooks.close","Before _closing script","file",NULL,"Runs while protected files are still accessible.",FALSE),
  S("hooks.after_close","After confirmed _lock script","file",NULL,"Runs only after the vault has been verified closed.",FALSE),END};
-static const Spec vault_open[]={S("password","Key _passphrase","password",NULL,"For a password-protected vault key. Software OpenPGP keys and YubiKeys use GnuPG's own passphrase or PIN prompt.",FALSE),END};
+static const Spec vault_open[]={S("password","Key _passphrase","password",NULL,"Enter the passphrase for this vault, then press Enter to unlock.",FALSE),S("_fido_pin","Security key _PIN","password",NULL,"Connect your FIDO2 key. After Unlock, touch it when it flashes.",FALSE),S("_use_passphrase","Use the recovery _passphrase instead","boolean",NULL,NULL,FALSE),S("_unlock_shared","Also unlock other vaults using this _key","boolean",NULL,"Uses this entry for the named vaults during this unlock sequence only.",FALSE),S("_unlock_remaining","Use this passphrase for the _remaining vaults","boolean",NULL,"Select only when those vaults use the same passphrase. A failed unlock returns to its own prompt.",FALSE),END};
+static const Spec fido_enroll[]={S("password","Current vault _passphrase","password",NULL,"This passphrase remains your recovery method if the security key is unavailable.",TRUE),S("_fido_pin","FIDO2 security key _PIN","password",NULL,"Connect a key supporting hmac-secret, enter its existing FIDO2 PIN, then touch when prompted. This does not change your SSH credentials.",TRUE),END};
 static const Spec vault_close[]={S("force","_Force close busy applications","boolean",NULL,"May discard unsaved work. Leave disabled for a graceful lock.",FALSE),END};
 static const Spec vault_resize[]={S("size_gb","New size in _gigabytes","number","20","The vault must be closed. Shrinking is not supported.",TRUE),S("password","Key _passphrase","password",NULL,NULL,FALSE),END};
 static const Spec vault_passwd[]={S("old_password","_Current passphrase","password",NULL,NULL,TRUE),S("password","_New passphrase","password",NULL,NULL,TRUE),S("_confirm_password","_Confirm new passphrase","password",NULL,NULL,TRUE),END};
@@ -915,6 +941,7 @@ static const Spec *specifications(const char *op){
  if(!strcmp(op,"vault.import"))return vault_import;
  if(!strcmp(op,"vault.update"))return vault_settings;
  if(!strcmp(op,"vault.open"))return vault_open;
+ if(!strcmp(op,"ui.fido-enroll"))return fido_enroll;
  if(!strcmp(op,"vault.close"))return vault_close;
  if(!strcmp(op,"vault.resize"))return vault_resize;
  if(!strcmp(op,"vault.passwd"))return vault_passwd;
@@ -973,7 +1000,7 @@ static Field *find_field(Form *form,const char *key){
 static gboolean advanced_field(const char*operation,const char*key){
   if(!strcmp(operation,"migration.add"))return !strcmp(key,"relative");
   if(g_str_has_prefix(operation,"vault.")){
-    if(!strcmp(key,"open_on")||!strcmp(key,"close_on")||!strcmp(key,"force_close")||!strcmp(key,"trust_native_hooks")||g_str_has_prefix(key,"hooks."))return TRUE;
+    if(!strcmp(key,"open_on")||!strcmp(key,"prompt_after_unlock")||!strcmp(key,"prompt_after_resume")||!strcmp(key,"close_on")||!strcmp(key,"force_close")||!strcmp(key,"trust_native_hooks")||g_str_has_prefix(key,"hooks."))return TRUE;
     if(!strcmp(key,"cipher_file"))return TRUE;
     if(!strcmp(operation,"vault.close")&&!strcmp(key,"force"))return TRUE;
   }
@@ -1028,7 +1055,7 @@ static const char *vault_create_guidance(const char *auth,gboolean existing){
   if(!strcmp(auth,"text"))return "OctoVault generates the key automatically, protects it with your passphrase, and creates a text carrier. The carrier is saved privately and its location remembered.";
   if(!strcmp(auth,"token"))return "Connect your YubiKey and choose Detect security key. OctoVault checks its existing OpenPGP encryption key and asks for PIN or touch before creating your vault. It generates the vault key file automatically; it does not reset or reconfigure your YubiKey.";
   if(!strcmp(auth,"gpg"))return "Choose your software OpenPGP encryption key. OctoVault tests that it can encrypt and unlock a short challenge, then generates the vault key file automatically. GnuPG asks for your private-key passphrase when needed.";
-  return "OctoVault generates and securely stores an encrypted key for you. You only need to enter its passphrase when unlocking. The key's location is remembered; the passphrase is never saved.";
+  return "OctoVault creates and remembers the encrypted key file. Enter its passphrase to unlock. After creation, you can add a FIDO2 security key while keeping this passphrase for recovery.";
 }
 static void update_location_preview(GtkEditable *editable,gpointer data){
   (void)editable;Form*f=data;if(!f->location_preview)return;
@@ -1091,6 +1118,20 @@ static void update_form_visibility(GObject *object,GParamSpec *pspec,gpointer da
       if(!strcmp(k,"vault_id"))visible=strcmp(mode,"none")!=0||!strcmp(trigger,"vault-open")||!strcmp(trigger,"vault-close");
       if(!strcmp(k,"sources"))visible=strcmp(mode,"closed-container")!=0;
     }
+    if(!strcmp(form->operation,"vault.open")){
+      Field *fallback=find_field(form,"_use_passphrase");gboolean enrolled=has_fido(form->original),recovery=fallback&&gtk_check_button_get_active(GTK_CHECK_BUTTON(fallback->widget));
+      if(!strcmp(k,"password"))visible=!openpgp_auth(str(form->original,"auth"))&&(!enrolled||recovery);
+      if(!strcmp(k,"_fido_pin"))visible=enrolled&&!recovery;
+      if(!strcmp(k,"_use_passphrase"))visible=enrolled;
+      if(!strcmp(k,"_unlock_shared")||!strcmp(k,"_unlock_remaining")){
+        GString *names=g_string_new(NULL);JsonNode *collection=form->app->collections[0];
+        if(!openpgp_auth(str(form->original,"auth"))&&collection&&JSON_NODE_HOLDS_ARRAY(collection)){
+          JsonArray *vaults=json_node_get_array(collection);
+          for(guint j=0;j<json_array_get_length(vaults);j++){JsonNode *node=json_array_get_element(vaults,j);if(!JSON_NODE_HOLDS_OBJECT(node))continue;JsonObject *record=json_node_get_object(node);if(strcmp(str(record,"id"),str(form->original,"id"))&&strcmp(str(record,"status"),"open")&&(!strcmp(k,"_unlock_shared")?same_vault_key(record,form->original):(form->app->pending_unlocks&&g_queue_find_custom(form->app->pending_unlocks,str(record,"id"),(GCompareFunc)g_strcmp0)!=NULL))){if(names->len)g_string_append(names,", ");g_string_append(names,str(record,"name"));}}
+        }
+        visible=names->len>0;if(visible){char *hint=g_strdup_printf("Also opens: %s. This entry is kept only until this unlock sequence ends.",names->str);gtk_label_set_text(f->hint,hint);g_free(hint);}g_string_free(names,TRUE);
+      }
+    }
     f->context_visible=visible;
     if(advanced_field(form->operation,k)&&form->advanced&&!gtk_check_button_get_active(form->advanced))visible=FALSE;
     gtk_widget_set_visible(f->row,visible);
@@ -1107,7 +1148,7 @@ static void update_form_visibility(GObject *object,GParamSpec *pspec,gpointer da
   if(form->guidance)gtk_label_set_text(form->guidance,vault_create_guidance(auth,existing));
 }
 static void field_free(gpointer data){Field*f=data;if(f->values)g_ptr_array_unref(f->values);g_free(f);}
-static void form_free(gpointer data){Form*f=data;if(f->guided_backup)backup_setup_form_closed(f->app,f->operation,f->submitted);if(f->automatic){f->app->automatic_prompt=FALSE;g_idle_add(drain_unlocks,f->app);}g_free(f->operation);json_object_unref(f->base);json_object_unref(f->original);g_ptr_array_unref(f->fields);g_free(f->suggested_relative);g_free(f);}
+static void form_free(gpointer data){Form*f=data;if(f->guided_backup)backup_setup_form_closed(f->app,f->operation,f->submitted);if(f->automatic){f->app->automatic_prompt=FALSE;g_clear_pointer(&f->app->current_unlock,g_free);g_idle_add(drain_unlocks,f->app);}g_free(f->operation);json_object_unref(f->base);json_object_unref(f->original);g_ptr_array_unref(f->fields);g_free(f->suggested_relative);g_free(f);}
 static char *field_text(Field *f){
   if(GTK_IS_TEXT_VIEW(f->widget)){GtkTextBuffer *b=gtk_text_view_get_buffer(GTK_TEXT_VIEW(f->widget));GtkTextIter start,end;gtk_text_buffer_get_bounds(b,&start,&end);return gtk_text_buffer_get_text(b,&start,&end,FALSE);}
   return g_strdup(gtk_editable_get_text(GTK_EDITABLE(f->widget)));
@@ -1307,7 +1348,7 @@ static Field *create_field(Form*form,const Spec*spec,JsonObject*record,GtkBox*co
       gtk_string_list_append(model,spec->required?"Select…":"None");g_ptr_array_add(f->values,g_strdup(""));
       guint index=(guint)atoi(spec->options);JsonNode*n=form->app->collections[index];
       if(n&&JSON_NODE_HOLDS_ARRAY(n)){JsonArray*a=json_node_get_array(n);for(guint i=0;i<json_array_get_length(a);i++){JsonNode*item=json_array_get_element(a,i);if(!JSON_NODE_HOLDS_OBJECT(item))continue;JsonObject*o=json_node_get_object(item);gtk_string_list_append(model,str(o,"name"));g_ptr_array_add(f->values,g_strdup(str(o,"id")));if(existing&&!strcmp(initial,str(o,"id")))selected=f->values->len-1;}}
-    }else{gboolean matched=FALSE;char**options=g_strsplit(spec->options,"|",-1);for(guint i=0;options[i];i++){char*t=!strcmp(spec->key,"auth")&&!strcmp(options[i],"token")?g_strdup("YubiKey / OpenPGP security key"):choice_label(options[i]);gtk_string_list_append(model,t);g_free(t);g_ptr_array_add(f->values,g_strdup(options[i]));if(existing&&!strcmp(initial,options[i])){selected=i;matched=TRUE;}}g_strfreev(options);if(!strcmp(kind,"schedule")&&existing&&*initial&&!matched){char*t=g_strdup_printf("Custom: %s",initial);gtk_string_list_append(model,t);g_free(t);g_ptr_array_add(f->values,g_strdup(initial));selected=f->values->len-1;}}
+    }else{gboolean matched=FALSE;char**options=g_strsplit(spec->options,"|",-1);for(guint i=0;options[i];i++){char*t=!strcmp(spec->key,"auth")&&!strcmp(options[i],"token")?g_strdup("OpenPGP security key"):choice_label(options[i]);gtk_string_list_append(model,t);g_free(t);g_ptr_array_add(f->values,g_strdup(options[i]));if(existing&&!strcmp(initial,options[i])){selected=i;matched=TRUE;}}g_strfreev(options);if(!strcmp(kind,"schedule")&&existing&&*initial&&!matched){char*t=g_strdup_printf("Custom: %s",initial);gtk_string_list_append(model,t);g_free(t);g_ptr_array_add(f->values,g_strdup(initial));selected=f->values->len-1;}}
     f->widget=gtk_drop_down_new(G_LIST_MODEL(model),NULL);gtk_drop_down_set_selected(GTK_DROP_DOWN(f->widget),selected);gtk_box_append(row,f->widget);
   }else if(!strcmp(kind,"number")||!strcmp(kind,"integer")){
     f->widget=gtk_spin_button_new_with_range(!strcmp(kind,"number")?0.001:0,100000000, !strcmp(kind,"number")?0.1:1);gtk_spin_button_set_digits(GTK_SPIN_BUTTON(f->widget),!strcmp(kind,"number")?3:0);gtk_spin_button_set_value(GTK_SPIN_BUTTON(f->widget),g_ascii_strtod(initial,NULL));gtk_box_append(row,f->widget);
@@ -1319,8 +1360,8 @@ static Field *create_field(Form*form,const Spec*spec,JsonObject*record,GtkBox*co
     if(!strcmp(kind,"paths")){GtkBox*buttons=GTK_BOX(gtk_box_new(GTK_ORIENTATION_HORIZONTAL,8));gtk_box_append(row,GTK_WIDGET(buttons));GtkWidget*b=gtk_button_new_with_label("Add files…");gtk_box_append(buttons,b);g_signal_connect(b,"clicked",G_CALLBACK(choose_file),f);b=gtk_button_new_with_label("Add folders…");g_object_set_data(G_OBJECT(b),"choose-folder",GINT_TO_POINTER(1));gtk_box_append(buttons,b);g_signal_connect(b,"clicked",G_CALLBACK(choose_file),f);}
   }else{
     f->widget=!strcmp(kind,"password")?gtk_password_entry_new():gtk_entry_new();
-    if(!strcmp(kind,"password"))gtk_password_entry_set_show_peek_icon(GTK_PASSWORD_ENTRY(f->widget),TRUE);
-    else gtk_editable_set_text(GTK_EDITABLE(f->widget),!existing&&!strcmp(spec->key,"directory")?g_get_home_dir():initial);
+    if(!strcmp(kind,"password")){gtk_password_entry_set_show_peek_icon(GTK_PASSWORD_ENTRY(f->widget),TRUE);g_object_set(f->widget,"activates-default",TRUE,NULL);}
+    else {gtk_entry_set_activates_default(GTK_ENTRY(f->widget),TRUE);gtk_editable_set_text(GTK_EDITABLE(f->widget),!existing&&!strcmp(spec->key,"directory")?g_get_home_dir():initial);}
     GtkBox*line=GTK_BOX(gtk_box_new(GTK_ORIENTATION_HORIZONTAL,8));gtk_widget_set_hexpand(f->widget,TRUE);gtk_box_append(line,f->widget);gtk_box_append(row,GTK_WIDGET(line));
     if(!strcmp(spec->key,"recipient")){
       GtkBox*controls=GTK_BOX(gtk_box_new(GTK_ORIENTATION_HORIZONTAL,8));gtk_box_append(row,GTK_WIDGET(controls));
@@ -1438,25 +1479,26 @@ static JsonObject *form_parameters(Form*f,gboolean*accepted){
 static void clear_form_secrets(Form *form){
   for(guint i=0;i<form->fields->len;i++){Field*field=g_ptr_array_index(form->fields,i);if(!strcmp(field->spec->kind,"password"))gtk_editable_set_text(GTK_EDITABLE(field->widget),"");else if(!strcmp(field->spec->kind,"secret-file"))gtk_text_buffer_set_text(gtk_text_view_get_buffer(GTK_TEXT_VIEW(field->widget)),"",-1);}
 }
+#include "unlock-flow.c"
 static void submit_form(GtkButton*button,gpointer data){
   (void)button;Form*f=data;
-  if(!access_can(f->app,f->operation)||(f->needs_system&&!access_system(f->app))||access_record_requires_system(f->app,f->operation,f->original)){f->access_blocked=TRUE;gtk_label_set_text(f->error,"Authorization is required to continue. Your entries have been kept; choose Authorize below.");gtk_widget_set_visible(f->authorize,TRUE);access_update_header(f->app);return;}
+  const char *permission=!strcmp(f->operation,"ui.fido-enroll")?"vault.update":f->operation;
+  if(f->submitted||f->fido_process)return;
+  if(!access_can(f->app,permission)||(f->needs_system&&!access_system(f->app))||access_record_requires_system(f->app,permission,f->original)){f->access_blocked=TRUE;gtk_label_set_text(f->error,"Authorization is required to continue. Your entries have been kept; choose Authorize below.");gtk_widget_set_visible(f->authorize,TRUE);access_update_header(f->app);return;}
   gboolean valid;JsonObject*params=form_parameters(f,&valid);
   if(valid&&f->app->active){gtk_label_set_text(f->error,"Wait for the current operation to finish before continuing.");valid=FALSE;}
   if(valid){
-    f->submitted=TRUE;gtk_label_set_text(f->error,"");
-    start_operation(f->app,f->operation,params,gtk_window_get_title(f->window),-1,f->acknowledge);
-    if(f->app->active&&!strcmp(f->app->active->op,f->operation)){
-      f->app->active->setup_window=g_object_ref(f->window);
-      clear_form_secrets(f);
-      gtk_widget_set_visible(GTK_WIDGET(f->window),FALSE);
-    }else gtk_window_destroy(f->window);
+    Field *fallback=find_field(f,"_use_passphrase");gboolean use_fido=!strcmp(f->operation,"vault.open")&&has_fido(f->original)&&fallback&&!gtk_check_button_get_active(GTK_CHECK_BUTTON(fallback->widget));
+    if(!strcmp(f->operation,"ui.fido-enroll")||use_fido)fido_submit(f,params,!strcmp(f->operation,"ui.fido-enroll"));
+    else run_form_operation(f,params,f->operation);
   }
+  if(json_object_has_member(params,"password"))wipe((char *)str(params,"password"));
   json_object_unref(params);
 }
 static void open_form(App*app,const char*operation,const char*title,JsonObject*record){
-  if(access_record_requires_system(app,operation,record)){access_require(app,"access.grant");return;}
-  if(!access_require(app,operation))return;
+  const char *permission=!strcmp(operation,"ui.fido-enroll")?"vault.update":operation;
+  if(access_record_requires_system(app,permission,record)){access_require(app,"access.grant");return;}
+  if(!access_require(app,permission))return;
   if(app->active&&!( !strcmp(operation,"vault.close")&&!strcmp(app->active->op,"backup.run"))){error_window(app,"An operation is already running","Wait for the current operation to complete or cancel it first.");return;}
   Form*f=g_new0(Form,1);f->app=app;f->operation=g_strdup(operation);f->base=json_object_new();f->original=copy_object(record);f->fields=g_ptr_array_new_with_free_func(field_free);f->acknowledge=!strcmp(operation,"repository.create");f->automatic=app->automatic_prompt&&!strcmp(operation,"vault.open");
   if(record&&*str(record,"id"))json_object_set_string_member(f->base,"id",str(record,"id"));
@@ -1465,13 +1507,15 @@ static void open_form(App*app,const char*operation,const char*title,JsonObject*r
     json_object_set_string_member(f->base,"action",str(record,"action"));
   }
   gboolean creating=!strcmp(operation,"vault.create"),recovering=!strcmp(operation,"migration.recover");
-  GtkWindow*w=dialog_window(app,title,recovering?600:720,recovering?360:760);f->window=w;g_object_set_data_full(G_OBJECT(w),"form",f,form_free);
+  gboolean compact=!strcmp(operation,"vault.open")||!strcmp(operation,"vault.close")||!strcmp(operation,"ui.fido-enroll")||recovering||specifications(operation)==empty_fields;
+  GtkWindow*w=dialog_window(app,title,compact?540:720,compact?1:640);f->window=w;g_object_set_data_full(G_OBJECT(w),"form",f,form_free);g_signal_connect(w,"close-request",G_CALLBACK(form_close_requested),f);
   GtkBox*root=GTK_BOX(gtk_box_new(GTK_ORIENTATION_VERTICAL,12));margin(GTK_WIDGET(root),24);append_text(root,title,"title-2");
   if(record&&*str(record,"name"))append_text(root,str(record,"name"),"dim-label");
+  if(f->automatic&&app->pending_unlocks&&!g_queue_is_empty(app->pending_unlocks)){char *remaining=g_strdup_printf("%u more vault%s waiting to unlock",g_queue_get_length(app->pending_unlocks),g_queue_get_length(app->pending_unlocks)==1?"":"s");append_text(root,remaining,"dim-label");g_free(remaining);}
   const Spec*spec=specifications(operation);gboolean has_advanced=FALSE;
   for(guint i=0;spec[i].key;i++)if(advanced_field(operation,spec[i].key))has_advanced=TRUE;
   if(has_advanced){f->advanced=GTK_CHECK_BUTTON(gtk_check_button_new_with_mnemonic("_Advanced options"));gtk_widget_set_tooltip_text(GTK_WIDGET(f->advanced),"Show optional technical settings. Basic mode uses defaults for new items and keeps saved settings when editing.");gtk_box_append(root,GTK_WIDGET(f->advanced));g_signal_connect(f->advanced,"notify::active",G_CALLBACK(update_form_visibility),f);}
-  GtkWidget*scroll=gtk_scrolled_window_new();gtk_widget_set_vexpand(scroll,TRUE);GtkBox*content=GTK_BOX(gtk_box_new(GTK_ORIENTATION_VERTICAL,18));margin(GTK_WIDGET(content),6);gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll),GTK_POLICY_NEVER,GTK_POLICY_AUTOMATIC);gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroll),GTK_WIDGET(content));gtk_box_append(root,scroll);
+  GtkWidget*scroll=gtk_scrolled_window_new();gtk_widget_set_vexpand(scroll,!compact);gtk_scrolled_window_set_propagate_natural_height(GTK_SCROLLED_WINDOW(scroll),TRUE);gtk_scrolled_window_set_max_content_height(GTK_SCROLLED_WINDOW(scroll),compact?500:560);GtkBox*content=GTK_BOX(gtk_box_new(GTK_ORIENTATION_VERTICAL,18));margin(GTK_WIDGET(content),6);gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll),GTK_POLICY_NEVER,GTK_POLICY_AUTOMATIC);gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroll),GTK_WIDGET(content));gtk_box_append(root,scroll);
   if(strstr(operation,".remove"))append_text(content,"This removes the registration and its managed automation. Your encrypted container or remote backup data will remain intact.",NULL);
   else if(creating)append_text(content,"Create an empty encrypted .tomb file. Then unlock it and choose Protect a folder or file to move your data into it.",NULL);
   else if(!strcmp(operation,"migration.add")){
@@ -1486,6 +1530,8 @@ static void open_form(App*app,const char*operation,const char*title,JsonObject*r
   else if(!strcmp(operation,"repository.prune"))append_text(content,"Pruning permanently removes data no longer referenced by retained snapshots. Other jobs for this repository must finish first.",NULL);
   else if(!strcmp(operation,"repository.recovery"))append_text(content,"This reveals repository access credentials. Continue only when you can save or inspect them privately.",NULL);
   else if(!strcmp(operation,"destination.save"))append_text(content,"Fill the connection settings for the selected destination type. When editing, empty secret fields keep the existing encrypted credentials.",NULL);
+  else if(!strcmp(operation,"vault.close"))append_text(content,"Lock this vault to hide its protected files. Close applications using those files first.",NULL);
+  else if(!strcmp(operation,"ui.fido-enroll"))append_text(content,"Add a FIDO2 security key as another way to unlock this vault. Your existing passphrase continues to work for recovery.",NULL);
   else if(!strcmp(operation,"vault.open")&&record&&!strcmp(str(record,"auth"),"gpg"))append_text(content,"GnuPG will ask for your software OpenPGP key's passphrase or your security key's PIN when needed. OctoVault remembers the vault key's location and does not save your passphrase or PIN.",NULL);
   else if(specifications(operation)==empty_fields)append_text(content,"Continue to run this operation. Its progress and result will appear in OctoVault.",NULL);
   for(guint i=0;spec[i].key;i++){
@@ -1499,15 +1545,17 @@ static void open_form(App*app,const char*operation,const char*title,JsonObject*r
     if(creating&&!strcmp(spec[i].key,"auth")){f->guidance=GTK_LABEL(label("","dim-label"));gtk_box_append(content,GTK_WIDGET(f->guidance));}
   }
   if(!strcmp(operation,"migration.add")){f->location_preview=GTK_LABEL(label("","dim-label"));gtk_label_set_selectable(f->location_preview,TRUE);gtk_box_append(content,GTK_WIDGET(f->location_preview));g_signal_connect(find_field(f,"source")->widget,"changed",G_CALLBACK(update_protection_preview),f);g_signal_connect(find_field(f,"relative")->widget,"changed",G_CALLBACK(update_protection_preview),f);update_protection_preview(GTK_EDITABLE(find_field(f,"source")->widget),f);}
-  for(guint i=0;i<f->fields->len;i++){Field*field=g_ptr_array_index(f->fields,i);if(GTK_IS_DROP_DOWN(field->widget))g_signal_connect(field->widget,"notify::selected",G_CALLBACK(update_form_visibility),f);if(!strcmp(field->spec->key,"use_existing_key"))g_signal_connect(field->widget,"notify::active",G_CALLBACK(update_form_visibility),f);if(creating&&(!strcmp(field->spec->key,"name")||!strcmp(field->spec->key,"directory")))g_signal_connect(field->widget,"changed",G_CALLBACK(update_location_preview),f);}
+  for(guint i=0;i<f->fields->len;i++){Field*field=g_ptr_array_index(f->fields,i);if(!strcmp(field->spec->key,"_shared_key"))g_signal_connect(field->widget,"notify::selected",G_CALLBACK(shared_key_selected),f);if(!strcmp(field->spec->key,"_use_passphrase"))g_signal_connect(field->widget,"notify::active",G_CALLBACK(update_form_visibility),f);if(GTK_IS_DROP_DOWN(field->widget))g_signal_connect(field->widget,"notify::selected",G_CALLBACK(update_form_visibility),f);if(!strcmp(field->spec->key,"use_existing_key"))g_signal_connect(field->widget,"notify::active",G_CALLBACK(update_form_visibility),f);if(creating&&(!strcmp(field->spec->key,"name")||!strcmp(field->spec->key,"directory")))g_signal_connect(field->widget,"changed",G_CALLBACK(update_location_preview),f);}
   update_form_visibility(NULL,NULL,f);
   if(creating)update_location_preview(NULL,f);
   f->error=GTK_LABEL(label("","error"));gtk_box_append(root,GTK_WIDGET(f->error));
   f->authorize=gtk_button_new_with_label("Authorize");gtk_widget_set_halign(f->authorize,GTK_ALIGN_START);gtk_widget_set_visible(f->authorize,FALSE);g_signal_connect(f->authorize,"clicked",G_CALLBACK(access_authorize_clicked),app);gtk_box_append(root,f->authorize);
   GtkBox*buttons=GTK_BOX(gtk_box_new(GTK_ORIENTATION_HORIZONTAL,10));gtk_widget_set_halign(GTK_WIDGET(buttons),GTK_ALIGN_END);gtk_box_append(root,GTK_WIDGET(buttons));
-  GtkWidget*cancel=gtk_button_new_with_mnemonic("_Cancel");gtk_box_append(buttons,cancel);g_signal_connect(cancel,"clicked",G_CALLBACK(close_window),w);
-  GtkWidget*submit=gtk_button_new_with_mnemonic(creating?"_Create empty vault":!strcmp(operation,"migration.add")?"_Protect":!strcmp(operation,"migration.recover")?(!strcmp(str(record,"action"),"rollback")?"_Restore original location":"_Resume protection"):"_Continue");gtk_widget_add_css_class(submit,strstr(operation,".remove")||!strcmp(operation,"repository.prune")?"destructive-action":"suggested-action");gtk_box_append(buttons,submit);g_signal_connect(submit,"clicked",G_CALLBACK(submit_form),f);
+  if(f->automatic){GtkWidget *stop=gtk_button_new_with_label("Cancel remaining");gtk_box_append(buttons,stop);g_signal_connect(stop,"clicked",G_CALLBACK(cancel_remaining_unlocks),f);}
+  GtkWidget*cancel=gtk_button_new_with_mnemonic(f->automatic?"_Skip":"_Cancel");gtk_box_append(buttons,cancel);g_signal_connect(cancel,"clicked",G_CALLBACK(close_window),w);
+  GtkWidget*submit=gtk_button_new_with_mnemonic(creating?"_Create empty vault":!strcmp(operation,"migration.add")?"_Protect":!strcmp(operation,"migration.recover")?(!strcmp(str(record,"action"),"rollback")?"_Restore original location":"_Resume protection"):!strcmp(operation,"vault.open")?"_Unlock":!strcmp(operation,"vault.close")?"_Lock":!strcmp(operation,"ui.fido-enroll")?"_Register key":"_Continue");gtk_widget_add_css_class(submit,strstr(operation,".remove")||!strcmp(operation,"repository.prune")?"destructive-action":"suggested-action");gtk_box_append(buttons,submit);g_signal_connect(submit,"clicked",G_CALLBACK(submit_form),f);f->submit=submit;gtk_window_set_default_widget(w,submit);
   gtk_window_set_child(w,GTK_WIDGET(root));gtk_window_present(w);
+  for(guint i=0;i<f->fields->len;i++){Field *field=g_ptr_array_index(f->fields,i);if(gtk_widget_get_visible(field->row)&&!strcmp(field->spec->kind,"password")){gtk_widget_grab_focus(field->widget);break;}}
 }
 
 static void action_free(gpointer data,GClosure*closure){(void)closure;Action*a=data;g_free(a->operation);g_free(a->title);if(a->record)json_object_unref(a->record);g_free(a);}
@@ -1676,6 +1724,9 @@ static void created_unlock_clicked(GtkButton*button,gpointer data){
   JsonObject*record=json_object_ref(g_object_get_data(G_OBJECT(window),"created-vault"));
   gtk_window_destroy(window);open_form(app,"vault.open","Unlock vault",record);json_object_unref(record);
 }
+static void created_fido_clicked(GtkButton *button,gpointer data){
+  App *app=data;GtkWindow *window=GTK_WINDOW(gtk_widget_get_root(GTK_WIDGET(button)));JsonObject *record=copy_object(g_object_get_data(G_OBJECT(window),"created-vault"));gtk_window_destroy(window);open_form(app,"ui.fido-enroll","Add FIDO2 security key",record);json_object_unref(record);
+}
 static void vault_created_window(App*app,JsonObject*record){
   GtkWindow*w=dialog_window(app,"Your encrypted vault is ready",680,560);
   g_object_set_data_full(G_OBJECT(w),"created-vault",json_object_ref(record),(GDestroyNotify)json_object_unref);
@@ -1686,6 +1737,7 @@ static void vault_created_window(App*app,JsonObject*record){
   for(guint i=0;i<G_N_ELEMENTS(keys);i++)if(*str(record,keys[i])){append_text(content,titles[i],"heading");GtkWidget*path=label(str(record,keys[i]),"dim-label");gtk_label_set_selectable(GTK_LABEL(path),TRUE);gtk_box_append(content,path);}
   append_text(content,"The .tomb file stores your protected data. The separate key file or carrier unlocks it with your passphrase or OpenPGP key; it does not contain your documents.",NULL);
   GtkBox*buttons=GTK_BOX(gtk_box_new(GTK_ORIENTATION_HORIZONTAL,10));gtk_widget_set_halign(GTK_WIDGET(buttons),GTK_ALIGN_END);gtk_box_append(root,GTK_WIDGET(buttons));GtkWidget*done=gtk_button_new_with_label("Done");gtk_box_append(buttons,done);g_signal_connect(done,"clicked",G_CALLBACK(close_window),w);
+  if(!openpgp_auth(str(record,"auth"))){GtkWidget *fido=gtk_button_new_with_label("Add FIDO2 security key…");gtk_box_append(buttons,fido);g_signal_connect(fido,"clicked",G_CALLBACK(created_fido_clicked),app);}
   GtkWidget*unlock=gtk_button_new_with_label("Unlock vault…");gtk_widget_add_css_class(unlock,"suggested-action");gtk_box_append(buttons,unlock);g_signal_connect(unlock,"clicked",G_CALLBACK(created_unlock_clicked),app);gtk_window_set_child(w,GTK_WIDGET(root));gtk_window_present(w);
 }
 static void add_menu_action(GtkBox*menu,App*app,const char*title,const char*operation,JsonObject*record){gtk_box_append(menu,action_button(app,title,operation,record,"flat"));}
@@ -1757,6 +1809,7 @@ static void show_record(App*app,JsonObject*record,gint collection){
     GtkWidget*lock=action_button(app,"Lock","vault.close",record,NULL);gtk_widget_set_sensitive(lock,opened);gtk_box_append(buttons,lock);
     GtkWidget*protect=action_button(app,"Protect a folder or file…","migration.add",record,opened&&vault_protected_locations(record)&&!json_array_get_length(vault_protected_locations(record))?"suggested-action":NULL);gtk_widget_set_sensitive(protect,opened);if(!opened)gtk_widget_set_tooltip_text(protect,"Unlock this vault before protecting a folder or file.");gtk_box_append(buttons,protect);
     add_menu_action(menu,app,"Details","vault.get",record);add_menu_action(menu,app,"Automation & scripts…","vault.update",record);
+    if(!openpgp_auth(str(record,"auth")))add_menu_action(menu,app,has_fido(record)?"Replace FIDO2 security key…":"Add FIDO2 security key…","ui.fido-enroll",record);
     add_menu_action(menu,app,"Change passphrase…","vault.passwd",record);add_menu_action(menu,app,"Replace key…","vault.setkey",record);add_menu_action(menu,app,"Export key…","vault.key-export",record);add_menu_action(menu,app,"Increase capacity…","vault.resize",record);
     add_menu_action(menu,app,"Folder protection & recovery","migration.list",record);add_menu_action(menu,app,"Build search index","vault.index",record);add_menu_action(menu,app,"Search protected files…","vault.search",record);add_menu_action(menu,app,"Remove registration…","vault.remove",record);
   }else if(collection==1){
@@ -1874,8 +1927,25 @@ static void activate(GApplication*application,gpointer data){
   app->progress=GTK_PROGRESS_BAR(gtk_progress_bar_new());gtk_box_append(GTK_BOX(app->job_box),GTK_WIDGET(app->progress));
   gtk_toggle_button_set_active(app->navigation[0],TRUE);gtk_window_present(app->window);access_update_header(app);refresh_all(app);
 }
+static void smoke_submit_count(GtkButton *button,gpointer data){(void)button;App *app=data;app->keyboard_activations++;}
+static gboolean smoke_press_enter(gpointer data){
+  App *app=data;Form *form=g_object_get_data(G_OBJECT(app->keyboard_test_window),"form");g_signal_emit_by_name(find_field(form,"password")->widget,"activate");return G_SOURCE_REMOVE;
+}
+static gboolean smoke_check_enter(gpointer data){
+  App *app=data;g_assert_cmpuint(app->keyboard_activations,==,1);gtk_window_destroy(app->keyboard_test_window);g_clear_object(&app->keyboard_test_window);return G_SOURCE_REMOVE;
+}
+static void smoke_compact_forms(App *app){
+  JsonObject *record=json_object_new();json_object_set_string_member(record,"name","Keyboard test vault");json_object_set_string_member(record,"auth","key");
+  open_form(app,"vault.open","Unlock vault",record);GListModel *windows=gtk_window_get_toplevels();app->keyboard_test_window=g_list_model_get_item(windows,g_list_model_get_n_items(windows)-1);Form *form=g_object_get_data(G_OBJECT(app->keyboard_test_window),"form");
+  Field *password=find_field(form,"password");gboolean activates=FALSE;g_object_get(password->widget,"activates-default",&activates,NULL);g_assert_true(activates);g_assert_true(gtk_window_get_default_widget(form->window)==form->submit);g_assert_cmpstr(gtk_button_get_label(GTK_BUTTON(form->submit)),==,"_Unlock");
+  g_assert_false(gtk_widget_get_visible(find_field(form,"_fido_pin")->row));g_assert_false(gtk_widget_get_visible(find_field(form,"_use_passphrase")->row));
+  g_signal_handlers_block_matched(form->submit,G_SIGNAL_MATCH_FUNC,0,0,NULL,G_CALLBACK(submit_form),NULL);g_signal_connect(form->submit,"clicked",G_CALLBACK(smoke_submit_count),app);
+  g_timeout_add(60,smoke_press_enter,app);g_timeout_add(280,smoke_check_enter,app);json_object_unref(record);
+}
 static gboolean smoke_finished(gpointer data){
   App*app=data;
+  if(app->keyboard_test_window)return G_SOURCE_CONTINUE;
+  if(app->screenshot_unlock||app->screenshot_lock){int height=gtk_widget_get_height(GTK_WIDGET(app->screenshot_window));g_assert_cmpint(height,>,100);g_assert_cmpint(height,<,600);}
   if(app->screenshot){
     GtkWidget*widget=GTK_WIDGET(app->screenshot_window?app->screenshot_window:app->window);int width=gtk_widget_get_width(widget),height=gtk_widget_get_height(widget);
     GdkPaintable*paintable=gtk_widget_paintable_new(widget);GtkSnapshot*snapshot=gtk_snapshot_new();gdk_paintable_snapshot(paintable,GDK_SNAPSHOT(snapshot),width,height);
@@ -1884,24 +1954,35 @@ static gboolean smoke_finished(gpointer data){
   }
   g_application_quit(G_APPLICATION(app->application));return G_SOURCE_REMOVE;
 }
+static JsonObject *registered_vault(App *app,const char *id){
+  JsonNode *node=app->collections[0];if(!node||!JSON_NODE_HOLDS_ARRAY(node))return NULL;
+  JsonArray *vaults=json_node_get_array(node);
+  for(guint i=0;i<json_array_get_length(vaults);i++){JsonNode *item=json_array_get_element(vaults,i);if(JSON_NODE_HOLDS_OBJECT(item)&&!strcmp(str(json_node_get_object(item),"id"),id))return json_node_get_object(item);}
+  return NULL;
+}
 static gboolean unlock_registered(App*app,const char*id){
-  JsonNode*n=app->collections[0];if(!n||!JSON_NODE_HOLDS_ARRAY(n))return FALSE;
-  JsonArray*a=json_node_get_array(n);
-  for(guint i=0;i<json_array_get_length(a);i++){
-    JsonNode*v=json_array_get_element(a,i);if(!JSON_NODE_HOLDS_OBJECT(v))continue;
-    JsonObject*record=json_node_get_object(v);if(strcmp(str(record,"id"),id))continue;
-    if(access_record_requires_system(app,"vault.open",record)){add_activity(app,"An automatic unlock was skipped because this vault requires management authorization.");return TRUE;}
-    if(!strcmp(str(record,"auth"),"gpg")){JsonObject*p=json_object_new();json_object_set_string_member(p,"id",id);start_operation(app,"vault.open",p,"Unlock vault",-1,FALSE);json_object_unref(p);}
-    else {app->automatic_prompt=TRUE;open_form(app,"vault.open","Unlock vault",record);}
-    return TRUE;
-  }
-  return FALSE;
+  JsonObject *record=registered_vault(app,id);if(!record)return FALSE;
+  if(!strcmp(str(record,"status"),"open")){g_idle_add(drain_unlocks,app);return TRUE;}
+  if(app->shared_password&&app->shared_vaults&&g_hash_table_contains(app->shared_vaults,id)&&!openpgp_auth(str(record,"auth"))){
+    JsonObject *params=json_object_new();json_object_set_string_member(params,"id",id);json_object_set_string_member(params,"password",app->shared_password);g_hash_table_remove(app->shared_vaults,id);start_operation(app,"vault.open",params,"Unlock vault",-1,FALSE);wipe((char *)str(params,"password"));json_object_unref(params);
+  }else{app->automatic_prompt=TRUE;g_free(app->current_unlock);app->current_unlock=g_strdup(id);open_form(app,"vault.open","Unlock vault",record);}
+  return TRUE;
 }
 static gboolean drain_unlocks(gpointer data){
-  App*app=data;
-  if(app->active||app->automatic_prompt||!app->collections[0]||g_queue_is_empty(app->pending_unlocks)||!access_can(app,"vault.open"))return G_SOURCE_REMOVE;
-  char*id=g_queue_pop_head(app->pending_unlocks);
-  if(!unlock_registered(app,id)){error_window(app,"Vault is unavailable","The automatically requested vault is no longer registered. Refresh the vault list and check its settings.");g_idle_add(drain_unlocks,app);}
+  App *app=data;
+  if(app->active||app->automatic_prompt||app->access_status_pending||!app->collections[0])return G_SOURCE_REMOVE;
+  if(g_queue_is_empty(app->pending_unlocks)){clear_shared_unlock(app);return G_SOURCE_REMOVE;}
+  JsonObject *record=registered_vault(app,g_queue_peek_head(app->pending_unlocks));
+  gboolean needs_system=record&&access_record_requires_system(app,"vault.open",record);
+  if(!access_can(app,"vault.open")||needs_system){
+    clear_shared_unlock(app);
+    if(!app->unlock_authorization_requested&&!app->access_busy&&boolean(app->access_state,"available")){
+      app->unlock_authorization_requested=TRUE;access_request_unlock(app,needs_system||!boolean(app->access_state,"delegated_personal")?"system":"personal");
+    }
+    return G_SOURCE_REMOVE;
+  }
+  char *id=g_queue_pop_head(app->pending_unlocks);
+  if(!unlock_registered(app,id)){error_window(app,"Vault is unavailable","The requested vault is no longer registered. Refresh the vault list and check its settings.");g_idle_add(drain_unlocks,app);}
   g_free(id);return G_SOURCE_REMOVE;
 }
 static void smoke_label_text(GtkWidget*widget,GString*text){
@@ -2040,26 +2121,35 @@ static int command_line(GApplication*application,GApplicationCommandLine*command
   if(g_variant_dict_lookup(options,"screenshot-destination","&s",&screenshot)){g_free(app->screenshot);app->screenshot=g_strdup(screenshot);app->smoke=TRUE;app->screenshot_destination=TRUE;}
   if(g_variant_dict_lookup(options,"screenshot-protect","&s",&screenshot)){g_free(app->screenshot);app->screenshot=g_strdup(screenshot);app->smoke=TRUE;app->screenshot_protect=TRUE;}
   if(g_variant_dict_lookup(options,"screenshot-menu","&s",&screenshot)){g_free(app->screenshot);app->screenshot=g_strdup(screenshot);app->smoke=TRUE;app->screenshot_menu=TRUE;}
+  if(g_variant_dict_lookup(options,"screenshot-unlock","&s",&screenshot)){app->screenshot=g_strdup(screenshot);app->smoke=TRUE;app->screenshot_unlock=TRUE;}
+  if(g_variant_dict_lookup(options,"screenshot-lock","&s",&screenshot)){app->screenshot=g_strdup(screenshot);app->smoke=TRUE;app->screenshot_lock=TRUE;}
   if(g_variant_dict_lookup(options,"screenshot-vault","&s",&screenshot)){g_free(app->screenshot);app->screenshot=g_strdup(screenshot);app->smoke=TRUE;app->screenshot_vault=TRUE;}
   app->screenshot_advanced=g_variant_dict_contains(options,"screenshot-advanced");
   gboolean background_launch=g_variant_dict_contains(options,"background")||g_variant_dict_contains(options,"unlock");
   if(!app->access_started||!background_launch)app->access_background_launch=background_launch;
   g_application_activate(application);
+  const char *unlock=NULL;gboolean requested=g_variant_dict_lookup(options,"unlock","&s",&unlock);
+  if(requested&&g_strcmp0(app->current_unlock,unlock)&&!(app->active&&!strcmp(app->active->op,"vault.open")&&!g_strcmp0(app->active->record_id,unlock))&&!g_queue_find_custom(app->pending_unlocks,unlock,(GCompareFunc)g_strcmp0)){
+    if(g_queue_is_empty(app->pending_unlocks)&&!app->automatic_prompt){app->access_startup_attempted=FALSE;app->unlock_authorization_requested=FALSE;}
+    g_queue_push_tail(app->pending_unlocks,g_strdup(unlock));
+  }
   if(!app->smoke){
-    if(!app->access_started||(!background_launch&&!app->access_startup_attempted))access_request_status(app,TRUE);
+    if(!app->access_started||requested||(!background_launch&&!app->access_startup_attempted))access_request_status(app,TRUE);
     app->access_started=TRUE;if(!app->access_timer)app->access_timer=g_timeout_add_seconds(1,access_poll,app);
   }
-  const char*unlock=NULL;if(g_variant_dict_lookup(options,"unlock","&s",&unlock)){
-    if(!g_queue_find_custom(app->pending_unlocks,unlock,(GCompareFunc)g_strcmp0))g_queue_push_tail(app->pending_unlocks,g_strdup(unlock));
-    g_idle_add(drain_unlocks,app);
-  }
+  if(requested)g_idle_add(drain_unlocks,app);
   if(app->smoke){
     for(guint i=0;i<6;i++)gtk_toggle_button_set_active(app->navigation[i],TRUE);
     const char *ops[]={"vault.create","vault.import","vault.update","vault.open","vault.close","vault.resize","vault.passwd","vault.setkey","vault.key-export","vault.search","migration.add","destination.save","repository.create","repository.import","repository.check","repository.files","repository.find","repository.diff","repository.restore","repository.forget","repository.password","repository.copy","backup.save"};
     for(guint i=0;i<G_N_ELEMENTS(ops);i++){open_form(app,ops[i],ops[i],NULL);GListModel*windows=gtk_window_get_toplevels();guint count=g_list_model_get_n_items(windows);if(count>1){GtkWindow*w=g_list_model_get_item(windows,count-1);if(w!=app->window){if(!strcmp(ops[i],"vault.create"))smoke_vault_creation(g_object_get_data(G_OBJECT(w),"form"));gtk_window_destroy(w);}g_object_unref(w);}}
-    smoke_advanced_defaults(app);smoke_protection_form(app);smoke_recovery_form(app);smoke_action_menu(app);backup_setup_smoke(app);smoke_access_lifecycle(app);
+    smoke_compact_forms(app);smoke_advanced_defaults(app);smoke_protection_form(app);smoke_recovery_form(app);smoke_action_menu(app);backup_setup_smoke(app);smoke_access_lifecycle(app);
     gtk_toggle_button_set_active(app->navigation[0],TRUE);
     if(app->screenshot_vault)smoke_unlinked_vault_card(app);
+    if(app->screenshot_unlock||app->screenshot_lock){
+      JsonObject *record=json_object_new();json_object_set_string_member(record,"id","sample-documents");json_object_set_string_member(record,"name","Documents vault");json_object_set_string_member(record,"auth","key");
+      open_form(app,app->screenshot_lock?"vault.close":"vault.open",app->screenshot_lock?"Lock vault":"Unlock vault",record);json_object_unref(record);
+      GListModel *windows=gtk_window_get_toplevels();app->screenshot_window=g_list_model_get_item(windows,g_list_model_get_n_items(windows)-1);
+    }
     if(app->screenshot_create){open_form(app,"vault.create","Create vault",NULL);GListModel*windows=gtk_window_get_toplevels();app->screenshot_window=g_list_model_get_item(windows,g_list_model_get_n_items(windows)-1);Form*f=g_object_get_data(G_OBJECT(app->screenshot_window),"form");gtk_editable_set_text(GTK_EDITABLE(find_field(f,"name")->widget),"Personal");}
     if(app->screenshot_backup){open_backup_setup(app);app->screenshot_window=app->backup_setup->window;}
     if(app->screenshot_backup_files){
@@ -2095,10 +2185,12 @@ int main(int argc,char**argv){
   g_application_add_main_option(G_APPLICATION(app->application),"screenshot-destination",0,G_OPTION_FLAG_NONE,G_OPTION_ARG_STRING,"Save the server connection form after native UI checks","FILE");
   g_application_add_main_option(G_APPLICATION(app->application),"screenshot-protect",0,G_OPTION_FLAG_NONE,G_OPTION_ARG_STRING,"Save the folder protection form after native UI checks","FILE");
   g_application_add_main_option(G_APPLICATION(app->application),"screenshot-menu",0,G_OPTION_FLAG_NONE,G_OPTION_ARG_STRING,"Save the vault action list after native UI checks","FILE");
+  g_application_add_main_option(G_APPLICATION(app->application),"screenshot-unlock",0,G_OPTION_FLAG_NONE,G_OPTION_ARG_STRING,"Save compact unlock dialog after native UI checks","FILE");
+  g_application_add_main_option(G_APPLICATION(app->application),"screenshot-lock",0,G_OPTION_FLAG_NONE,G_OPTION_ARG_STRING,"Save compact lock dialog after native UI checks","FILE");
   g_application_add_main_option(G_APPLICATION(app->application),"screenshot-vault",0,G_OPTION_FLAG_NONE,G_OPTION_ARG_STRING,"Save an unlocked vault card with no linked folders after native UI checks","FILE");
   g_application_add_main_option(G_APPLICATION(app->application),"screenshot-advanced",0,G_OPTION_FLAG_NONE,G_OPTION_ARG_NONE,"Reveal advanced settings in the captured form",NULL);
   g_signal_connect(app->application,"activate",G_CALLBACK(activate),app);g_signal_connect(app->application,"command-line",G_CALLBACK(command_line),app);
-  int status=g_application_run(G_APPLICATION(app->application),argc,argv);g_object_unref(app->application);
+  int status=g_application_run(G_APPLICATION(app->application),argc,argv);clear_shared_unlock(app);g_object_unref(app->application);
   /* Process exit also terminates background polling threads; the service owns jobs. */
   return status;
 }

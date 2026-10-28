@@ -581,9 +581,41 @@ ov_vault_status() {
         '. + {status:$status,usage:$usage,pending_migrations:$pending,protected_locations:$locations}' <<< "$record"
 }
 
+ov_vault_verify_recovery_passphrase() {
+    local record=$1 rc=0
+    [[ $(ov_vault_field "$record" auth) != gpg ]] || ov_fail invalid_auth 'FIDO2 enrollment needs a passphrase-protected Tomb key.'
+    ov_vault_password
+    [[ -n $OV_VAULT_PASSWORD ]] || ov_fail password_required 'Enter the existing recovery passphrase before adding a FIDO2 key.'
+    ov_vault_plain_key "$record"
+    ov_secret_fd "$OV_VAULT_PASSWORD"
+    ov_vault_temporary
+    mkdir -p -m 0700 "$OV_VAULT_TEMP_DIR/verify-gpg"
+    timeout --signal=TERM --kill-after=2 30 gpg --no-options --homedir "$OV_VAULT_TEMP_DIR/verify-gpg" \
+        --batch --no-tty --pinentry-mode loopback --passphrase-fd "$OV_SECRET_FD" \
+        --output /dev/null --decrypt "$OV_VAULT_MATERIALIZED_KEY" >/dev/null 2>&1 || rc=$?
+    ov_secret_close
+    gpgconf --homedir "$OV_VAULT_TEMP_DIR/verify-gpg" --kill all >/dev/null 2>&1 || true
+    rm -f -- "$OV_VAULT_MATERIALIZED_KEY"
+    ((rc==0)) || ov_fail invalid_password 'The recovery passphrase could not unlock this Tomb key. The FIDO2 enrollment was not saved.'
+}
+
+ov_vault_validate_fido2() {
+    local record=$1
+    jq -e '
+      def b64($min;$max): type=="string" and length>=$min and length<=$max and test("^[A-Za-z0-9+/]+={0,2}$");
+      . as $r | .fido2 |
+      .==null or (type=="object" and
+      (keys|sort)==(["version","vault_id","credential","salt","nonce","ciphertext","tag"]|sort) and
+      .version==1 and .vault_id==$r.id and
+      (.credential|b64(4;1368)) and (.salt|b64(44;44)) and (.nonce|b64(16;16)) and
+      (.tag|b64(24;24)) and (.ciphertext|b64(4;5464)) and $r.auth!="gpg")
+    ' <<< "$record" >/dev/null || ov_fail invalid_fido2 'The FIDO2 enrollment is invalid for this vault.'
+}
+
 ov_vault_validate_record() {
     local record=$1
     ov_record_scope "$record" >/dev/null
+    ov_vault_validate_fido2 "$record"
     if [[ ${OV_EXECUTION_SCOPE:-system} == personal && $(ov_vault_field "$record" force_close) == true ]]; then
         ov_fail admin_required 'Force locking can terminate other processes. Unlock administrator access to enable this policy.'
     fi
@@ -591,6 +623,7 @@ ov_vault_validate_record() {
       (.file|type=="string") and (.key_file|type=="string") and
       (.auth|IN("key","gpg","image","text")) and
       (.open_on|IN("manual","login","drive","token")) and
+      ((.prompt_after_unlock//false)|type=="boolean") and ((.prompt_after_resume//false)|type=="boolean") and
       (.close_on|type=="array" and all(.[];IN("screen-lock","logout","sleep","shutdown"))) and
       (.force_close|type=="boolean") and ((.trust_native_hooks//false)|type=="boolean") and
       ((.require_token//false)|type=="boolean") and
@@ -920,7 +953,7 @@ ov_vault_new_record() {
         --arg auth "$auth" --arg time "$(ov_now)" --arg scope "${OV_EXECUTION_SCOPE:-system}" \
         '. as $p | {schema_version:1,id:$id,name:$name,file:$file,key_file:$key,mountpoint:$mount,auth:$auth,execution_scope:$scope,
         recipient:($p.recipient//""),require_token:($p.require_token//false),cipher_file:(if ($p.cipher_file//"")=="" then "/usr/share/octovault/cloak-ciphers/words" else $p.cipher_file end),size_gb:($p.size_gb//null),
-        open_on:($p.open_on//"login"),drive_uuid:($p.drive_uuid//""),close_on:($p.close_on//["shutdown"]),
+        open_on:($p.open_on//"login"),prompt_after_unlock:($p.prompt_after_unlock//false),prompt_after_resume:($p.prompt_after_resume//false),drive_uuid:($p.drive_uuid//""),close_on:($p.close_on//["shutdown"]),
         force_close:($p.force_close//false),trust_native_hooks:($p.trust_native_hooks//false),hooks:($p.hooks//{}),created_at:$time,updated_at:$time}' <<< "$OV_PARAMS")
     ov_vault_validate_record "$OV_RECORD"
     ov_as_user mkdir -p -m 0700 -- "$mountpoint" || ov_fail permission_denied "Could not create the vault mountpoint."
@@ -1076,9 +1109,16 @@ ov_vault_update() {
     jq -e 'has("file") or has("mountpoint")' <<< "$OV_PARAMS" >/dev/null &&
         ov_fail immutable "Container and mountpoint paths cannot be changed on a registered vault."
     record=$(jq --argjson record "$record" --arg time "$(ov_now)" '
-        . as $p | $record + ($p | with_entries(select(.key|IN("name","key_file","auth","recipient","require_token","cipher_file","open_on","drive_uuid","close_on","force_close","hooks","trust_native_hooks")))) | .updated_at=$time' <<< "$OV_PARAMS")
+        . as $p | $record + ($p | with_entries(select(.key|IN("name","key_file","auth","recipient","require_token","cipher_file","open_on","prompt_after_unlock","prompt_after_resume","fido2","drive_uuid","close_on","force_close","hooks","trust_native_hooks")))) | .updated_at=$time' <<< "$OV_PARAMS")
+    if [[ $(ov_vault_field "$record" key_file) != "$(ov_vault_field "$OV_RECORD" key_file)" ||
+          $(ov_vault_field "$record" auth) != "$(ov_vault_field "$OV_RECORD" auth)" ]]; then
+        record=$(jq 'del(.fido2)' <<< "$record")
+    fi
     ov_vault_validate_record "$record"
     ov_vault_user_path "$(ov_vault_field "$record" key_file)" >/dev/null
+    if jq -e 'has("fido2") and .fido2 != null' <<< "$OV_PARAMS" >/dev/null; then
+        ov_vault_verify_recovery_passphrase "$record"
+    fi
     if [[ $(ov_vault_field "$record" require_token) == true ]] &&
         jq -e 'has("key_file") or has("auth") or has("recipient") or has("require_token")' <<< "$OV_PARAMS" >/dev/null; then
         ov_vault_auth_preflight "$(ov_vault_field "$record" recipient)" true "$(ov_vault_field "$record" key_file)"
@@ -1132,6 +1172,8 @@ ov_vault_change_password() {
             ;;
         *) ov_vault_publish "$OV_VAULT_MATERIALIZED_KEY" "$key" true || ov_fail key_failed "Could not save the replacement encrypted key." ;;
     esac
+    record=$(jq 'del(.fido2)' <<< "$record")
+    ov_save vaults "$(ov_vault_field "$record" id)" "$record"
     ov_ok '{"changed":true}'
 }
 
@@ -1166,7 +1208,7 @@ ov_vault_replace_key() {
     fi
     ((rc==0)) || ov_fail key_failed "The key could not be replaced. The saved configuration has not changed."
     ov_vault_unpin "$record" || ov_fail cleanup_failed "The key changed but its temporary container reference remains attached."
-    record=$(jq --arg key "$new_key" --arg time "$(ov_now)" '.key_file=$key | .auth="key" | .require_token=false | .recipient="" | .cipher_file="" | .updated_at=$time' <<< "$record")
+    record=$(jq --arg key "$new_key" --arg time "$(ov_now)" 'del(.fido2) | .key_file=$key | .auth="key" | .require_token=false | .recipient="" | .cipher_file="" | .updated_at=$time' <<< "$record")
     ov_save vaults "$(ov_vault_field "$record" id)" "$record"
     ov_ok "$record"
 }

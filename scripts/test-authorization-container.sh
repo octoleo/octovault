@@ -28,7 +28,7 @@ FROM ubuntu:26.04
 ENV container=docker
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
     systemd systemd-sysv dbus dbus-user-session polkitd libpam-systemd login passwd util-linux \
-    build-essential pkg-config libglib2.0-dev libjson-glib-dev libpolkit-agent-1-dev \
+    build-essential pkg-config libglib2.0-dev libjson-glib-dev libfido2-dev libssl-dev libpolkit-agent-1-dev \
     libgtk-4-dev libadwaita-1-dev jq restic tomb cryptsetup-bin gnupg scdaemon \
     pinentry-gnome3 rsync lsof ca-certificates \
     && rm -rf /var/lib/apt/lists/*

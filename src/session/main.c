@@ -23,6 +23,11 @@ static guint card_timeout_id;
 static gchar *card_identity;
 static gchar *session_client;
 static guint pending_jobs;
+static gchar *login_session_path;
+static gboolean session_known, desktop_active, logind_locked = TRUE, screensaver_locked;
+static gboolean login_offered, was_locked, resume_pending;
+static guint64 desktop_generation;
+static GHashTable *pending_unlock_ids;
 
 typedef struct {
     gchar *id;
@@ -31,6 +36,7 @@ typedef struct {
     gboolean release_inhibitor;
     guint64 inhibitor_generation;
     gboolean end_session;
+    guint64 desktop_generation;
 } EventJob;
 
 static void notify_failure(const gchar *event) {
@@ -95,6 +101,7 @@ static void event_job_free(EventJob *job) {
 }
 
 static gboolean poll_job(gpointer data);
+static void launch_pending_unlocks(void);
 
 static void poll_finished(GObject *source, GAsyncResult *async, gpointer data) {
     EventJob *job = data;
@@ -118,15 +125,14 @@ static void poll_finished(GObject *source, GAsyncResult *async, gpointer data) {
                         JsonObject *payload = json_object_get_object_member(result_object, "data");
                         if (payload && json_object_has_member(payload, "unlock_requests")) {
                             JsonArray *requests = json_object_get_array_member(payload, "unlock_requests");
-                            if (requests) for (guint i = 0; i < json_array_get_length(requests); i++) {
-                                const gchar *id = json_array_get_string_element(requests, i);
-                                if (!id || !*id || strlen(id) > 64 || strspn(id, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-") != strlen(id)) continue;
-                                const gchar *argv[] = { "/usr/bin/octovault-gtk", "--unlock", id, NULL };
-                                GError *launch_error = NULL;
-                                if (!g_spawn_async(NULL, (gchar **)argv, NULL, G_SPAWN_DEFAULT, NULL, NULL, NULL, &launch_error)) {
-                                    g_warning("Could not display the vault unlock prompt: %s", launch_error->message);
-                                    g_error_free(launch_error);
+                            if (requests && job->desktop_generation == desktop_generation) {
+                                for (guint i = 0; i < json_array_get_length(requests); i++) {
+                                    const gchar *id = json_array_get_string_element(requests, i);
+                                    if (!id || !*id || strlen(id) > 64 || strspn(id, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-") != strlen(id)) continue;
+                                    if (!g_hash_table_contains(pending_unlock_ids, id))
+                                        g_hash_table_insert(pending_unlock_ids, g_strdup(id), GINT_TO_POINTER(0));
                                 }
+                                launch_pending_unlocks();
                             }
                         }
                     }
@@ -182,6 +188,7 @@ static void submit_event(const gchar *event, const gchar *uuid, guint64 idle,
     job->release_inhibitor = release_after;
     job->inhibitor_generation = inhibitor_generation;
     job->end_session = end_session;
+    job->desktop_generation = desktop_generation;
     json_builder_begin_object(builder);
     json_builder_set_member_name(builder, "op"); json_builder_add_string_value(builder, "event.session");
     json_builder_set_member_name(builder, "params"); json_builder_begin_object(builder);
@@ -201,19 +208,150 @@ static void submit_event(const gchar *event, const gchar *uuid, guint64 idle,
     g_free(document); json_node_free(root); g_object_unref(generator); g_object_unref(builder);
 }
 
+/* Unlock offers belong to an active, unlocked desktop. Both logind and the
+ * screen saver can report a transition; keeping their state avoids racing one
+ * signal against the other and showing a prompt over the lock screen. */
+static gboolean desktop_ready(void) {
+    return session_known && desktop_active && !logind_locked && !screensaver_locked && !exiting;
+}
+
+static void launch_pending_unlocks(void) {
+    if (!desktop_ready()) return;
+    GHashTableIter iter;
+    gpointer key, delivered;
+    g_hash_table_iter_init(&iter, pending_unlock_ids);
+    while (g_hash_table_iter_next(&iter, &key, &delivered)) {
+        if (delivered) continue;
+        const gchar *argv[] = { "/usr/bin/octovault-gtk", "--unlock", key, NULL };
+        GError *error = NULL;
+        if (!g_spawn_async(NULL, (gchar **)argv, NULL, G_SPAWN_DEFAULT, NULL, NULL, NULL, &error)) {
+            g_warning("Could not display the vault unlock prompt: %s", error->message);
+            g_error_free(error);
+        }
+        g_hash_table_iter_replace(&iter, GINT_TO_POINTER(1));
+    }
+}
+
+static void desktop_state_changed(void) {
+    gboolean locked = logind_locked || screensaver_locked;
+    if (locked && !was_locked && login_offered) {
+        desktop_generation++;
+        g_hash_table_remove_all(pending_unlock_ids);
+        submit_event("screen-lock", NULL, 0, FALSE, FALSE);
+    }
+    if (!desktop_ready()) { was_locked = locked; return; }
+    if (!login_offered) {
+        login_offered = TRUE;
+        submit_event("login", NULL, 0, FALSE, FALSE);
+    } else if (was_locked) submit_event("screen-unlock", NULL, 0, FALSE, FALSE);
+    was_locked = FALSE;
+    if (resume_pending) {
+        resume_pending = FALSE;
+        submit_event("resume", NULL, 0, FALSE, FALSE);
+    }
+    launch_pending_unlocks();
+}
+
+static void session_properties(GVariant *properties) {
+    gboolean active, locked;
+    if (g_variant_lookup(properties, "Active", "b", &active)) desktop_active = active;
+    if (g_variant_lookup(properties, "LockedHint", "b", &locked)) logind_locked = locked;
+    session_known = TRUE;
+    desktop_state_changed();
+}
+
+static void logind_properties_changed(GDBusConnection *connection, const gchar *sender,
+                                     const gchar *path, const gchar *interface,
+                                     const gchar *signal, GVariant *parameters, gpointer data) {
+    const gchar *changed;
+    GVariant *properties, *invalidated;
+    (void)connection; (void)sender; (void)interface; (void)signal; (void)data;
+    if (!login_session_path || strcmp(path, login_session_path)) return;
+    g_variant_get(parameters, "(&s@a{sv}@as)", &changed, &properties, &invalidated);
+    if (!strcmp(changed, "org.freedesktop.login1.Session")) session_properties(properties);
+    g_variant_unref(properties); g_variant_unref(invalidated);
+}
+
+static gchar *primary_display_path(GVariant *properties) {
+    guint32 uid;
+    if (!g_variant_lookup(properties, "UID", "u", &uid) || uid != (guint32)getuid()) return NULL;
+    GVariant *display = g_variant_lookup_value(properties, "Display", G_VARIANT_TYPE("(so)"));
+    if (!display) return NULL;
+    const gchar *id, *path;
+    g_variant_get(display, "(&s&o)", &id, &path);
+    gchar *result = *id && g_str_has_prefix(path, "/org/freedesktop/login1/session/") ? g_strdup(path) : NULL;
+    g_variant_unref(display);
+    return result;
+}
+
+static gboolean refresh_session_state(gpointer data) {
+    GVariant *reply;
+    (void)data;
+    if (exiting) return G_SOURCE_REMOVE;
+    if (!login_session_path) {
+        reply = g_dbus_connection_call_sync(system_bus, "org.freedesktop.login1", "/org/freedesktop/login1",
+            "org.freedesktop.login1.Manager", "GetSessionByPID", g_variant_new("(u)", (guint32)getpid()),
+            G_VARIANT_TYPE("(o)"), G_DBUS_CALL_FLAGS_NONE, 1500, NULL, NULL);
+        if (reply) { g_variant_get(reply, "(o)", &login_session_path); g_variant_unref(reply); }
+    }
+    if (!login_session_path) {
+        /* XDG autostart is often launched by the systemd user manager rather
+         * than inside a logind session. Follow that user's primary display. */
+        reply = g_dbus_connection_call_sync(system_bus, "org.freedesktop.login1", "/org/freedesktop/login1",
+            "org.freedesktop.login1.Manager", "GetUserByPID", g_variant_new("(u)", (guint32)getpid()),
+            G_VARIANT_TYPE("(o)"), G_DBUS_CALL_FLAGS_NONE, 1500, NULL, NULL);
+        if (reply) {
+            gchar *path;
+            g_variant_get(reply, "(o)", &path); g_variant_unref(reply);
+            reply = g_dbus_connection_call_sync(system_bus, "org.freedesktop.login1", path,
+                "org.freedesktop.DBus.Properties", "GetAll", g_variant_new("(s)", "org.freedesktop.login1.User"),
+                G_VARIANT_TYPE("(a{sv})"), G_DBUS_CALL_FLAGS_NONE, 1500, NULL, NULL);
+            g_free(path);
+            if (reply) {
+                GVariant *properties;
+                g_variant_get(reply, "(@a{sv})", &properties);
+                login_session_path = primary_display_path(properties);
+                g_variant_unref(properties); g_variant_unref(reply);
+            }
+        }
+    }
+    if (login_session_path) {
+        reply = g_dbus_connection_call_sync(system_bus, "org.freedesktop.login1", login_session_path,
+            "org.freedesktop.DBus.Properties", "GetAll", g_variant_new("(s)", "org.freedesktop.login1.Session"),
+            G_VARIANT_TYPE("(a{sv})"), G_DBUS_CALL_FLAGS_NONE, 1500, NULL, NULL);
+        if (reply) {
+            GVariant *properties;
+            g_variant_get(reply, "(@a{sv})", &properties);
+            session_properties(properties);
+            g_variant_unref(properties); g_variant_unref(reply);
+        } else {
+            session_known = FALSE;
+            g_clear_pointer(&login_session_path, g_free);
+        }
+    }
+    return G_SOURCE_CONTINUE;
+}
+
 static void login_signal(GDBusConnection *connection, const gchar *sender, const gchar *path,
                          const gchar *interface, const gchar *signal, GVariant *parameters,
                          gpointer user_data) {
     gboolean preparing;
     (void)connection; (void)sender; (void)path; (void)interface; (void)user_data;
     g_variant_get(parameters, "(b)", &preparing);
-    if (preparing) submit_event(g_str_equal(signal, "PrepareForSleep") ? "sleep" : "shutdown", NULL, 0, TRUE, FALSE);
+    if (preparing) {
+        desktop_generation++;
+        g_hash_table_remove_all(pending_unlock_ids);
+        submit_event(g_str_equal(signal, "PrepareForSleep") ? "sleep" : "shutdown", NULL, 0, TRUE, FALSE);
+    }
     else {
         /* The previous transition may finish after resume. Give the next
          * inhibitor a distinct generation so stale job completion cannot close it. */
         release_inhibitor();
         acquire_inhibitor();
-        if (g_str_equal(signal, "PrepareForSleep")) submit_event("resume", NULL, 0, FALSE, FALSE);
+        if (g_str_equal(signal, "PrepareForSleep")) {
+            resume_pending = TRUE;
+            refresh_session_state(NULL);
+        }
     }
 }
 
@@ -223,7 +361,8 @@ static void lock_signal(GDBusConnection *connection, const gchar *sender, const 
     gboolean active;
     (void)connection; (void)sender; (void)path; (void)interface; (void)signal; (void)user_data;
     g_variant_get(parameters, "(b)", &active);
-    if (active) submit_event("screen-lock", NULL, 0, FALSE, FALSE);
+    screensaver_locked = active;
+    desktop_state_changed();
 }
 
 static void mount_added(GVolumeMonitor *monitor, GMount *mount, gpointer user_data) {
@@ -334,6 +473,10 @@ int main(int argc, char **argv) {
     guint name_result; g_variant_get(reply, "(u)", &name_result); g_variant_unref(reply);
     if (name_result != 1) return 0;
     loop = g_main_loop_new(NULL, FALSE);
+    pending_unlock_ids = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+    g_dbus_connection_signal_subscribe(system_bus, "org.freedesktop.login1", "org.freedesktop.DBus.Properties",
+        "PropertiesChanged", NULL, "org.freedesktop.login1.Session", G_DBUS_SIGNAL_FLAGS_NONE,
+        logind_properties_changed, NULL, NULL);
     g_dbus_connection_signal_subscribe(system_bus, "org.freedesktop.login1", "org.freedesktop.login1.Manager",
         "PrepareForSleep", "/org/freedesktop/login1", NULL, G_DBUS_SIGNAL_FLAGS_NONE, login_signal, NULL, NULL);
     g_dbus_connection_signal_subscribe(system_bus, "org.freedesktop.login1", "org.freedesktop.login1.Manager",
@@ -353,7 +496,8 @@ int main(int argc, char **argv) {
     acquire_inhibitor();
     volumes = g_volume_monitor_get();
     g_signal_connect(volumes, "mount-added", G_CALLBACK(mount_added), NULL);
-    submit_event("login", NULL, 0, FALSE, FALSE);
+    refresh_session_state(NULL);
+    g_timeout_add_seconds(5, refresh_session_state, NULL);
     mounts = g_volume_monitor_get_mounts(volumes);
     for (GList *item = mounts; item; item = item->next) mount_added(volumes, G_MOUNT(item->data), NULL);
     g_list_free_full(mounts, g_object_unref);
@@ -362,7 +506,8 @@ int main(int argc, char **argv) {
     g_timeout_add_seconds(15, card_tick, NULL);
     g_main_loop_run(loop);
     release_inhibitor();
-    g_free(card_identity); g_free(session_client);
+    g_free(card_identity); g_free(session_client); g_free(login_session_path);
+    g_hash_table_unref(pending_unlock_ids);
     g_object_unref(volumes); g_object_unref(session_bus); g_object_unref(system_bus);
     g_main_loop_unref(loop);
     return 0;

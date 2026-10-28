@@ -4,7 +4,7 @@ OctoVault's desktop interface and command-line client run as the signed-in user.
 
 ## Management sessions
 
-An explicitly opened desktop application requests administrator authorization once for a working session. Cancelling leaves inspection and diagnostics available. Background activation does not unexpectedly open an administrator prompt. The native Polkit agent chooses eligible administrator identities according to the operating system's policy; OctoVault never reads or stores an administrator password.
+An explicitly opened desktop application requests administrator authorization once for a working session. Cancelling leaves inspection and diagnostics available. A saved automatic-unlock policy can also start the required authorization flow when its configured vault prompts arrive. Ordinary background refreshes do not open administrator prompts. The native Polkit agent chooses eligible administrator identities according to the operating system's policy; OctoVault never reads or stores an administrator password.
 
 A management grant belongs to the verified caller UID, its unique system-bus connection, and its actual local login session. The service verifies each operation against that grant and the operation's resource permissions. Grants end on explicit cancellation, connection loss, desktop lock or loss of the active session, logout, suspend, service restart, policy change, revocation, or expiry. The default maximum lifetime is eight hours. Desktop lock monitoring is distinct from merely checking whether any session of a user is active.
 
@@ -24,7 +24,7 @@ Records retain their execution scope. Existing records without a scope retain ad
 
 ## Separate sensitive operations
 
-Changing another account's access requires fresh administrator authorization. Recovery disclosure has its own authentication action; a personal session recovering a personal-scope repository authenticates the owner, while a management session requires administrator authentication. Forced closure and operations that affect protected system resources require administrator scope and explicit confirmation. YubiKey PIN/touch requirements remain independent of operating-system authorization.
+Changing another account's access requires fresh administrator authorization. Recovery disclosure has its own authentication action; a personal session recovering a personal-scope repository authenticates the owner, while a management session requires administrator authentication. Forced closure and operations that affect protected system resources require administrator scope and explicit confirmation. OpenPGP and FIDO2 PIN/touch requirements remain independent of operating-system authorization. A login unlock offer does not bypass either boundary.
 
 The interface obtains its capabilities from the service. It explains unavailable actions before submission, preserves populated forms if permission expires, and distinguishes unavailable authorization infrastructure from an ordinary refusal as far as the operating system reports that distinction.
 
