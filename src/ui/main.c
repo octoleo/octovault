@@ -91,7 +91,8 @@ struct Form {
   gboolean acknowledge;
   gboolean automatic;
   gboolean submitted, guided_backup, access_blocked, needs_system;
-  GtkWidget *authorize, *submit;
+  GtkWidget *authorize, *submit, *content, *scroll;
+  gboolean compact;
   GSubprocess *fido_process;
   gboolean dismissed;
 };
@@ -153,7 +154,7 @@ static gboolean access_system(App *app){return access_authorized(app)&&!strcmp(s
 static const char *access_startup_scope(App *app){
   if(app->access_startup_attempted||access_authorized(app)||!boolean(app->access_state,"available"))return NULL;
   if(boolean(app->access_state,"delegated_personal"))return "personal";
-  return (!app->access_background_launch||(app->pending_unlocks&&!g_queue_is_empty(app->pending_unlocks)))&&boolean(app->access_state,"can_request_system")?"system":NULL;
+  return (!app->access_background_launch||app->current_unlock||(app->pending_unlocks&&!g_queue_is_empty(app->pending_unlocks)))&&boolean(app->access_state,"can_request_system")?"system":NULL;
 }
 static gboolean access_read_operation(const char *operation){
   const char *reads[]={"vault.list","vault.get","vault.auth-check","destination.list","destination.get",
@@ -1127,7 +1128,7 @@ static void update_form_visibility(GObject *object,GParamSpec *pspec,gpointer da
         GString *names=g_string_new(NULL);JsonNode *collection=form->app->collections[0];
         if(!openpgp_auth(str(form->original,"auth"))&&collection&&JSON_NODE_HOLDS_ARRAY(collection)){
           JsonArray *vaults=json_node_get_array(collection);
-          for(guint j=0;j<json_array_get_length(vaults);j++){JsonNode *node=json_array_get_element(vaults,j);if(!JSON_NODE_HOLDS_OBJECT(node))continue;JsonObject *record=json_node_get_object(node);if(strcmp(str(record,"id"),str(form->original,"id"))&&strcmp(str(record,"status"),"open")&&(!strcmp(k,"_unlock_shared")?same_vault_key(record,form->original):(form->app->pending_unlocks&&g_queue_find_custom(form->app->pending_unlocks,str(record,"id"),(GCompareFunc)g_strcmp0)!=NULL))){if(names->len)g_string_append(names,", ");g_string_append(names,str(record,"name"));}}
+          for(guint j=0;j<json_array_get_length(vaults);j++){JsonNode *node=json_array_get_element(vaults,j);if(!JSON_NODE_HOLDS_OBJECT(node))continue;JsonObject *record=json_node_get_object(node);if(strcmp(str(record,"id"),str(form->original,"id"))&&strcmp(str(record,"status"),"open")&&!openpgp_auth(str(record,"auth"))&&(!strcmp(k,"_unlock_shared")?same_vault_key(record,form->original):(form->app->pending_unlocks&&g_queue_find_custom(form->app->pending_unlocks,str(record,"id"),(GCompareFunc)g_strcmp0)!=NULL))){if(names->len)g_string_append(names,", ");g_string_append(names,str(record,"name"));}}
         }
         visible=names->len>0;if(visible){char *hint=g_strdup_printf("Also opens: %s. This entry is kept only until this unlock sequence ends.",names->str);gtk_label_set_text(f->hint,hint);g_free(hint);}g_string_free(names,TRUE);
       }
@@ -1146,6 +1147,7 @@ static void update_form_visibility(GObject *object,GParamSpec *pspec,gpointer da
     }
   }
   if(form->guidance)gtk_label_set_text(form->guidance,vault_create_guidance(auth,existing));
+  if(form->compact&&form->content&&form->scroll){int minimum=0,natural=0;gtk_widget_measure(form->content,GTK_ORIENTATION_VERTICAL,480,&minimum,&natural,NULL,NULL);gtk_scrolled_window_set_min_content_height(GTK_SCROLLED_WINDOW(form->scroll),MIN(MAX(minimum,natural),500));}
 }
 static void field_free(gpointer data){Field*f=data;if(f->values)g_ptr_array_unref(f->values);g_free(f);}
 static void form_free(gpointer data){Form*f=data;if(f->guided_backup)backup_setup_form_closed(f->app,f->operation,f->submitted);if(f->automatic){f->app->automatic_prompt=FALSE;g_clear_pointer(&f->app->current_unlock,g_free);g_idle_add(drain_unlocks,f->app);}g_free(f->operation);json_object_unref(f->base);json_object_unref(f->original);g_ptr_array_unref(f->fields);g_free(f->suggested_relative);g_free(f);}
@@ -1332,6 +1334,9 @@ static void size_changed(GtkSpinButton*spin,gpointer data){
   char*text=g_strdup_printf("Allocated container: %.6f GB (%" G_GUINT64_FORMAT " MiB). Filesystem overhead reduces usable space.",(double)mib*1048576.0/1000000000.0,mib);
   gtk_label_set_text(GTK_LABEL(data),text);g_free(text);
 }
+static void form_entry_activated(GtkWidget *entry,gpointer data){
+  (void)entry;Form *form=data;if(form->submit&&gtk_widget_is_sensitive(form->submit))g_signal_emit_by_name(form->submit,"clicked");
+}
 static Field *create_field(Form*form,const Spec*spec,JsonObject*record,GtkBox*content){
   Field*f=g_new0(Field,1);f->spec=spec;JsonNode*existing=lookup(record,spec->key);char *initial=existing?node_text(existing):g_strdup(spec->options?spec->options:"");
   if(!strcmp(spec->key,"auth")&&!strcmp(initial,"gpg")&&boolean(record,"require_token")){g_free(initial);initial=g_strdup("token");}
@@ -1360,8 +1365,9 @@ static Field *create_field(Form*form,const Spec*spec,JsonObject*record,GtkBox*co
     if(!strcmp(kind,"paths")){GtkBox*buttons=GTK_BOX(gtk_box_new(GTK_ORIENTATION_HORIZONTAL,8));gtk_box_append(row,GTK_WIDGET(buttons));GtkWidget*b=gtk_button_new_with_label("Add files…");gtk_box_append(buttons,b);g_signal_connect(b,"clicked",G_CALLBACK(choose_file),f);b=gtk_button_new_with_label("Add folders…");g_object_set_data(G_OBJECT(b),"choose-folder",GINT_TO_POINTER(1));gtk_box_append(buttons,b);g_signal_connect(b,"clicked",G_CALLBACK(choose_file),f);}
   }else{
     f->widget=!strcmp(kind,"password")?gtk_password_entry_new():gtk_entry_new();
-    if(!strcmp(kind,"password")){gtk_password_entry_set_show_peek_icon(GTK_PASSWORD_ENTRY(f->widget),TRUE);g_object_set(f->widget,"activates-default",TRUE,NULL);}
-    else {gtk_entry_set_activates_default(GTK_ENTRY(f->widget),TRUE);gtk_editable_set_text(GTK_EDITABLE(f->widget),!existing&&!strcmp(spec->key,"directory")?g_get_home_dir():initial);}
+    if(!strcmp(kind,"password")){gtk_password_entry_set_show_peek_icon(GTK_PASSWORD_ENTRY(f->widget),TRUE);g_object_set(f->widget,"activates-default",FALSE,NULL);}
+    else {gtk_entry_set_activates_default(GTK_ENTRY(f->widget),FALSE);gtk_editable_set_text(GTK_EDITABLE(f->widget),!existing&&!strcmp(spec->key,"directory")?g_get_home_dir():initial);}
+    g_signal_connect(f->widget,"activate",G_CALLBACK(form_entry_activated),form);
     GtkBox*line=GTK_BOX(gtk_box_new(GTK_ORIENTATION_HORIZONTAL,8));gtk_widget_set_hexpand(f->widget,TRUE);gtk_box_append(line,f->widget);gtk_box_append(row,GTK_WIDGET(line));
     if(!strcmp(spec->key,"recipient")){
       GtkBox*controls=GTK_BOX(gtk_box_new(GTK_ORIENTATION_HORIZONTAL,8));gtk_box_append(row,GTK_WIDGET(controls));
@@ -1515,7 +1521,7 @@ static void open_form(App*app,const char*operation,const char*title,JsonObject*r
   const Spec*spec=specifications(operation);gboolean has_advanced=FALSE;
   for(guint i=0;spec[i].key;i++)if(advanced_field(operation,spec[i].key))has_advanced=TRUE;
   if(has_advanced){f->advanced=GTK_CHECK_BUTTON(gtk_check_button_new_with_mnemonic("_Advanced options"));gtk_widget_set_tooltip_text(GTK_WIDGET(f->advanced),"Show optional technical settings. Basic mode uses defaults for new items and keeps saved settings when editing.");gtk_box_append(root,GTK_WIDGET(f->advanced));g_signal_connect(f->advanced,"notify::active",G_CALLBACK(update_form_visibility),f);}
-  GtkWidget*scroll=gtk_scrolled_window_new();gtk_widget_set_vexpand(scroll,!compact);gtk_scrolled_window_set_propagate_natural_height(GTK_SCROLLED_WINDOW(scroll),TRUE);gtk_scrolled_window_set_max_content_height(GTK_SCROLLED_WINDOW(scroll),compact?500:560);GtkBox*content=GTK_BOX(gtk_box_new(GTK_ORIENTATION_VERTICAL,18));margin(GTK_WIDGET(content),6);gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll),GTK_POLICY_NEVER,GTK_POLICY_AUTOMATIC);gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroll),GTK_WIDGET(content));gtk_box_append(root,scroll);
+  GtkWidget*scroll=gtk_scrolled_window_new();gtk_widget_set_vexpand(scroll,!compact);gtk_scrolled_window_set_propagate_natural_height(GTK_SCROLLED_WINDOW(scroll),TRUE);gtk_scrolled_window_set_max_content_height(GTK_SCROLLED_WINDOW(scroll),compact?500:560);GtkBox*content=GTK_BOX(gtk_box_new(GTK_ORIENTATION_VERTICAL,18));margin(GTK_WIDGET(content),6);gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll),GTK_POLICY_NEVER,GTK_POLICY_AUTOMATIC);gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroll),GTK_WIDGET(content));gtk_box_append(root,scroll);f->content=GTK_WIDGET(content);f->scroll=scroll;f->compact=compact;
   if(strstr(operation,".remove"))append_text(content,"This removes the registration and its managed automation. Your encrypted container or remote backup data will remain intact.",NULL);
   else if(creating)append_text(content,"Create an empty encrypted .tomb file. Then unlock it and choose Protect a folder or file to move your data into it.",NULL);
   else if(!strcmp(operation,"migration.add")){
@@ -1927,6 +1933,21 @@ static void activate(GApplication*application,gpointer data){
   app->progress=GTK_PROGRESS_BAR(gtk_progress_bar_new());gtk_box_append(GTK_BOX(app->job_box),GTK_WIDGET(app->progress));
   gtk_toggle_button_set_active(app->navigation[0],TRUE);gtk_window_present(app->window);access_update_header(app);refresh_all(app);
 }
+static void smoke_shared_and_fido_forms(App *app){
+  JsonNode *saved=app->collections[0];GQueue *saved_queue=app->pending_unlocks;app->pending_unlocks=g_queue_new();g_queue_push_tail(app->pending_unlocks,g_strdup("different"));
+  JsonArray *vaults=json_array_new();app->collections[0]=json_node_new(JSON_NODE_ARRAY);json_node_take_array(app->collections[0],vaults);
+  const char *ids[]={"selected","matching","different"};
+  for(guint i=0;i<G_N_ELEMENTS(ids);i++){JsonObject *record=json_object_new();json_object_set_string_member(record,"id",ids[i]);json_object_set_string_member(record,"name",ids[i]);json_object_set_string_member(record,"auth","key");json_object_set_string_member(record,"status","closed");json_object_set_string_member(record,"key_file",i==2?"/home/example/different.key":"/home/example/shared.key");json_array_add_object_element(vaults,record);}
+  JsonObject *selected=json_array_get_object_element(vaults,0);open_form(app,"vault.open","Shared unlock test",selected);GListModel *windows=gtk_window_get_toplevels();GtkWindow *window=g_list_model_get_item(windows,g_list_model_get_n_items(windows)-1);Form *form=g_object_get_data(G_OBJECT(window),"form");
+  Field *matching=find_field(form,"_unlock_shared"),*remaining=find_field(form,"_unlock_remaining");g_assert_true(gtk_widget_get_visible(matching->row));g_assert_true(gtk_widget_get_visible(remaining->row));g_assert_nonnull(strstr(gtk_label_get_text(matching->hint),"matching"));g_assert_nonnull(strstr(gtk_label_get_text(remaining->hint),"different"));
+  gtk_editable_set_text(GTK_EDITABLE(find_field(form,"password")->widget),"test-only-passphrase");gboolean accepted=FALSE;JsonObject *params=form_parameters(form,&accepted);g_assert_true(accepted);remember_shared_unlock(form,params);g_assert_null(app->shared_password);
+  gtk_check_button_set_active(GTK_CHECK_BUTTON(matching->widget),TRUE);remember_shared_unlock(form,params);g_assert_cmpstr(app->shared_password,==,"test-only-passphrase");g_assert_true(g_hash_table_contains(app->shared_vaults,"matching"));g_assert_false(g_hash_table_contains(app->shared_vaults,"different"));clear_shared_unlock(app);
+  gtk_check_button_set_active(GTK_CHECK_BUTTON(matching->widget),FALSE);gtk_check_button_set_active(GTK_CHECK_BUTTON(remaining->widget),TRUE);remember_shared_unlock(form,params);g_assert_true(g_hash_table_contains(app->shared_vaults,"different"));clear_shared_unlock(app);wipe((char *)str(params,"password"));json_object_unref(params);gtk_window_destroy(window);g_object_unref(window);
+  JsonObject *enrollment=json_object_new();json_object_set_string_member(enrollment,"vault_id","selected");json_object_set_object_member(selected,"fido2",enrollment);open_form(app,"vault.open","FIDO2 unlock test",selected);window=g_list_model_get_item(windows,g_list_model_get_n_items(windows)-1);form=g_object_get_data(G_OBJECT(window),"form");g_assert_false(gtk_widget_get_visible(find_field(form,"password")->row));g_assert_true(gtk_widget_get_visible(find_field(form,"_fido_pin")->row));
+  gtk_editable_set_text(GTK_EDITABLE(find_field(form,"_fido_pin")->widget),"1234");params=form_parameters(form,&accepted);g_assert_false(json_object_has_member(params,"_fido_pin"));g_assert_false(json_object_has_member(params,"password"));json_object_unref(params);
+  gtk_check_button_set_active(GTK_CHECK_BUTTON(find_field(form,"_use_passphrase")->widget),TRUE);g_assert_true(gtk_widget_get_visible(find_field(form,"password")->row));g_assert_false(gtk_widget_get_visible(find_field(form,"_fido_pin")->row));gtk_window_destroy(window);g_object_unref(window);
+  json_node_free(app->collections[0]);app->collections[0]=saved;g_queue_free_full(app->pending_unlocks,g_free);app->pending_unlocks=saved_queue;
+}
 static void smoke_submit_count(GtkButton *button,gpointer data){(void)button;App *app=data;app->keyboard_activations++;}
 static gboolean smoke_press_enter(gpointer data){
   App *app=data;Form *form=g_object_get_data(G_OBJECT(app->keyboard_test_window),"form");g_signal_emit_by_name(find_field(form,"password")->widget,"activate");return G_SOURCE_REMOVE;
@@ -1937,7 +1958,7 @@ static gboolean smoke_check_enter(gpointer data){
 static void smoke_compact_forms(App *app){
   JsonObject *record=json_object_new();json_object_set_string_member(record,"name","Keyboard test vault");json_object_set_string_member(record,"auth","key");
   open_form(app,"vault.open","Unlock vault",record);GListModel *windows=gtk_window_get_toplevels();app->keyboard_test_window=g_list_model_get_item(windows,g_list_model_get_n_items(windows)-1);Form *form=g_object_get_data(G_OBJECT(app->keyboard_test_window),"form");
-  Field *password=find_field(form,"password");gboolean activates=FALSE;g_object_get(password->widget,"activates-default",&activates,NULL);g_assert_true(activates);g_assert_true(gtk_window_get_default_widget(form->window)==form->submit);g_assert_cmpstr(gtk_button_get_label(GTK_BUTTON(form->submit)),==,"_Unlock");
+  Field *password=find_field(form,"password");gboolean activates=FALSE;g_object_get(password->widget,"activates-default",&activates,NULL);g_assert_false(activates);g_assert_true(gtk_window_get_default_widget(form->window)==form->submit);g_assert_cmpstr(gtk_button_get_label(GTK_BUTTON(form->submit)),==,"_Unlock");
   g_assert_false(gtk_widget_get_visible(find_field(form,"_fido_pin")->row));g_assert_false(gtk_widget_get_visible(find_field(form,"_use_passphrase")->row));
   g_signal_handlers_block_matched(form->submit,G_SIGNAL_MATCH_FUNC,0,0,NULL,G_CALLBACK(submit_form),NULL);g_signal_connect(form->submit,"clicked",G_CALLBACK(smoke_submit_count),app);
   g_timeout_add(60,smoke_press_enter,app);g_timeout_add(280,smoke_check_enter,app);json_object_unref(record);
@@ -2133,6 +2154,7 @@ static int command_line(GApplication*application,GApplicationCommandLine*command
     if(g_queue_is_empty(app->pending_unlocks)&&!app->automatic_prompt){app->access_startup_attempted=FALSE;app->unlock_authorization_requested=FALSE;}
     g_queue_push_tail(app->pending_unlocks,g_strdup(unlock));
   }
+  if(requested&&!access_authorized(app)&&!app->access_busy)app->access_startup_attempted=FALSE;
   if(!app->smoke){
     if(!app->access_started||requested||(!background_launch&&!app->access_startup_attempted))access_request_status(app,TRUE);
     app->access_started=TRUE;if(!app->access_timer)app->access_timer=g_timeout_add_seconds(1,access_poll,app);
@@ -2142,7 +2164,7 @@ static int command_line(GApplication*application,GApplicationCommandLine*command
     for(guint i=0;i<6;i++)gtk_toggle_button_set_active(app->navigation[i],TRUE);
     const char *ops[]={"vault.create","vault.import","vault.update","vault.open","vault.close","vault.resize","vault.passwd","vault.setkey","vault.key-export","vault.search","migration.add","destination.save","repository.create","repository.import","repository.check","repository.files","repository.find","repository.diff","repository.restore","repository.forget","repository.password","repository.copy","backup.save"};
     for(guint i=0;i<G_N_ELEMENTS(ops);i++){open_form(app,ops[i],ops[i],NULL);GListModel*windows=gtk_window_get_toplevels();guint count=g_list_model_get_n_items(windows);if(count>1){GtkWindow*w=g_list_model_get_item(windows,count-1);if(w!=app->window){if(!strcmp(ops[i],"vault.create"))smoke_vault_creation(g_object_get_data(G_OBJECT(w),"form"));gtk_window_destroy(w);}g_object_unref(w);}}
-    smoke_compact_forms(app);smoke_advanced_defaults(app);smoke_protection_form(app);smoke_recovery_form(app);smoke_action_menu(app);backup_setup_smoke(app);smoke_access_lifecycle(app);
+    smoke_shared_and_fido_forms(app);smoke_compact_forms(app);smoke_advanced_defaults(app);smoke_protection_form(app);smoke_recovery_form(app);smoke_action_menu(app);backup_setup_smoke(app);smoke_access_lifecycle(app);
     gtk_toggle_button_set_active(app->navigation[0],TRUE);
     if(app->screenshot_vault)smoke_unlinked_vault_card(app);
     if(app->screenshot_unlock||app->screenshot_lock){
@@ -2190,7 +2212,9 @@ int main(int argc,char**argv){
   g_application_add_main_option(G_APPLICATION(app->application),"screenshot-vault",0,G_OPTION_FLAG_NONE,G_OPTION_ARG_STRING,"Save an unlocked vault card with no linked folders after native UI checks","FILE");
   g_application_add_main_option(G_APPLICATION(app->application),"screenshot-advanced",0,G_OPTION_FLAG_NONE,G_OPTION_ARG_NONE,"Reveal advanced settings in the captured form",NULL);
   g_signal_connect(app->application,"activate",G_CALLBACK(activate),app);g_signal_connect(app->application,"command-line",G_CALLBACK(command_line),app);
-  int status=g_application_run(G_APPLICATION(app->application),argc,argv);clear_shared_unlock(app);g_object_unref(app->application);
+  int status=g_application_run(G_APPLICATION(app->application),argc,argv);clear_shared_unlock(app);
+  GListModel *windows=gtk_window_get_toplevels();for(guint i=0;i<g_list_model_get_n_items(windows);i++){GtkWindow *window=g_list_model_get_item(windows,i);Form *form=g_object_get_data(G_OBJECT(window),"form");if(form){form->dismissed=TRUE;clear_form_secrets(form);if(form->fido_process)g_subprocess_force_exit(form->fido_process);}g_object_unref(window);}
+  g_object_unref(app->application);
   /* Process exit also terminates background polling threads; the service owns jobs. */
   return status;
 }

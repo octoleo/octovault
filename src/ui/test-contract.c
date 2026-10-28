@@ -435,9 +435,27 @@ static void test_protected_location_browsing(void)
     json_object_unref(record);g_assert_cmpint(g_unlink(file),==,0);g_assert_cmpint(g_rmdir(documents),==,0);g_assert_cmpint(g_rmdir(container),==,0);g_assert_cmpint(g_rmdir(base),==,0);g_free(file);g_free(documents);g_free(container);g_free(base);
 }
 
+static void test_fido_and_shared_key_contract(void)
+{
+    JsonObject *a=json_object_new(),*b=json_object_new();json_object_set_string_member(a,"key_file","/home/person/a.key");json_object_set_string_member(b,"key_file","/home/person/a.key");json_object_set_string_member(a,"auth","key");json_object_set_string_member(b,"auth","key");g_assert_true(same_vault_key(a,b));
+    json_object_set_string_member(b,"auth","gpg");g_assert_false(same_vault_key(a,b));json_object_set_string_member(b,"auth","key");json_object_set_string_member(b,"key_file","/home/person/b.key");g_assert_false(same_vault_key(a,b));
+    g_assert_false(has_fido(a));json_object_set_object_member(a,"fido2",json_object_new());g_assert_true(has_fido(a));
+    const Spec *spec=specifications("ui.fido-enroll");g_assert_true(find_spec(spec,"password")->required);g_assert_true(find_spec(spec,"_fido_pin")->required);
+    g_assert_nonnull(strstr(fido_error_message("pin_invalid"),"incorrect"));g_assert_nonnull(strstr(fido_error_message("wrong_key"),"registered"));
+    App app={0};app.shared_password=g_strdup("test-only-secret");app.shared_key=g_strdup("/home/person/a.key");app.shared_vaults=g_hash_table_new_full(g_str_hash,g_str_equal,g_free,NULL);g_hash_table_add(app.shared_vaults,g_strdup("test-only-id"));clear_shared_unlock(&app);g_assert_null(app.shared_password);g_assert_null(app.shared_key);g_assert_null(app.shared_vaults);
+    json_object_unref(a);json_object_unref(b);
+}
+static void test_login_unlock_authorization_contract(void)
+{
+    App app={0};app.access_background_launch=TRUE;app.access_state=json_object_new();app.pending_unlocks=g_queue_new();json_object_set_boolean_member(app.access_state,"available",TRUE);json_object_set_boolean_member(app.access_state,"can_request_system",TRUE);
+    g_assert_null(access_startup_scope(&app));g_queue_push_tail(app.pending_unlocks,g_strdup("vault"));g_assert_cmpstr(access_startup_scope(&app),==,"system");app.access_startup_attempted=TRUE;g_assert_null(access_startup_scope(&app));g_queue_free_full(app.pending_unlocks,g_free);json_object_unref(app.access_state);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
+    g_test_add_func("/ui/fido-shared-key-contract",test_fido_and_shared_key_contract);
+    g_test_add_func("/ui/login-unlock-authorization",test_login_unlock_authorization_contract);
     g_test_add_func("/ui/protected-location-browsing",test_protected_location_browsing);
     g_test_add_func("/ui/migration-recovery-contract",test_migration_recovery_contract);
     g_test_add_func("/ui/request-round-trip", test_request_round_trip);
