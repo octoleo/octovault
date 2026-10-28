@@ -20,7 +20,7 @@ A revoked personal grant prevents new personal sessions and future personal sche
 
 ## Failed vault creation
 
-Read the specific error and failed stage before retrying. OctoVault checks OpenPGP authentication before allocating a new container: a missing public key, unavailable token, failed PIN prompt, or unsuccessful decryption challenge must be resolved first. **Software OpenPGP key** uses your local OpenPGP private key; **YubiKey / OpenPGP security key** requires the matching OpenPGP encryption key on the connected token. Having used a YubiKey for web sign-in does not by itself configure its OpenPGP application.
+Read the specific error and failed stage before retrying. OctoVault checks OpenPGP authentication before allocating a new container: a missing public key, unavailable token, failed PIN prompt, or unsuccessful decryption challenge must be resolved first. **Software OpenPGP key** uses your local OpenPGP private key; **OpenPGP security key** requires the matching OpenPGP encryption key on the connected token. Having used a YubiKey for web sign-in does not by itself configure its OpenPGP application.
 
 For a new vault, leave **Reuse an existing vault key file** unchecked even if you already own the token. That checkbox means that you are supplying an existing encrypted vault key file or carrier, not an existing OpenPGP identity. A token's private key decrypts the vault key file; both are needed to open the vault.
 
@@ -36,6 +36,14 @@ A summary records the error code, readable explanation, failed stage when availa
 If authentication failed before allocation, correct the reported problem and retry. If creation already allocated files, keep the reported container and key until you have checked their state. The container is in the folder selected during setup; automatically managed encrypted keys are under `~/.local/share/octovault/keys/`. A vault marked incomplete has not completed initialization. Retrying the same name will not overwrite an existing container, and importing an uninitialized container cannot make it a usable vault. Do not delete or rename files as a blind retry procedure.
 
 Older versions displayed “Existing recovery material has been retained” for unrelated validation errors, even when no recovery files had been created. That message alone does not establish that any files exist or that a diagnostic report was saved. Inspect the selected storage folder, the managed key folder, and the vault list before deciding how to recover an earlier attempt.
+
+## FIDO2 security keys
+
+FIDO2 unlocking requires a device that advertises the `hmac-secret` extension. Register a dedicated OctoVault credential on the device; an existing SSH credential is not a Tomb decryption key. OpenPGP and FIDO2 are separate methods, and a FIDO-only key cannot pass an OpenPGP detection check.
+
+FIDO2 enrollment protects the existing Tomb key passphrase with a hardware-derived secret. It retains the original encrypted Tomb key and passphrase as an independent way to unlock. If the device is missing, has been reset, or cannot complete a PIN/touch request, choose **Use the recovery passphrase instead** in the unlock dialog. Use **Replace FIDO2 security key…** in the vault menu to enroll a replacement device. Changing the passphrase requires enrolling FIDO2 again so it can protect the current value.
+
+Keep the encrypted container, its Tomb key or carrier, and the original passphrase available for recovery. Hardware enrollment does not make the device a copy of the container or Tomb key. Moving a vault to another computer can use the normal Tomb passphrase path without the original computer's FIDO2 enrollment metadata.
 
 ## Restore on another computer
 

@@ -2,7 +2,7 @@ Source: octovault
 Section: utils
 Priority: optional
 Maintainer: Vast Development Method <octoleo@users.noreply.github.com>
-Build-Depends: debhelper-compat (= 13), pkg-config, libgtk-4-dev (>= 4.12), libadwaita-1-dev (>= 1.4), libjson-glib-dev, libglib2.0-dev, desktop-file-utils, libxml2-utils, appstream, apt-utils, gnupg, jq, rsync, restic, openssh-client, steghide, systemd, shellcheck, dbus-daemon, xvfb, xauth
+Build-Depends: debhelper-compat (= 13), pkg-config, libgtk-4-dev (>= 4.12), libadwaita-1-dev (>= 1.4), libjson-glib-dev, libfido2-dev, libssl-dev, libglib2.0-dev, desktop-file-utils, libxml2-utils, appstream, apt-utils, gnupg, jq, rsync, restic, openssh-client, steghide, systemd, shellcheck, dbus-daemon, xvfb, xauth
 Standards-Version: 4.7.0
 Rules-Requires-Root: no
 Homepage: https://www.vdm.io

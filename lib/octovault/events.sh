@@ -236,7 +236,7 @@ ov_event_dispatch() {
         *) ov_fail invalid_operation 'Unknown automation operation.' ;;
     esac
     event=$(ov_require event)
-    case "$event" in login|resume|screen-lock|logout|sleep|shutdown|idle|drive|token|vault-open|vault-close|timer) ;;
+    case "$event" in login|resume|screen-unlock|screen-lock|logout|sleep|shutdown|idle|drive|token|vault-open|vault-close|timer) ;;
         *) ov_fail invalid_event 'Unsupported event.' ;; esac
     if [[ "$OV_OP" == event.session ]]; then
         case "$event" in vault-open|vault-close|timer) ov_fail forbidden 'This event cannot originate in a desktop session.' ;; esac
@@ -283,9 +283,13 @@ ov_event_dispatch() {
                 force=$(jq -r '.force_close // false' <<<"$record")
                 if ov_event_vault_operation close "$id" "$force"; then ((count+=1)); else ((failures+=1)); fi
                 ;;
-            login|drive|token)
+            login|screen-unlock|resume|drive|token)
                 mode=$(jq -r '.open_on // "manual"' <<<"$record")
-                [[ "$mode" == "$event" ]] || continue
+                case "$event" in
+                    screen-unlock) [[ $(jq -r '.prompt_after_unlock // false' <<<"$record") == true ]] || continue ;;
+                    resume) [[ $(jq -r '.prompt_after_resume // false' <<<"$record") == true ]] || continue ;;
+                    *) [[ "$mode" == "$event" ]] || continue ;;
+                esac
                 if [[ "$event" == drive && $(jq -r '.drive_uuid // ""' <<<"$record") != "$drive" ]]; then continue; fi
                 # Authentication belongs in the owning desktop. Never launch root pinentry.
                 # Existing mounts need no prompt; the session agent receives only safe IDs.

@@ -1,4 +1,4 @@
-.TH OCTOVAULT 1 "October 2026" "OctoVault 1.2.2" "User Commands"
+.TH OCTOVAULT 1 "October 2026" "OctoVault 1.3.0" "User Commands"
 .SH NAME
 octovault \- manage encrypted local vaults and independent backups
 .SH SYNOPSIS
@@ -103,8 +103,9 @@ OpenPGP keys and compatible tokens; a new key requires --recipient.
 Add --require-token to require the matching card-backed encryption key.
 The auth-check action verifies the recipient and PIN or passphrase before
 creating any vault. Creation performs this check automatically.
-The unlock folder is managed automatically. Key paths are remembered;
-vault passphrases are never saved.
+The unlock folder is managed automatically. Key paths are remembered. Optional desktop FIDO2 enrollment protects an
+encrypted copy of the vault passphrase with a hardware-derived secret;
+the original passphrase remains usable for recovery.
 .PP
 Creation makes an empty container and does not move existing folders.
 After opening it, use migration add to protect a selected original path;
@@ -146,6 +147,32 @@ Show command usage.
 .TP
 .B --version
 Show the application version.
+.SH DESKTOP UNLOCKING
+A saved login unlock policy starts OctoVault's unlock sequence without opening
+the dashboard first. Required operating-system authorization appears before
+vault passphrase or device prompts. Offers after screen unlock and waking
+from sleep are independently selectable. Already open vaults are skipped.
+.PP
+Press Enter in the passphrase field to submit the unlock dialog. Automatic
+requests allow skipping the current vault or cancelling the remaining sequence.
+.PP
+Create a passphrase-protected vault first, then choose Add FIDO2 security key
+in its ready dialog or vault menu. The FIDO2 method requires the hmac-secret
+extension and registers
+a dedicated OctoVault credential. PIN and touch requests run as the desktop
+user. An SSH credential cannot be used as the Tomb key file. The OpenPGP
+security key option instead requires an OpenPGP encryption key.
+.PP
+FIDO2 enrollment retains the existing Tomb key and its passphrase. Use that
+passphrase if the hardware is unavailable or reset. After changing the
+passphrase, enroll FIDO2 again. The desktop vault menu offers Add FIDO2
+security key or Replace FIDO2 security key for enrollment.
+.PP
+When creating a vault, Use the key from another vault selects an existing
+compatible encrypted key. Also unlock other vaults using this key applies
+one passphrase entry to the listed matching vaults during the current unlock
+sequence only. Separate keys prompt separately; the entry is not a saved
+group password.
 .SH FILES
 .TP
 .B /var/lib/octovault/access.json

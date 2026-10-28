@@ -16,7 +16,7 @@ GUI_CFLAGS := $(shell $(PKG_CONFIG) --cflags $(GUI_PKGS))
 GUI_LIBS := $(shell $(PKG_CONFIG) --libs $(GUI_PKGS))
 
 .PHONY: all gui check test lint install clean package
-all: build/octovault build/octovaultd build/octovault-session build/pinentry-octovault build/steghide gui
+all: build/octovault build/octovaultd build/octovault-session build/pinentry-octovault build/steghide build/fido2 gui
 gui: build/octovault-gtk
 
 build:
@@ -28,7 +28,7 @@ build/octovaultd: src/service/daemon.c src/service/access.c src/service/access-s
 build/octovault: src/service/cli.c src/service/client.c src/service/client.h | build
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(CORE_CFLAGS) src/service/cli.c src/service/client.c -o $@ $(LDFLAGS) $(CORE_LIBS)
 
-build/octovault-gtk: src/ui/main.c src/ui/file-picker.c src/ui/folder-launcher.c src/ui/backup-setup.c src/service/client.c src/service/client.h | build
+build/octovault-gtk: src/ui/main.c src/ui/file-picker.c src/ui/folder-launcher.c src/ui/backup-setup.c src/ui/unlock-flow.c src/service/client.c src/service/client.h | build
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(GUI_CFLAGS) src/ui/main.c src/service/client.c -o $@ $(LDFLAGS) $(GUI_LIBS)
 
 build/octovault-session: src/session/main.c src/service/client.c src/service/client.h | build
@@ -36,6 +36,9 @@ build/octovault-session: src/session/main.c src/service/client.c src/service/cli
 
 build/pinentry-octovault: src/service/pinentry.c | build
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+build/fido2: src/service/fido2.c | build
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(CORE_CFLAGS) $(shell $(PKG_CONFIG) --cflags libfido2 openssl) $< -o $@ $(LDFLAGS) $(CORE_LIBS) $(shell $(PKG_CONFIG) --libs libfido2 openssl)
 
 build/steghide: src/service/steghide.c | build
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ $(LDFLAGS) -lutil
@@ -59,6 +62,7 @@ install: all
 	install -m 0755 build/octovault build/octovault-gtk build/octovault-session build/pinentry-octovault $(DESTDIR)$(PREFIX)/bin/
 	install -m 0755 build/octovaultd $(DESTDIR)$(PREFIX)/libexec/octovault/daemon
 	install -m 0755 build/steghide $(DESTDIR)$(PREFIX)/libexec/octovault/steghide
+	install -m 0755 build/fido2 $(DESTDIR)$(PREFIX)/libexec/octovault/fido2
 	install -m 0755 lib/octovault/backend $(DESTDIR)$(PREFIX)/libexec/octovault/backend
 	install -m 0755 lib/octovault/run-plan lib/octovault/event-system lib/octovault/priority-backend $(DESTDIR)$(PREFIX)/libexec/octovault/
 	install -m 0644 lib/octovault/*.sh $(DESTDIR)$(PREFIX)/lib/octovault/

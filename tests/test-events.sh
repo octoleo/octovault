@@ -63,6 +63,17 @@ ov_save vaults open '{"name":"Already open","open_on":"login","test_open":true,"
 OV_OP=event.session OV_PARAMS='{"event":"login"}'
 out=$(ov_event_dispatch)
 assert_json "$out" '.ok and .data.unlock_requests == ["login"]'
+# Screen-unlock and wake policies are explicit and independent of login.
+ov_save vaults unlock '{"name":"Unlock","open_on":"manual","prompt_after_unlock":true,"close_on":[]}'
+ov_save vaults resume '{"name":"Wake","open_on":"manual","prompt_after_resume":true,"close_on":[]}'
+ov_save vaults open_after_unlock '{"name":"Already open","open_on":"manual","test_open":true,"prompt_after_unlock":true,"prompt_after_resume":true,"close_on":[]}'
+OV_PARAMS='{"event":"screen-unlock"}'
+out=$(ov_event_dispatch)
+assert_json "$out" '.ok and .data.unlock_requests == ["unlock"]'
+OV_PARAMS='{"event":"resume"}'
+out=$(ov_event_dispatch)
+assert_json "$out" '.ok and .data.unlock_requests == ["resume"]'
+rm "$OV_ROOT/vaults/unlock.json" "$OV_ROOT/vaults/resume.json" "$OV_ROOT/vaults/open_after_unlock.json"
 OV_PARAMS='{"event":"login","force":true}'
 if (ov_event_dispatch > "$work/rejected"); then exit 1; fi
 assert_json "$(cat "$work/rejected")" '.error.code == "invalid_event"'

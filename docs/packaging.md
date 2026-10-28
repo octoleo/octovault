@@ -1,6 +1,6 @@
 # Build, test, and distribute
 
-The Debian package contains a C/GTK4/libadwaita GUI, a C command-line client, the privileged D-Bus service, a desktop event observer, and Bash engine adapters. Build on the Ubuntu release and architecture you intend to distribute. A binary compiled on a newer distribution is not automatically compatible with an older one.
+The Debian package contains a C/GTK4/libadwaita GUI, a C command-line client, the privileged D-Bus service, a desktop event observer, Bash engine adapters, and a user-side FIDO2 helper linked with libfido2 and OpenSSL. Build on the Ubuntu release and architecture you intend to distribute. A binary compiled on a newer distribution is not automatically compatible with an older one.
 
 Install the packages named in `debian/control` under `Build-Depends`, then run:
 
@@ -17,7 +17,7 @@ Do not run `scripts/test-package-lifecycle.sh` on a normal workstation. It insta
 
 Desktop entry: `io.vdm.OctoVault.desktop`. Application ID: `io.vdm.OctoVault`. D-Bus name: `io.vdm.OctoVault1`. The package installs the GUI and CLI into `/usr/bin`, fixed workers into `/usr/libexec/octovault`, and root-owned Bash modules into `/usr/lib/octovault`. State is stored separately under `/var/lib/octovault/users/UID`.
 
-The desktop observer is started through GNOME autostart. Its systemd user unit is also supplied for managed environments; do not deliberately start duplicate observers. The system daemon is activated on demand by D-Bus. A required pre-sleep unit runs before systemd's sleep executors. The shutdown helper runs before the shutdown and unmount targets. These guards invoke only saved vault policies and do not create policies during package installation.
+The desktop observer is started through XDG desktop autostart on desktops using logind. GNOME on Ubuntu remains the baseline tested desktop; GNOME-specific logout and idle integrations are not claimed for other desktops. Its systemd user unit is also supplied for managed environments; do not deliberately start duplicate observers. The observer requests configured unlock offers through the GUI, including the authorization step when needed; it does not pass secrets on a command line or unlock vaults without their credentials. The system daemon is activated on demand by D-Bus. A required pre-sleep unit runs before systemd's sleep executors. The shutdown helper runs before the shutdown and unmount targets. These guards invoke only saved vault policies and do not create policies during package installation.
 
 ## Versioned release
 
