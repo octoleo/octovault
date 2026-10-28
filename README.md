@@ -29,9 +29,20 @@ Saved schedules do not need an open management session. Personal schedules still
 
 ## Vaults
 
-Create a vault by choosing its name, a folder to save it in, and its capacity in decimal GB. OctoVault creates the encrypted container in that folder and generates a new encryption key automatically. Choose a passphrase and confirm it; OctoVault remembers the encrypted key's location, never the passphrase. The private managed key folder is accessible only to your account. Select **Reuse an existing vault key file** only when you want to reuse an existing compatible vault key or protected carrier. Capacity is converted to whole MiB for the underlying engine.
+Creating a vault makes an **empty encrypted container**. It does not select, move, or protect your existing Documents folder. Give the container a **Vault file name**, choose the **Folder for the encrypted vault file**, and set its capacity in decimal GB. For example, `Document_vault` saved in `/home/alex` creates `/home/alex/Document_vault.tomb`. Your protected folders can have different names; `Documents` does not need to be renamed to `Document_vault`.
 
-Choose how the generated key is protected. **Passphrase-protected key** is the default. **Key hidden in an image** asks for a cover image and saves a separate protected copy; the original image is unchanged. **Key hidden in text** generates a text carrier automatically, so no source text is needed. The image or generated text still requires your passphrase. **Software OpenPGP key** and **YubiKey / OpenPGP security key** are separate choices. OctoVault generates the vault key and encrypts it for the selected recipient. GnuPG handles the private-key passphrase or token PIN; touch the token when its policy requires it.
+These locations serve different purposes:
+
+| Item | What it contains | Where it is used |
+| --- | --- | --- |
+| Encrypted container, such as `Document_vault.tomb` | The encrypted filesystem and its protected files | Stays in the storage folder chosen during creation, whether the vault is locked or unlocked |
+| Encrypted key file or image/text key carrier | The key needed to unlock that container | Stored separately; OctoVault manages its location automatically by default |
+| Unlocked vault folder | The decrypted view of the container while it is open | Managed automatically under `~/.local/share/octovault/mounts/`; **Browse files** opens this view |
+| Protected original path, such as `~/Documents` | The protected folder while unlocked; a separate ordinary folder while locked | Remains the familiar path your applications use after folder protection succeeds |
+
+OctoVault generates a new encryption key automatically. Choose a passphrase and confirm it; OctoVault remembers the encrypted key's location, never the passphrase. The private managed key folder is accessible only to your account. Select **Reuse an existing vault key file** only when you want to reuse an existing compatible vault key or protected carrier. Capacity is converted to whole MiB for the underlying engine; filesystem overhead reduces usable space.
+
+Choose how the generated key is protected. **Passphrase (encrypted key file)** is the default. **Key hidden in an image** asks for a cover image and saves a separate protected copy; the original image is unchanged. **Key hidden in text** generates a text carrier automatically, so no source text is needed. The image or generated text still requires your passphrase. **Software OpenPGP key** and **YubiKey / OpenPGP security key** are separate choices. OctoVault generates the vault key and encrypts it for the selected recipient. GnuPG handles the private-key passphrase or token PIN; touch the token when its policy requires it.
 
 A YubiKey must have a usable OpenPGP encryption key, and its matching public key must be available in your GnuPG keyring. A token used only for website sign-in is not automatically ready for vault encryption. OctoVault checks the selected key, token when required, and an actual decryption challenge before allocating a new vault. A detected USB device or a public key alone does not establish that you can unlock it. Resolve the specific authentication error before trying creation again.
 
@@ -43,9 +54,21 @@ Keep a separate recovery copy of the generated key or carrier using **Export key
 
 Vaults can open manually, at desktop login, when a selected drive is mounted, or when a configured OpenPGP token becomes available. Closing policies are independently selectable for screen lock, logout, sleep, and shutdown. Policies run through the background services even when the application window is closed. A busy vault is reported as busy; force closing is a separate explicit setting because it can terminate applications and lose unsaved work.
 
-To protect an existing folder or file, open the vault and choose its migration action. OctoVault retains a staging original, copies the content, creates the native mapping and original-path placeholder, then closes and reopens the vault to verify the mapping. It removes staging only after successful verification. Interrupted migrations retain recovery material and remain visible for recovery. Do not manually delete that staging material until the operation has completed or you have recovered it.
+To protect an existing folder or file:
 
-The ordinary directory or file underneath a closed vault's mapping remains independent and writable. OctoVault does not monitor, erase, merge, or reconcile content written there while the vault is closed. Reopening the vault temporarily covers that underlying content with the encrypted contents; closing reveals it again.
+1. Create the empty vault, then unlock it.
+2. Close applications using the folder or file. Choose **Protect a folder or file…** and select the existing path, such as `~/Documents`.
+3. Choose its **Name inside the encrypted vault**, such as `Documents`. This is a relative name within the container, separate from the container's filename and the original path.
+4. Let OctoVault finish copying, mapping, closing, reopening, and checking the files. Keep the application running until it reports completion. A temporary original remains available until the verification succeeds.
+5. Work through `~/Documents` while the vault is unlocked. Lock the vault to hide that protected view; unlock it to show those same protected files at `~/Documents` again.
+
+OctoVault creates the folder mapping automatically. You do not need to configure bind hooks or custom scripts. Advanced script hooks run user-provided programs on vault events and are optional; they are separate from folder protection.
+
+After successful protection, the original folder remains present when the vault locks. It starts empty. You can put separate files there while locked, but those files are **outside the encrypted vault**. Unlocking covers that ordinary folder with the protected contents; locking reveals the ordinary folder again. OctoVault does not monitor, erase, merge, or reconcile files written there. A mapped individual file similarly has a separate underlying file while locked.
+
+If the original folder disappears or a `.octovault-staging-…` folder remains, protection has not finished normally. That staging folder is a retained, unencrypted original, not the encrypted container. Do not delete it or repeat protection on it. Open **Folder protection & recovery** for the recorded operation and follow the [interrupted protection guidance](docs/recovery.md#interrupted-folder-protection).
+
+A vault protects the working copy in its container. It does not create versioned backups or protect against losing the only container and key. Configure a separate backup plan for recoverable copies. When copying a closed vault for recovery, preserve both its `.tomb` container and its encrypted key or carrier, with the required passphrase or OpenPGP recovery arrangement.
 
 ## Backups and recovery
 

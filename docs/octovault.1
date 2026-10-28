@@ -106,6 +106,25 @@ creating any vault. Creation performs this check automatically.
 The unlock folder is managed automatically. Key paths are remembered;
 vault passphrases are never saved.
 .PP
+Creation makes an empty container and does not move existing folders.
+After opening it, use migration add to protect a selected original path;
+--source is the existing file or folder and --relative is its name inside
+the encrypted filesystem. OctoVault creates its folder mapping automatically.
+After successful protection, opening the vault shows the protected contents
+at the original path. Closing reveals a separate ordinary underlying folder
+or file. Content written there while locked is not encrypted or merged.
+.PP
+A retained .octovault-staging-* location is an original copy from unfinished
+folder protection, not the encrypted container. Preserve it and inspect
+migration list before choosing migration recover with --action resume or,
+when the recorded stage permits it, --action rollback. Recovery refuses
+to overwrite an occupied original path. The --migration-id value comes
+from the migration_id field of the recovery record.
+.PP
+Vault protection does not create a versioned backup. Preserve the encrypted
+container and its separate encrypted key or carrier, plus the authentication
+material needed to unlock it, in an independent recovery arrangement.
+.PP
 Secret options such as --password, --old-password, --secret-key,
 --ssh-private-key, and --ssh-passphrase take no argument and prompt on the
 terminal without echo. Never place secrets in command-line arguments.

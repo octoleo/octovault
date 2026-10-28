@@ -5,7 +5,7 @@ OctoVault is a native GNOME vault and independent backup manager by Vast Develop
 ## Accepted behaviour
 
 - Vault size input is decimal GB; convert internally to whole MiB.
-- Migration retains a staging original, copies into the open vault, writes native bind-hooks, creates empty original placeholders, closes and reopens, verifies mounted content, then deletes staging only on successful verification. Interrupted or failed verification retains recovery material.
+- Folder protection copies and verifies content inside the open vault while the original remains at its familiar path. Only then does it rename the original to adjacent staging and immediately create the original-path placeholder. It writes native bind-hooks, closes and reopens, verifies the mounted content, then deletes staging only on successful verification. Interrupted or failed verification retains recovery material; legacy staged records recreate missing placeholders when resumed.
 - Closed-vault underlying locations are independent writable contents. Never monitor, block, erase or reconcile their changes.
 - Tests belong in CI. Hardware/manual testing is optional user work, not an approval gate.
 - Tomb and Restic remain dependencies and portable recovery formats. Secrets are encrypted using systemd credentials; no SHC security claims.
