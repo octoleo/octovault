@@ -391,13 +391,14 @@ static void test_destination_guidance(void)
 
 static void test_migration_recovery_contract(void)
 {
+    const Spec*recover=specifications("migration.recover");g_assert_null(find_spec(recover,"migration_id"));g_assert_null(find_spec(recover,"action"));g_assert_nonnull(find_spec(recover,"password"));g_assert_true(advanced_field("migration.add","relative"));
     JsonObject*migration=json_object_new();
     json_object_set_string_member(migration,"vault_id","vault-example");
     json_object_set_string_member(migration,"migration_id","protection-example");
     json_object_set_string_member(migration,"id","wrong-legacy-field");
     const char*actions[]={"resume","rollback"};
     for(guint i=0;i<G_N_ELEMENTS(actions);i++){
-        JsonObject*params=migration_recovery_parameters("vault-example",migration,actions[i]);
+        JsonObject*params=migration_recovery_parameters(NULL,"vault-example",migration,actions[i]);
         g_assert_cmpstr(str(params,"id"),==,"vault-example");
         g_assert_cmpstr(str(params,"migration_id"),==,"protection-example");
         g_assert_cmpstr(str(params,"action"),==,actions[i]);
@@ -405,7 +406,7 @@ static void test_migration_recovery_contract(void)
     }
     g_assert_true(migration_can_restore("prepared"));
     g_assert_true(migration_can_restore("staged"));
-    g_assert_true(migration_can_restore("copied"));
+    g_assert_false(migration_can_restore("copied"));
     g_assert_false(migration_can_restore("mapped"));
     g_assert_false(migration_can_restore("reopened"));
     g_assert_false(migration_can_restore("complete"));
