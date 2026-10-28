@@ -1,3 +1,12 @@
+octovault (1.2.2) unstable; urgency=high
+
+  * Distinguish restored original folders from completed folder protection.
+  * Reject resuming cancelled moves instead of reporting false success.
+  * Show native folder links and open the protected location when unambiguous.
+  * Continue from restored files through a prefilled protection form.
+
+ -- Vast Development Method <octoleo@users.noreply.github.com>  Wed, 28 Oct 2026 12:30:00 +0200
+
 octovault (1.2.1) unstable; urgency=high
 
   * Keep original folders in place until encrypted copies are verified.

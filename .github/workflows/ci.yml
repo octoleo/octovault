@@ -50,6 +50,7 @@ jobs:
           runuser -u octovault-test -- xvfb-run -a dbus-run-session -- env GDK_DEBUG=portals OCTOVAULT_PICKER_SCREENSHOT=/tmp/octovault-picker.png bash tests/test-picker.sh --native
           runuser -u octovault-test -- xvfb-run -a dbus-run-session -- env GTK_A11Y=none G_DEBUG=fatal-criticals GSK_RENDERER=cairo XDG_DATA_DIRS="$GITHUB_WORKSPACE/debian/octovault/usr/share:/usr/share" build/octovault-gtk --screenshot /tmp/octovault.png
           runuser -u octovault-test -- xvfb-run -a dbus-run-session -- env GTK_A11Y=none G_DEBUG=fatal-criticals GSK_RENDERER=cairo XDG_DATA_DIRS="$GITHUB_WORKSPACE/debian/octovault/usr/share:/usr/share" build/octovault-gtk --screenshot-create /tmp/octovault-create.png
+          runuser -u octovault-test -- xvfb-run -a dbus-run-session -- env GTK_A11Y=none G_DEBUG=fatal-criticals GSK_RENDERER=cairo XDG_DATA_DIRS="$GITHUB_WORKSPACE/debian/octovault/usr/share:/usr/share" build/octovault-gtk --screenshot-vault /tmp/octovault-vault.png
           runuser -u octovault-test -- xvfb-run -a dbus-run-session -- env GTK_A11Y=none G_DEBUG=fatal-criticals GSK_RENDERER=cairo XDG_DATA_DIRS="$GITHUB_WORKSPACE/debian/octovault/usr/share:/usr/share" build/octovault-gtk --screenshot-protect /tmp/octovault-protect.png
           runuser -u octovault-test -- xvfb-run -a dbus-run-session -- env GTK_A11Y=none G_DEBUG=fatal-criticals GSK_RENDERER=cairo XDG_DATA_DIRS="$GITHUB_WORKSPACE/debian/octovault/usr/share:/usr/share" build/octovault-gtk --screenshot-menu /tmp/octovault-menu.png
           runuser -u octovault-test -- xvfb-run -a dbus-run-session -- env GTK_A11Y=none G_DEBUG=fatal-criticals GSK_RENDERER=cairo XDG_DATA_DIRS="$GITHUB_WORKSPACE/debian/octovault/usr/share:/usr/share" build/octovault-gtk --screenshot-backup /tmp/octovault-backup.png
@@ -60,6 +61,7 @@ jobs:
           cp /tmp/octovault-picker.png build/screenshots/File-navigator.png
           cp /tmp/octovault.png build/screenshots/OctoVault.png
           cp /tmp/octovault-create.png build/screenshots/Create-vault.png
+          cp /tmp/octovault-vault.png build/screenshots/Vault-protection-state.png
           cp /tmp/octovault-protect.png build/screenshots/Protect-folder.png
           cp /tmp/octovault-menu.png build/screenshots/Vault-actions.png
           cp /tmp/octovault-backup.png build/screenshots/Create-backup.png

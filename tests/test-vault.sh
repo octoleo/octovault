@@ -338,6 +338,159 @@ test_prepared_rollback() (
     printf 'ok - rollback after an initial copy failure preserves the original and encrypted partial copy\n'
 )
 
+test_terminal_recovery_actions() (
+    local source="$OV_HOME/Terminal recovery Documents" stage action expected migration output
+    mkdir -p "$source"
+    printf 'original stays visible\n' > "$source/data"
+    ov_save vaults terminalrecoveryvault '{"mountpoint":"/unused-terminal-vault"}'
+    ov_vault_password() { touch "$WORK/unexpected-terminal-authentication"; }
+    ov_vault_open_record() { touch "$WORK/unexpected-terminal-open"; }
+    ov_migration_finish() { touch "$WORK/unexpected-terminal-copy"; }
+    for stage in rolled_back complete; do
+        migration=$(jq -n --arg source "$source" --arg stage "$stage" \
+            '{migration_id:"terminalmove",source:$source,relative:"Documents",stage:$stage}')
+        ov_migration_save terminalrecoveryvault terminalmove "$migration"
+        for action in resume rollback unknown; do
+            OV_PARAMS=$(jq -n --arg action "$action" \
+                '{id:"terminalrecoveryvault",migration_id:"terminalmove",action:$action}')
+            expected=''
+            case "$stage:$action" in
+                *:unknown) expected=invalid_action ;;
+                rolled_back:*) expected=migration_cancelled ;;
+                complete:*) expected=already_protected ;;
+            esac
+            output="$WORK/terminal-$stage-$action.json"
+            if [[ -n $expected ]]; then
+                if (ov_migration_recover) > "$output" 2>/dev/null; then
+                    printf 'Terminal recovery falsely accepted %s on %s\n' "$action" "$stage" >&2; exit 1
+                fi
+                assert_equal "$(jq -r .error.code "$output")" "$expected"
+            else
+                ov_migration_recover > "$output"
+                jq -e --arg stage "$stage" '.ok and .data.stage == $stage' "$output" >/dev/null
+            fi
+            assert_equal "$(jq -r .stage "$OV_ROOT/migrations/terminalrecoveryvault/terminalmove.json")" "$stage"
+            assert_equal "$(cat "$source/data")" 'original stays visible'
+            [[ ! -e $WORK/unexpected-terminal-authentication && ! -e $WORK/unexpected-terminal-open &&
+               ! -e $WORK/unexpected-terminal-copy ]]
+        done
+    done
+    printf 'ok - stale recovery actions cannot claim resumed protection or restoration after a terminal outcome\n'
+)
+
+test_native_protection_status() (
+    local status_mountpoint="$OV_HOME/status-vault" source="$OV_HOME/Original file" record status
+    local MOCK_STATUS_OPEN=true MOCK_STATUS_EXPOSED=true
+    mkdir -p "$status_mountpoint" "$OV_HOME/Unmapped folder"
+    printf 'direct vault data\n' > "$status_mountpoint/direct-file"
+    touch "$OV_HOME/status.tomb"
+    record=$(jq -n --arg mount "$status_mountpoint" --arg file "$OV_HOME/status.tomb" \
+        '{id:"statusvault",mountpoint:$mount,file:$file}')
+    ov_vault_active_mount() { printf '%s\n' "$status_mountpoint"; }
+    ov_vault_is_open() { [[ $MOCK_STATUS_OPEN == true ]]; }
+    ov_vault_is_exposed() { [[ $MOCK_STATUS_OPEN == true && $MOCK_STATUS_EXPOSED == true ]]; }
+    ov_vault_attached() { return 1; }
+    findmnt() { [[ $* == *"--mountpoint $source"* ]]; }
+    status=$(ov_vault_status "$record")
+    jq -e '.status == "open" and .protected_locations == []' <<< "$status" >/dev/null
+    [[ -f $status_mountpoint/direct-file ]]
+    # Historical completion is not a current native mapping.
+    ov_migration_save statusvault historicalstatus \
+        '{"migration_id":"historicalstatus","relative":"OldDocuments","stage":"complete"}'
+    status=$(ov_vault_status "$record")
+    jq -e '.protected_locations == []' <<< "$status" >/dev/null
+    printf 'protected bytes\n' > "$status_mountpoint/ProtectedFile"
+    ln "$status_mountpoint/ProtectedFile" "$source"
+    ov_migration_write_bind "$status_mountpoint" ProtectedFile 'Original file'
+    ov_migration_write_bind "$status_mountpoint" MissingFolder 'Unmapped folder'
+    status=$(ov_vault_status "$record")
+    jq -e --arg source "$source" --arg inactive "$OV_HOME/Unmapped folder" \
+        '.protected_locations == [{source:$source,relative:"ProtectedFile",active:true},
+          {source:$inactive,relative:"MissingFolder",active:false}]' <<< "$status" >/dev/null
+    MOCK_STATUS_EXPOSED=false
+    status=$(ov_vault_status "$record"); jq -e '.protected_locations == null' <<< "$status" >/dev/null
+    MOCK_STATUS_EXPOSED=true; MOCK_STATUS_OPEN=false
+    status=$(ov_vault_status "$record"); jq -e '.status == "closed" and .protected_locations == null' <<< "$status" >/dev/null
+    MOCK_STATUS_OPEN=true
+    for status in 'invalid three fields' '../outside Documents' 'Documents ../outside'; do
+        printf '%s\n' "$status" > "$status_mountpoint/bind-hooks"
+        status=$(ov_vault_status "$record")
+        jq -e '.protected_locations == null' <<< "$status" >/dev/null
+    done
+    rm -- "$status_mountpoint/bind-hooks"
+    ln -s "$status_mountpoint/direct-file" "$status_mountpoint/bind-hooks"
+    status=$(ov_vault_status "$record"); jq -e '.protected_locations == null' <<< "$status" >/dev/null
+    printf 'ok - protection status comes from exposed native mappings, distinguishes direct files, and stays unknown when unavailable\n'
+)
+
+test_closed_vault_protection() (
+    local source="$OV_HOME/Closed protect Documents" mountpoint="$OV_HOME/closed-protect-vault" record
+    local MOCK_CLOSED_PROTECT_OPEN=false
+    mkdir -p "$source" "$mountpoint"
+    printf 'closed-vault original\n' > "$source/data"
+    record=$(jq -n --arg mount "$mountpoint" --arg file "$OV_HOME/closed-protect.tomb" \
+        '{mountpoint:$mount,file:$file,auth:"key"}')
+    ov_save vaults closedprotectvault "$record"
+    ov_vault_is_open() { [[ $MOCK_CLOSED_PROTECT_OPEN == true ]]; }
+    ov_vault_is_exposed() { [[ $MOCK_CLOSED_PROTECT_OPEN == true ]]; }
+    ov_vault_password() {
+        OV_VAULT_PASSWORD=$(ov_param password '')
+        printf 'credentials\n' >> "$WORK/closed-protect-credentials"
+    }
+    ov_vault_open_record() {
+        [[ ${OV_EVENT_RUNNING:-0} == 1 && ${OV_VAULT_PASSWORD:-} == fixture-passphrase ]] || exit 83
+        printf 'open\n' >> "$WORK/closed-protect-transitions"
+        MOCK_CLOSED_PROTECT_OPEN=true
+        # The first open exposes storage; the verification reopen stands in
+        # for the kernel bind exposing the protected data at its original path.
+        if [[ -d $mountpoint/Documents ]]; then rsync -aHAX "$mountpoint/Documents/" "$source/"; fi
+    }
+    ov_vault_close_record() {
+        [[ ${OV_EVENT_RUNNING:-0} == 1 ]] || exit 84
+        printf 'close\n' >> "$WORK/closed-protect-transitions"; MOCK_CLOSED_PROTECT_OPEN=false
+    }
+    findmnt() {
+        if [[ $* == *'--json --list --output TARGET'* ]]; then printf '{"filesystems":[]}\n'; else return 1; fi
+    }
+    ov_vault_mapping_matches() { return 0; }
+    OV_PARAMS=$(jq -n --arg source "$source" \
+        '{id:"closedprotectvault",source:$source,relative:"Documents",password:"fixture-passphrase"}')
+    ov_migration_add > "$WORK/closed-protect-result.json"
+    jq -e '.ok and .data.stage == "complete"' "$WORK/closed-protect-result.json" >/dev/null
+    assert_equal "$(cat "$source/data")" 'closed-vault original'
+    assert_equal "$(cat "$WORK/closed-protect-credentials")" credentials
+    assert_equal "$(cat "$WORK/closed-protect-transitions")" $'open\nclose\nopen'
+    [[ -f $mountpoint/Documents/data ]]
+    printf 'ok - protecting into a closed vault reuses supplied credentials and suppresses intermediate vault events\n'
+)
+
+test_closed_vault_partial_conflict() (
+    local source="$OV_HOME/Retried protect Documents" mountpoint="$OV_HOME/retried-protect-vault" record
+    local MOCK_RETRY_OPEN=false
+    mkdir -p "$source" "$mountpoint/Documents"
+    printf 'original retained\n' > "$source/data"
+    printf 'encrypted partial retained\n' > "$mountpoint/Documents/partial"
+    record=$(jq -n --arg mount "$mountpoint" --arg file "$OV_HOME/retried-protect.tomb" \
+        '{mountpoint:$mount,file:$file,auth:"key"}')
+    ov_save vaults retriedprotectvault "$record"
+    ov_vault_is_open() { [[ $MOCK_RETRY_OPEN == true ]]; }
+    ov_vault_is_exposed() { [[ $MOCK_RETRY_OPEN == true ]]; }
+    ov_vault_open_record() { MOCK_RETRY_OPEN=true; }
+    findmnt() {
+        if [[ $* == *'--json --list --output TARGET'* ]]; then printf '{"filesystems":[]}\n'; else return 1; fi
+    }
+    OV_PARAMS=$(jq -n --arg source "$source" \
+        '{id:"retriedprotectvault",source:$source,relative:"Documents",password:"fixture-passphrase"}')
+    if (ov_migration_add) > "$WORK/retried-protect-result.json" 2>/dev/null; then
+        printf 'Expected preserved partial-destination conflict\n' >&2; exit 1
+    fi
+    assert_equal "$(jq -r .error.code "$WORK/retried-protect-result.json")" exists
+    assert_equal "$(cat "$source/data")" 'original retained'
+    assert_equal "$(cat "$mountpoint/Documents/partial")" 'encrypted partial retained'
+    [[ ! -d $OV_ROOT/migrations/retriedprotectvault ]]
+    printf 'ok - fresh protection never replaces a retained partial encrypted destination\n'
+)
+
 test_published_mapping_blocks_rollback() (
     local source="$OV_HOME/Published Documents" mountpoint="$OV_HOME/published-vault"
     local staging="$OV_HOME/.octovault-staging-publishedrollback" migration
@@ -754,7 +907,8 @@ PROBE
     # vault or overwrite another location.
     local restored="$OV_HOME/Restored Documents" restore_staging="$OV_HOME/.octovault-staging-legacy-restore"
     ov_as_user mkdir -m 0700 "$restore_staging"
-    printf 'restored original\n' | ov_as_user tee "$restore_staging/data" >/dev/null
+    printf 'restored original\n' > "$WORK/restored-original.expected"
+    ov_as_user tee "$restore_staging/data" < "$WORK/restored-original.expected" >/dev/null
     migration=$(jq -n --arg id "$id" --arg source "$restored" --arg staging "$restore_staging" \
         '{schema_version:1,vault_id:$id,migration_id:"legacy-restore",source:$source,staging:$staging,relative:"RestoredDocuments",stage:"staged"}')
     ov_migration_save "$id" legacy-restore "$migration"
@@ -765,8 +919,37 @@ PROBE
     assert_equal "$(cat "$restored/data")" 'restored original'
     [[ ! -e $restore_staging ]]
     ov_load vaults "$id"; assert_fails ov_vault_is_open "$OV_RECORD"
+    cmp -s -- "$WORK/restored-original.expected" "$restored/data"
+    jq -e '.protected_locations == null' <<< "$(ov_vault_status "$OV_RECORD")" >/dev/null
     OV_PARAMS=$(jq -n --arg id "$id" '{id:$id,password:"OctoVault-CI-only-passphrase"}')
-    printf 'ok - real legacy interrupted-move resume and original-folder restoration after update\n'
+    OV_OP=vault.open; ov_vault_dispatch >/dev/null
+    cmp -s -- "$WORK/restored-original.expected" "$restored/data"
+    [[ ! -e $protected_mount/RestoredDocuments ]]
+    ov_load vaults "$id"
+    jq -e --arg source "$restored" 'all(.protected_locations[]; .source != $source)' \
+        <<< "$(ov_vault_status "$OV_RECORD")" >/dev/null
+    OV_OP=vault.close; ov_vault_dispatch >/dev/null
+    cmp -s -- "$WORK/restored-original.expected" "$restored/data"
+    # Restore cancels the old attempt. A fresh explicit Protect request can
+    # unlock the same closed vault and create a new verified native mapping.
+    OV_PARAMS=$(jq -n --arg id "$id" --arg source "$restored" \
+        '{id:$id,source:$source,relative:"RestoredDocuments",password:"OctoVault-CI-only-passphrase"}')
+    OV_OP=migration.add; ov_vault_dispatch > "$WORK/reprotected.json"
+    jq -e '.ok and .data.stage == "complete" and .data.migration_id != "legacy-restore"' "$WORK/reprotected.json" >/dev/null
+    cmp -s -- "$WORK/restored-original.expected" "$restored/data"
+    cmp -s -- "$WORK/restored-original.expected" "$protected_mount/RestoredDocuments/data"
+    ov_load vaults "$id"
+    jq -e --arg source "$restored" \
+        'any(.protected_locations[]; .source == $source and .relative == "RestoredDocuments" and .active)' \
+        <<< "$(ov_vault_status "$OV_RECORD")" >/dev/null
+    OV_PARAMS=$(jq -n --arg id "$id" '{id:$id,password:"OctoVault-CI-only-passphrase"}')
+    OV_OP=vault.close; ov_vault_dispatch >/dev/null
+    [[ -d $restored && -z $(find "$restored" -mindepth 1 -maxdepth 1 -print -quit) ]]
+    OV_OP=vault.open; ov_vault_dispatch >/dev/null
+    cmp -s -- "$WORK/restored-original.expected" "$restored/data"
+    ov_vault_mount_safe "$restored"
+    OV_OP=vault.close; ov_vault_dispatch >/dev/null
+    printf 'ok - real restore keeps plaintext visible until a fresh closed-vault Protect request verifies lock and unlock\n'
     # Imported native metadata must never cause root writes through symlinks;
     # executable native hooks stay dormant until the user explicitly trusts them.
     local mountpoint guard="$WORK/root-owned-guard"
@@ -919,5 +1102,5 @@ PINENTRY
 }
 
 if [[ ${1:-} == --integration ]]; then integration
-else test_validation; test_native_binds; test_compare; test_migration; test_interrupted_migration; test_failed_copy_preserves_original; test_symlink_destination_preserves_original; test_closed_recovery_rechecks_destination; test_full_vault_preserves_original; test_legacy_staging_recovery; test_prepared_rollback; test_published_mapping_blocks_rollback; test_symlink_staging_blocks_rollback; test_migration_source_safety; test_device_identity; test_mount_protections; test_unknown_state; test_secret_arguments; test_container_pin; test_guided_creation
+else test_validation; test_native_binds; test_compare; test_migration; test_terminal_recovery_actions; test_native_protection_status; test_closed_vault_protection; test_closed_vault_partial_conflict; test_interrupted_migration; test_failed_copy_preserves_original; test_symlink_destination_preserves_original; test_closed_recovery_rechecks_destination; test_full_vault_preserves_original; test_legacy_staging_recovery; test_prepared_rollback; test_published_mapping_blocks_rollback; test_symlink_staging_blocks_rollback; test_migration_source_safety; test_device_identity; test_mount_protections; test_unknown_state; test_secret_arguments; test_container_pin; test_guided_creation
 fi
