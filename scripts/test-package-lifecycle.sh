@@ -19,6 +19,9 @@ printf '{"id":"lifecycle","schema_version":1}\n' >/var/lib/octovault/users/12345
 chmod 0600 /var/lib/octovault/users/12345/plans/lifecycle.json
 cp /var/lib/octovault/users/12345/plans/lifecycle.json "$temp/expected"
 apt-get install --yes "$package"
+# Modern udev supplies FIDO discovery and active-user device access.
+test -f /usr/lib/udev/rules.d/60-fido-id.rules
+grep -q ID_SECURITY_TOKEN /usr/lib/udev/rules.d/70-uaccess.rules
 apt-get install --yes --reinstall "$package"
 /usr/bin/octovault --version
 test -x /usr/bin/octovault-gtk
