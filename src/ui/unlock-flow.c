@@ -93,7 +93,7 @@ static void cancel_remaining_unlocks(GtkButton *button,gpointer data){
   Form *form=data;g_queue_clear_full(form->app->pending_unlocks,g_free);clear_shared_unlock(form->app);close_window(button,form->window);
 }
 static gboolean form_close_requested(GtkWindow *window,gpointer data){
-  (void)window;Form *form=data;form->dismissed=TRUE;if(form->fido_process)g_subprocess_force_exit(form->fido_process);return FALSE;
+  (void)window;Form *form=data;form->dismissed=TRUE;if(!form->submitted)clear_shared_unlock(form->app);if(form->fido_process)g_subprocess_force_exit(form->fido_process);return FALSE;
 }
 static void shared_key_selected(GObject *object,GParamSpec *pspec,gpointer data){
   (void)object;(void)pspec;Form *form=data;const char *id=selected_value(form,"_shared_key");JsonNode *collection=form->app->collections[0];if(!*id||!collection||!JSON_NODE_HOLDS_ARRAY(collection))return;
