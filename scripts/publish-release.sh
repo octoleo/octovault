@@ -45,10 +45,13 @@ if [[ $count == 1 ]] && jq -e '.[0].draft == false' "$temp/matches.json" >/dev/n
     exit 0
 fi
 files=()
-ubuntu_versions=(26.04)
+ubuntu_versions=(24.04 26.04)
 for ubuntu in "${ubuntu_versions[@]}"; do
     filename="octovault_${version}_ubuntu${ubuntu}_amd64.deb"
-    test -f "$artifacts/$filename" && test ! -L "$artifacts/$filename"
+    [[ -f $artifacts/$filename && ! -L $artifacts/$filename &&
+        -f $artifacts/SHA256SUMS-ubuntu$ubuntu && ! -L $artifacts/SHA256SUMS-ubuntu$ubuntu ]] || {
+        printf 'A regular package and checksum manifest are required for Ubuntu %s.\n' "$ubuntu" >&2; exit 1;
+    }
     hash=$(sha256sum "$artifacts/$filename")
     printf '%s  %s\n' "${hash%% *}" "$filename" >"$temp/SHA256SUMS-ubuntu$ubuntu"
     cmp "$temp/SHA256SUMS-ubuntu$ubuntu" "$artifacts/SHA256SUMS-ubuntu$ubuntu"
@@ -65,14 +68,16 @@ else
     cat >"$temp/notes.md" <<EOF
 OctoVault $version by Vast Development Method, part of the OctoLeo Suite.
 
-Download the Debian package matching your Ubuntu release and CPU architecture, verify its SHA-256 manifest, and install it using your desktop package installer or \
-\`sudo apt install ./octovault_${version}_ubuntu26.04_amd64.deb\` on Ubuntu 26.04.
+Download the amd64 Debian package matching your Ubuntu release, verify its SHA-256 manifest, and install it using your desktop package installer or the matching command:
+
+- Ubuntu 24.04: \`sudo apt install ./octovault_${version}_ubuntu24.04_amd64.deb\`
+- Ubuntu 26.04: \`sudo apt install ./octovault_${version}_ubuntu26.04_amd64.deb\`
 
 The package includes the GNOME application, CLI, desktop event observer, and privilege service. APT installs its dependencies. Vaults, repositories, and private configuration are retained during upgrades and removal. This download does not configure an automatic APT update repository.
 
 Read the [usage and recovery instructions](https://github.com/octoleo/octovault/blob/$tag/README.md) before configuring your first vault or unattended backup. Keep recovery credentials outside this computer.
 
-Built from $commit after the Ubuntu 26.04 package and real encryption integration checks passed.
+Built from $commit after both Ubuntu package builds and the integration checks passed.
 EOF
     gh release create "$tag" --repo "$GH_REPO" --draft --target "$commit" --title "OctoVault $version" --notes-file "$temp/notes.md"
 fi

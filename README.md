@@ -6,11 +6,20 @@ OctoVault provides two independent tracks. Vaults protect local working folders;
 
 ## Install
 
-Download the `.deb` matching **your Ubuntu release and CPU architecture** from [Releases](https://github.com/octoleo/octovault/releases). CI builds Ubuntu 26.04 amd64 packages. The initial baseline is Ubuntu 26.04 LTS with GNOME. Open the matching package in the desktop package installer, or use APT:
+Download the `.deb` and checksum manifest matching **your Ubuntu release and CPU architecture** from [Releases](https://github.com/octoleo/octovault/releases). CI builds and tests separate Ubuntu 24.04 LTS and 26.04 LTS packages for amd64, with GNOME as the tested desktop. Open the matching package in the desktop package installer, or use APT.
+
+**Ubuntu 24.04:**
+
+```bash
+sha256sum --check SHA256SUMS-ubuntu24.04
+sudo apt install ./octovault_1.3.1_ubuntu24.04_amd64.deb
+```
+
+**Ubuntu 26.04:**
 
 ```bash
 sha256sum --check SHA256SUMS-ubuntu26.04
-sudo apt install ./octovault_1.3.0_ubuntu26.04_amd64.deb
+sudo apt install ./octovault_1.3.1_ubuntu26.04_amd64.deb
 ```
 
 APT installs the required encryption, backup, desktop, and system-integration dependencies. The checksum detects damaged or changed downloads; it is not an independent publisher signature. A downloaded Debian package does not enroll the computer into an automatic update repository.

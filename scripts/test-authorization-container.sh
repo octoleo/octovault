@@ -9,9 +9,14 @@ cd "$(dirname "$0")/.."
     exit 2
 }
 command -v docker >/dev/null || { printf 'Docker is required for this integration runner.\n' >&2; exit 2; }
+ubuntu_version=${UBUNTU_VERSION:-26.04}
+[[ $ubuntu_version == 24.04 || $ubuntu_version == 26.04 ]] || {
+    printf 'Supported Ubuntu releases: 24.04 and 26.04.\n' >&2
+    exit 2
+}
 context=$(mktemp -d)
-container=octovault-authorization-${GITHUB_RUN_ID:-$$}
-image=octovault-authorization-ci:${GITHUB_RUN_ID:-local}
+container=octovault-authorization-${ubuntu_version}-${GITHUB_RUN_ID:-$$}
+image=octovault-authorization-ci:${ubuntu_version}-${GITHUB_RUN_ID:-local}
 cleanup() {
     local status=$?
     if ((status != 0)); then
@@ -24,7 +29,8 @@ cleanup() {
 }
 trap cleanup EXIT
 cat >"$context/Dockerfile" <<'DOCKERFILE'
-FROM ubuntu:26.04
+ARG UBUNTU_VERSION=26.04
+FROM ubuntu:${UBUNTU_VERSION}
 ENV container=docker
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
     systemd systemd-sysv dbus dbus-user-session polkitd libpam-systemd login passwd util-linux \
@@ -38,7 +44,7 @@ STOPSIGNAL SIGRTMIN+3
 # has no VTs; the test must never switch the hosted runner's virtual consoles.
 CMD ["/bin/sh", "-c", "rm -f /dev/tty0; exec /sbin/init"]
 DOCKERFILE
-docker build --tag "$image" "$context"
+docker build --build-arg "UBUNTU_VERSION=$ubuntu_version" --tag "$image" "$context"
 # This writable cgroup mount belongs to the disposable hosted runner. It lets
 # systemd create genuine user login sessions instead of replacing logind.
 docker run --detach --name "$container" --privileged --cgroupns=host \

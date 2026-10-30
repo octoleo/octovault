@@ -16,7 +16,7 @@ GUI_CFLAGS := $(shell $(PKG_CONFIG) --cflags $(GUI_PKGS))
 GUI_LIBS := $(shell $(PKG_CONFIG) --libs $(GUI_PKGS))
 
 .PHONY: all gui check test lint install clean package
-all: build/octovault build/octovaultd build/octovault-session build/pinentry-octovault build/steghide build/fido2 gui
+all: build/octovault build/octovaultd build/octovault-session build/pinentry-octovault build/steghide build/fido2 build/text-carrier gui
 gui: build/octovault-gtk
 
 build:
@@ -43,6 +43,9 @@ build/fido2: src/service/fido2.c | build
 build/steghide: src/service/steghide.c | build
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ $(LDFLAGS) -lutil
 
+build/text-carrier: src/service/text-carrier.c | build
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(shell $(PKG_CONFIG) --cflags glib-2.0) $< -o $@ $(LDFLAGS) $(shell $(PKG_CONFIG) --libs glib-2.0)
+
 lint:
 	@while IFS= read -r -d '' source; do bash -n "$$source" || exit; done < <(find lib scripts tests -type f -name '*.sh' -print0)
 	@for source in lib/octovault/backend lib/octovault/run-plan lib/octovault/event-system lib/octovault/priority-backend; do bash -n "$$source" || exit; done
@@ -63,6 +66,7 @@ install: all
 	install -m 0755 build/octovaultd $(DESTDIR)$(PREFIX)/libexec/octovault/daemon
 	install -m 0755 build/steghide $(DESTDIR)$(PREFIX)/libexec/octovault/steghide
 	install -m 0755 build/fido2 $(DESTDIR)$(PREFIX)/libexec/octovault/fido2
+	install -m 0755 build/text-carrier $(DESTDIR)$(PREFIX)/libexec/octovault/text-carrier
 	install -m 0755 lib/octovault/backend $(DESTDIR)$(PREFIX)/libexec/octovault/backend
 	install -m 0755 lib/octovault/run-plan lib/octovault/event-system lib/octovault/priority-backend $(DESTDIR)$(PREFIX)/libexec/octovault/
 	install -m 0644 lib/octovault/*.sh $(DESTDIR)$(PREFIX)/lib/octovault/
@@ -91,7 +95,7 @@ install: all
 	install -m 0644 docs/octovault.1 $(DESTDIR)$(PREFIX)/share/man/man1/
 
 package:
-	dpkg-buildpackage -us -uc -b
+	bash scripts/build-package.sh
 
 clean:
 	rm -rf build

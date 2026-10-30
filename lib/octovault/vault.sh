@@ -173,7 +173,7 @@ ov_vault_text_embed() {
     local key=$1 cipher=$2 output=$3
     ov_vault_temporary
     ov_as_user cat -- "$cipher" > "$OV_VAULT_TEMP_DIR/cloak-cipher" || return 1
-    /usr/libexec/tomb/cloakify -i "$key" -c "$OV_VAULT_TEMP_DIR/cloak-cipher" > "$output"
+    /usr/libexec/octovault/text-carrier encode "$key" "$OV_VAULT_TEMP_DIR/cloak-cipher" "$output"
 }
 
 ov_vault_plain_key() {
@@ -186,7 +186,7 @@ ov_vault_plain_key() {
         text)
             ov_as_user cat -- "$key" > "$OV_VAULT_TEMP_DIR/cloaked.txt" || ov_fail key_failed "The text carrier cannot be read."
             ov_as_user cat -- "$(ov_vault_field "$record" cipher_file)" > "$OV_VAULT_TEMP_DIR/cloak-cipher" || ov_fail key_failed "The cipher file cannot be read."
-            /usr/libexec/tomb/decloakify -i "$OV_VAULT_TEMP_DIR/cloaked.txt" -c "$OV_VAULT_TEMP_DIR/cloak-cipher" -o "$OV_VAULT_MATERIALIZED_KEY" >&2 ||
+            /usr/libexec/octovault/text-carrier decode "$OV_VAULT_TEMP_DIR/cloaked.txt" "$OV_VAULT_TEMP_DIR/cloak-cipher" "$OV_VAULT_MATERIALIZED_KEY" >&2 ||
                 ov_fail key_failed "The text key could not be decoded; verify the cipher file and installed encryption extras."
             ;;
         *) ov_as_user cat -- "$key" > "$OV_VAULT_MATERIALIZED_KEY" || ov_fail key_failed "The encrypted key cannot be read by your account." ;;
@@ -673,10 +673,38 @@ ov_vault_tomb() {
             done
             command cat "$@"
         }
+        # Tomb 2.9 reads native metadata through its own mapfile helper.
+        # Route only that legacy helper through the same guarded reader.
+        if (( $+functions[_cat] )); then
+            _cat() { cat "$@"; }
+        fi
         if [[ $1 == close || $1 == slam ]]; then
             OPTS[--no-color]=1; OPTS[-n]=1
-            [[ $1 == slam ]] && SLAM=1
-            umount_tomb "$2"
+            if (( $+functions[slam_tomb] )); then
+                # Noble ships Tomb 2.9, whose mount lookup accepts labels
+                # rather than mapper hashes. Never fall back to a label:
+                # two users can own vaults with identical filenames.
+                OV_TOMB_LEGACY_SOURCE=$(command findmnt -rn --mountpoint "$OV_TOMB_ENGINE" --output SOURCE) || exit 1
+                [[ "$OV_TOMB_LEGACY_SOURCE" == /dev/mapper/tomb.*."$2".* ]] || exit 1
+                list_tomb_mounts() {
+                    command findmnt -rn --mountpoint "$OV_TOMB_ENGINE" --output SOURCE,TARGET,FSTYPE,OPTIONS,LABEL |
+                        awk "{ print \$1 \";\" \$2 \";\" \$3 \";(\" \$4 \");[\" \$5 \"]\" }"
+                }
+                # OctoVault unbinds its verified exposures itself; legacy
+                # Tomb discovers binds by label and could touch another vault.
+                list_tomb_binds() { return 0; }
+                if [[ $1 == slam ]]; then
+                    # Legacy slam normally unmounts immediately after killing
+                    # holders. Keep the engine mounted until OctoVault removes
+                    # its verified bind exposures, then its normal-close retry
+                    # invokes the original umount_tomb in a fresh process.
+                    umount_tomb() { return 0; }
+                    slam_tomb "$2"
+                else umount_tomb "$2"; fi
+            else
+                [[ $1 == slam ]] && SLAM=1
+                umount_tomb "$2"
+            fi
         else
             main --no-color "$@"
         fi
@@ -685,8 +713,8 @@ ov_vault_tomb() {
         [[ -x /usr/bin/pinentry-octovault ]] || ov_fail missing_dependency "OctoVault's secure passphrase adapter is missing."
         ov_vault_temporary
         install -d -m 0700 "$OV_VAULT_TEMP_DIR/pinentry"
-        # Tomb 2.13 finds backends with which and checks them with ldd. This
-        # root-only scoped PATH selects our ELF helper without replacing Tomb.
+        # Tomb 2.9 finds pinentry-curses through PATH; newer Tomb also checks
+        # its ELF dependencies. Both use our root-only scoped adapter.
         for backend in pinentry pinentry-curses pinentry-tty; do
             ln -sf /usr/bin/pinentry-octovault "$OV_VAULT_TEMP_DIR/pinentry/$backend"
         done
@@ -998,8 +1026,8 @@ ov_vault_create() {
         fi
     fi
     if [[ $auth == text ]]; then
-        if [[ ! -x /usr/libexec/tomb/cloakify || ! -x /usr/libexec/tomb/decloakify ]]; then
-            ov_fail missing_dependency "The encryption engine text-cloaking helpers are missing. Reinstall the required dependency."
+        if [[ ! -x /usr/libexec/octovault/text-carrier ]]; then
+            ov_fail missing_dependency "OctoVault's text-carrier helper is missing. Reinstall OctoVault."
         fi
         cipher=$(ov_param cipher_file)
         ov_as_user test -r "${cipher:-/usr/share/octovault/cloak-ciphers/words}" || ov_fail not_found "The cloak cipher file is unavailable."

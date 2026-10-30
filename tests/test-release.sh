@@ -10,6 +10,7 @@ version=$(bash "$root/scripts/version.sh")
 commit=1111111111111111111111111111111111111111
 other_commit=2222222222222222222222222222222222222222
 filename="octovault_${version}_ubuntu26.04_amd64.deb"
+ubuntu_versions=(24.04 26.04)
 mkdir -p "$task_tmp/bin" "$task_tmp/package/DEBIAN" "$task_tmp/package/usr/share/octovault" "$task_tmp/original"
 cat >"$task_tmp/package/DEBIAN/control" <<EOF
 Package: octovault
@@ -18,9 +19,12 @@ Architecture: amd64
 Maintainer: OctoVault test fixture <fixture@example.invalid>
 Description: Disposable release publication test fixture
 EOF
-printf 'Release verification fixture\n' >"$task_tmp/package/usr/share/octovault/fixture"
-dpkg-deb --build --root-owner-group "$task_tmp/package" "$task_tmp/original/$filename" >/dev/null
-(cd "$task_tmp/original" && sha256sum "$filename" >SHA256SUMS-ubuntu26.04)
+for ubuntu in "${ubuntu_versions[@]}"; do
+    package_name="octovault_${version}_ubuntu${ubuntu}_amd64.deb"
+    printf 'Release verification fixture for Ubuntu %s\n' "$ubuntu" >"$task_tmp/package/usr/share/octovault/fixture"
+    dpkg-deb --build --root-owner-group "$task_tmp/package" "$task_tmp/original/$package_name" >/dev/null
+    (cd "$task_tmp/original" && sha256sum "$package_name" >"SHA256SUMS-ubuntu$ubuntu")
+done
 
 cat >"$task_tmp/bin/gh" <<'FIXTURE'
 #!/usr/bin/env bash
@@ -73,6 +77,7 @@ case $operation in
             esac
         done
         [[ $target == "$MOCK_COMMIT" && $draft == true && -s $notes ]]
+        cp "$notes" "$MOCK_STATE/notes.md"
         jq -n --arg tag "$MOCK_TAG" --arg target "$target" '{tag_name:$tag,draft:true,target_commitish:$target}' >"$MOCK_STATE/release.json"
         ;;
     view)
@@ -176,8 +181,13 @@ run_success
 assert_available true
 grep -Fxq "tag=v$version" "$GITHUB_OUTPUT"
 jq -e '.draft == false' "$MOCK_STATE/release.json" >/dev/null
-cmp "$task_tmp/original/$filename" "$MOCK_STATE/assets/$filename"
-cmp "$task_tmp/original/SHA256SUMS-ubuntu26.04" "$MOCK_STATE/assets/SHA256SUMS-ubuntu26.04"
+for ubuntu in "${ubuntu_versions[@]}"; do
+    package_name="octovault_${version}_ubuntu${ubuntu}_amd64.deb"
+    cmp "$task_tmp/original/$package_name" "$MOCK_STATE/assets/$package_name"
+    cmp "$task_tmp/original/SHA256SUMS-ubuntu$ubuntu" "$MOCK_STATE/assets/SHA256SUMS-ubuntu$ubuntu"
+    grep -Fq "sudo apt install ./$package_name" "$MOCK_STATE/notes.md"
+done
+[[ $(find "$MOCK_STATE/assets" -maxdepth 1 -type f | wc -l) == 4 ]]
 [[ $(grep -c '^release create ' "$MOCK_STATE/calls") == 1 ]]
 grep -q '^release download ' "$MOCK_STATE/calls"
 
@@ -215,10 +225,23 @@ fixture_release true "$other_commit"
 run_failure
 assert_no_mutations
 
-start_case bad-checksum
-printf 'corruption\n' >>"$MOCK_STATE/artifacts/$filename"
-run_failure
-assert_no_mutations
+for ubuntu in "${ubuntu_versions[@]}"; do
+    package_name="octovault_${version}_ubuntu${ubuntu}_amd64.deb"
+    start_case "bad-checksum-$ubuntu"
+    printf 'corruption\n' >>"$MOCK_STATE/artifacts/$package_name"
+    run_failure
+    assert_no_mutations
+
+    start_case "missing-package-$ubuntu"
+    rm "$MOCK_STATE/artifacts/$package_name"
+    run_failure
+    assert_no_mutations
+
+    start_case "missing-checksum-$ubuntu"
+    rm "$MOCK_STATE/artifacts/SHA256SUMS-ubuntu$ubuntu"
+    run_failure
+    assert_no_mutations
+done
 
 for failure in corrupt-download unexpected-asset main-moved; do
     start_case "$failure"

@@ -27,7 +27,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        ubuntu: ['26.04']
+        ubuntu: ['24.04', '26.04']
     steps:
       - name: Install build and integration-test dependencies
         run: |
@@ -39,10 +39,9 @@ jobs:
       - name: Build, lint, and run tests inside Debian packaging
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          make build/text-carrier
           bash scripts/test-tomb-capabilities.sh
-          dpkg-buildpackage -us -uc -b
-          version=$(cat VERSION)
-          bash scripts/test-packaging.sh "../octovault_${version}_amd64.deb"
+          bash scripts/build-package.sh
       - name: Run actual native interface as an ordinary desktop user
         run: |
           useradd --create-home octovault-test
@@ -84,15 +83,6 @@ jobs:
         run: |
           version=$(cat VERSION)
           bash scripts/test-package-lifecycle.sh --disposable-system "../octovault_${version}_amd64.deb"
-      - name: Prepare versioned downloads
-        env:
-          UBUNTU_VERSION: ${{ matrix.ubuntu }}
-        run: |
-          mkdir -p dist
-          version=$(cat VERSION)
-          cp "../octovault_${version}_amd64.deb" "dist/octovault_${version}_ubuntu${UBUNTU_VERSION}_amd64.deb"
-          cd dist
-          sha256sum *.deb > "SHA256SUMS-ubuntu${UBUNTU_VERSION}"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: octovault-ubuntu-${{ matrix.ubuntu }}-amd64
@@ -101,18 +91,24 @@ jobs:
           retention-days: 30
 
   vault-integration:
-    name: Real Tomb encryption and mounts
+    name: Real Tomb encryption and mounts (Ubuntu ${{ matrix.ubuntu }})
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        ubuntu: ['24.04', '26.04']
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
       - name: Exercise vault creation, actual mounts, migration, and closure
+        env:
+          UBUNTU_VERSION: ${{ matrix.ubuntu }}
         run: |
           # Hosted runners have swap enabled; remove it only in this disposable
           # host VM, where the swapfile is accessible. The app retains Tomb's
-          # swap safeguard. The actual dependency and tests run on Ubuntu 26.04.
+          # swap safeguard. Test each release's actual distribution dependencies.
           sudo swapoff -a
           sudo modprobe dm_mod
           sudo modprobe loop
@@ -120,12 +116,16 @@ jobs:
             --volume /lib/modules:/lib/modules:ro \
             --volume "$GITHUB_WORKSPACE:/workspace" --workdir /workspace \
             --env CI=true --env OCTOVAULT_DISPOSABLE_TEST=1 \
-            ubuntu:26.04 bash scripts/test-vault-container.sh
+            "ubuntu:$UBUNTU_VERSION" bash scripts/test-vault-container.sh
 
   authorization-integration:
-    name: Real Polkit, PAM and login-session authorization
+    name: Real Polkit, PAM and login-session authorization (Ubuntu ${{ matrix.ubuntu }})
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        ubuntu: ['24.04', '26.04']
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -133,6 +133,7 @@ jobs:
       - name: Exercise administrator approval and non-sudo personal access
         env:
           OCTOVAULT_DISPOSABLE_TEST: '1'
+          UBUNTU_VERSION: ${{ matrix.ubuntu }}
         run: bash scripts/test-authorization-container.sh
 
   distribution:
@@ -158,7 +159,7 @@ jobs:
           pattern: octovault-ubuntu-*-amd64
           path: packages
           merge-multiple: true
-      - name: Build inspectable APT repository from the real Debian package
+      - name: Build inspectable APT repository from both real Debian packages
         run: bash scripts/apt-repository.sh --input packages --output apt-test
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -286,8 +287,10 @@ jobs:
           APT_REPOSITORY_URL: ${{ vars.APT_REPOSITORY_URL }}
         run: |
           bash scripts/apt-repository.sh --input packages --output apt-public
-          test -f apt-public/dists/resolute/InRelease
-          test -f apt-public/dists/resolute/Release.gpg
+          for suite in noble resolute; do
+            test -f "apt-public/dists/$suite/InRelease"
+            test -f "apt-public/dists/$suite/Release.gpg"
+          done
           test ! -e apt-public/UNSIGNED-TEST-ONLY
       - uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b # v4
         if: steps.gate.outputs.current == 'true'

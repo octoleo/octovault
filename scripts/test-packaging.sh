@@ -16,7 +16,7 @@ if [[ $# == 1 ]]; then
     [[ $(dpkg-deb -f "$package" Package) == octovault ]]
     [[ $(dpkg-deb -f "$package" Version) == "$(cat VERSION)" ]]
     contents=$(dpkg-deb --contents "$package")
-    for path in usr/bin/octovault usr/bin/octovault-gtk usr/bin/octovault-session usr/bin/pinentry-octovault usr/libexec/octovault/backend usr/libexec/octovault/daemon usr/libexec/octovault/fido2 usr/libexec/octovault/run-plan usr/libexec/octovault/event-system usr/libexec/octovault/priority-backend usr/share/octovault/cloak-ciphers/words usr/share/polkit-1/actions/io.vdm.octovault.policy usr/share/dbus-1/system.d/io.vdm.OctoVault1.conf; do
+    for path in usr/bin/octovault usr/bin/octovault-gtk usr/bin/octovault-session usr/bin/pinentry-octovault usr/libexec/octovault/backend usr/libexec/octovault/daemon usr/libexec/octovault/fido2 usr/libexec/octovault/text-carrier usr/libexec/octovault/run-plan usr/libexec/octovault/event-system usr/libexec/octovault/priority-backend usr/share/octovault/cloak-ciphers/words usr/share/polkit-1/actions/io.vdm.octovault.policy usr/share/dbus-1/system.d/io.vdm.OctoVault1.conf; do
         [[ $contents == *"./$path"* ]] || { printf 'Package missing %s\n' "$path" >&2; exit 1; }
     done
     dependencies=$(dpkg-deb -f "$package" Depends)

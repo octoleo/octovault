@@ -17,8 +17,9 @@ apt_test_cleanup() {
 }
 trap apt_test_cleanup EXIT
 version=$(bash scripts/version.sh)
-name="octovault_${version}_ubuntu26.04_amd64.deb"
-mkdir -p "$apt_test_root/package/DEBIAN" "$apt_test_root/input" "$apt_test_root/keyhome"
+ubuntu_versions=(24.04 26.04)
+declare -A suites=([24.04]=noble [26.04]=resolute)
+mkdir -p "$apt_test_root/package/DEBIAN" "$apt_test_root/package/usr/share/octovault" "$apt_test_root/input" "$apt_test_root/keyhome"
 chmod 0755 "$apt_test_root/package/DEBIAN"
 cat >"$apt_test_root/package/DEBIAN/control" <<CONTROL
 Package: octovault
@@ -27,21 +28,33 @@ Architecture: amd64
 Maintainer: OctoVault isolated CI fixture <fixture@example.invalid>
 Description: Synthetic repository test package; never installed
 CONTROL
-dpkg-deb --root-owner-group --build "$apt_test_root/package" "$apt_test_root/input/$name" >/dev/null
-(cd "$apt_test_root/input" && sha256sum "$name" >SHA256SUMS-ubuntu26.04)
+for ubuntu in "${ubuntu_versions[@]}"; do
+    name="octovault_${version}_ubuntu${ubuntu}_amd64.deb"
+    printf 'Ubuntu %s repository fixture\n' "$ubuntu" >"$apt_test_root/package/usr/share/octovault/fixture"
+    dpkg-deb --root-owner-group --build "$apt_test_root/package" "$apt_test_root/input/$name" >/dev/null
+    (cd "$apt_test_root/input" && sha256sum "$name" >"SHA256SUMS-ubuntu$ubuntu")
+done
 bash scripts/apt-repository.sh --input "$apt_test_root/input" --output "$apt_test_root/unsigned" >"$apt_test_root/unsigned.log" 2>&1
 test -f "$apt_test_root/unsigned/UNSIGNED-TEST-ONLY"
-test ! -e "$apt_test_root/unsigned/dists/resolute/InRelease"
-test ! -e "$apt_test_root/unsigned/octovault-resolute.sources"
 test ! -e "$apt_test_root/unsigned/octovault-archive-keyring.gpg"
 (cd "$apt_test_root/unsigned" && sha256sum --check SHA256SUMS >/dev/null)
-cmp "$apt_test_root/input/$name" "$apt_test_root/unsigned/pool/resolute/main/o/octovault/$name"
-grep -Fxq "Filename: pool/resolute/main/o/octovault/$name" "$apt_test_root/unsigned/dists/resolute/main/binary-amd64/Packages"
-gzip -t "$apt_test_root/unsigned/dists/resolute/main/binary-amd64/Packages.gz"
-gzip -t "$apt_test_root/unsigned/dists/resolute/main/dep11/Components-amd64.yml.gz"
-appstreamcli convert "$apt_test_root/unsigned/dists/resolute/main/dep11/Components-amd64.yml" "$apt_test_root/roundtrip.xml" >/dev/null
-[[ $(xmllint --xpath 'string(/components/component/pkgname)' "$apt_test_root/roundtrip.xml") == octovault ]]
-appstreamcli validate --no-net "$apt_test_root/roundtrip.xml" >/dev/null
+for ubuntu in "${ubuntu_versions[@]}"; do
+    suite=${suites[$ubuntu]}
+    name="octovault_${version}_ubuntu${ubuntu}_amd64.deb"
+    test ! -e "$apt_test_root/unsigned/dists/$suite/InRelease"
+    test ! -e "$apt_test_root/unsigned/octovault-$suite.sources"
+    cmp "$apt_test_root/input/$name" "$apt_test_root/unsigned/pool/$suite/main/o/octovault/$name"
+    grep -Fxq "Filename: pool/$suite/main/o/octovault/$name" "$apt_test_root/unsigned/dists/$suite/main/binary-amd64/Packages"
+    [[ $(grep -c '^Package: ' "$apt_test_root/unsigned/dists/$suite/main/binary-amd64/Packages") == 1 ]]
+    grep -Fxq "Codename: $suite" "$apt_test_root/unsigned/dists/$suite/Release"
+    grep -Fxq "Suite: $suite" "$apt_test_root/unsigned/dists/$suite/Release"
+    gzip -t "$apt_test_root/unsigned/dists/$suite/main/binary-amd64/Packages.gz"
+    gzip -t "$apt_test_root/unsigned/dists/$suite/main/dep11/Components-amd64.yml.gz"
+    appstreamcli convert "$apt_test_root/unsigned/dists/$suite/main/dep11/Components-amd64.yml" "$apt_test_root/roundtrip-$suite.xml" >/dev/null
+    [[ $(xmllint --xpath 'string(/components/component/pkgname)' "$apt_test_root/roundtrip-$suite.xml") == octovault ]]
+    [[ $(xmllint --xpath 'string(/components/@origin)' "$apt_test_root/roundtrip-$suite.xml") == "octovault-$suite-main" ]]
+    appstreamcli validate --no-net "$apt_test_root/roundtrip-$suite.xml" >/dev/null
+done
 
 reject_build() {
     if bash scripts/apt-repository.sh --input "$apt_test_root/input" --output "$apt_test_root/rejected" >"$apt_test_root/reject.log" 2>&1; then
@@ -51,21 +64,31 @@ reject_build() {
 }
 # Package bytes, manifests, output paths, and distribution metadata are checked
 # before any signing credentials can reach the repository.
-printf 'corruption' >>"$apt_test_root/input/$name"
-reject_build
-cp "$apt_test_root/unsigned/pool/resolute/main/o/octovault/$name" "$apt_test_root/input/$name"
+for ubuntu in "${ubuntu_versions[@]}"; do
+    suite=${suites[$ubuntu]}
+    name="octovault_${version}_ubuntu${ubuntu}_amd64.deb"
+    printf 'corruption' >>"$apt_test_root/input/$name"
+    reject_build
+    cp "$apt_test_root/unsigned/pool/$suite/main/o/octovault/$name" "$apt_test_root/input/$name"
+    mv "$apt_test_root/input/$name" "$apt_test_root/held.deb"
+    reject_build
+    ln -s "$apt_test_root/held.deb" "$apt_test_root/input/$name"
+    reject_build
+    rm "$apt_test_root/input/$name"
+    mv "$apt_test_root/held.deb" "$apt_test_root/input/$name"
+    mv "$apt_test_root/input/SHA256SUMS-ubuntu$ubuntu" "$apt_test_root/checksum"
+    reject_build
+    printf 'malformed manifest\n' >"$apt_test_root/input/SHA256SUMS-ubuntu$ubuntu"
+    reject_build
+    rm "$apt_test_root/input/SHA256SUMS-ubuntu$ubuntu"
+    ln -s "$apt_test_root/checksum" "$apt_test_root/input/SHA256SUMS-ubuntu$ubuntu"
+    reject_build
+    rm "$apt_test_root/input/SHA256SUMS-ubuntu$ubuntu"
+    mv "$apt_test_root/checksum" "$apt_test_root/input/SHA256SUMS-ubuntu$ubuntu"
+done
 cp "$apt_test_root/input/$name" "$apt_test_root/input/unexpected.deb"
 reject_build
 rm "$apt_test_root/input/unexpected.deb"
-cp "$apt_test_root/input/SHA256SUMS-ubuntu26.04" "$apt_test_root/checksum"
-printf 'malformed manifest\n' >"$apt_test_root/input/SHA256SUMS-ubuntu26.04"
-reject_build
-cp "$apt_test_root/checksum" "$apt_test_root/input/SHA256SUMS-ubuntu26.04"
-mv "$apt_test_root/input/$name" "$apt_test_root/held.deb"
-ln -s "$apt_test_root/held.deb" "$apt_test_root/input/$name"
-reject_build
-rm "$apt_test_root/input/$name"
-mv "$apt_test_root/held.deb" "$apt_test_root/input/$name"
 if bash scripts/apt-repository.sh --input "$apt_test_root/input" --output "$apt_test_root/unsigned" >/dev/null 2>&1; then
     printf 'FAIL: existing APT output was overwritten.\n' >&2; exit 1
 fi
@@ -100,26 +123,31 @@ test -n "$APT_SIGNING_KEY"
 # Tracing must be shut off before any private key/passphrase is read.
 bash -x scripts/apt-repository.sh --input "$apt_test_root/input" --output "$apt_test_root/signed" >"$apt_test_root/signed.log" 2>&1
 test ! -e "$apt_test_root/signed/UNSIGNED-TEST-ONLY"
-grep -Fxq 'Signed-By: /etc/apt/keyrings/octovault-archive-keyring.gpg' "$apt_test_root/signed/octovault-resolute.sources"
-grep -Fxq 'URIs: https://example.invalid/apt' "$apt_test_root/signed/octovault-resolute.sources"
 [[ $(cat "$apt_test_root/signed/octovault-archive-keyring.fingerprint") == "$APT_SIGNING_KEY_FINGERPRINT" ]]
-gpgv --homedir "$apt_test_root/keyhome" --keyring "$apt_test_root/signed/octovault-archive-keyring.gpg" \
-    "$apt_test_root/signed/dists/resolute/InRelease" >/dev/null 2>&1
-gpgv --homedir "$apt_test_root/keyhome" --keyring "$apt_test_root/signed/octovault-archive-keyring.gpg" \
-    "$apt_test_root/signed/dists/resolute/Release.gpg" "$apt_test_root/signed/dists/resolute/Release" >/dev/null 2>&1
+for suite in noble resolute; do
+    grep -Fxq 'Signed-By: /etc/apt/keyrings/octovault-archive-keyring.gpg' "$apt_test_root/signed/octovault-$suite.sources"
+    grep -Fxq 'URIs: https://example.invalid/apt' "$apt_test_root/signed/octovault-$suite.sources"
+    grep -Fxq "Suites: $suite" "$apt_test_root/signed/octovault-$suite.sources"
+    gpgv --homedir "$apt_test_root/keyhome" --keyring "$apt_test_root/signed/octovault-archive-keyring.gpg" \
+        "$apt_test_root/signed/dists/$suite/InRelease" >/dev/null 2>&1
+    gpgv --homedir "$apt_test_root/keyhome" --keyring "$apt_test_root/signed/octovault-archive-keyring.gpg" \
+        "$apt_test_root/signed/dists/$suite/Release.gpg" "$apt_test_root/signed/dists/$suite/Release" >/dev/null 2>&1
+done
 (cd "$apt_test_root/signed" && sha256sum --check SHA256SUMS >/dev/null)
 verify_release_hashes() (
-    cd "$apt_test_root/signed/dists/resolute"
+    cd "$apt_test_root/signed/dists/$1"
     awk '/^SHA256:/ {section=1; next} /^[^ ]/ {section=0} section {print $1 "  " $3}' Release | sha256sum --check >/dev/null 2>&1
 )
-verify_release_hashes
-printf 'changed index\n' >>"$apt_test_root/signed/dists/resolute/main/binary-amd64/Packages"
-if verify_release_hashes; then printf 'FAIL: changed package index was accepted.\n' >&2; exit 1; fi
-printf 'changed metadata\n' >>"$apt_test_root/signed/dists/resolute/Release"
-if gpgv --homedir "$apt_test_root/keyhome" --keyring "$apt_test_root/signed/octovault-archive-keyring.gpg" \
-    "$apt_test_root/signed/dists/resolute/Release.gpg" "$apt_test_root/signed/dists/resolute/Release" >/dev/null 2>&1; then
-    printf 'FAIL: changed release metadata was accepted.\n' >&2; exit 1
-fi
+for suite in noble resolute; do
+    verify_release_hashes "$suite"
+    printf 'changed index\n' >>"$apt_test_root/signed/dists/$suite/main/binary-amd64/Packages"
+    if verify_release_hashes "$suite"; then printf 'FAIL: changed %s package index was accepted.\n' "$suite" >&2; exit 1; fi
+    printf 'changed metadata\n' >>"$apt_test_root/signed/dists/$suite/Release"
+    if gpgv --homedir "$apt_test_root/keyhome" --keyring "$apt_test_root/signed/octovault-archive-keyring.gpg" \
+        "$apt_test_root/signed/dists/$suite/Release.gpg" "$apt_test_root/signed/dists/$suite/Release" >/dev/null 2>&1; then
+        printf 'FAIL: changed %s release metadata was accepted.\n' "$suite" >&2; exit 1
+    fi
+done
 export APT_SIGNING_KEY_FINGERPRINT=0000000000000000000000000000000000000000
 reject_build
 APT_SIGNING_KEY_FINGERPRINT=$(cat "$apt_test_root/signed/octovault-archive-keyring.fingerprint")
@@ -132,4 +160,4 @@ if grep -rFq -- 'BEGIN PGP PRIVATE KEY' "$apt_test_root/signed" ||
     printf 'FAIL: signing material leaked into published output or logs.\n' >&2; exit 1
 fi
 [[ -z $(find "$apt_test_root" -maxdepth 1 -name '.octovault-apt.*' -print -quit) ]]
-printf 'APT: unsigned catalog, package hashes, real protected-key signing, signature/index tampering, credential rejection and secret isolation passed\n'
+printf 'APT: both Ubuntu suites, isolated package catalogs, complete release inputs, protected-key signing, tampering rejection and secret isolation passed\n'
