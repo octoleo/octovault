@@ -65,7 +65,7 @@ fail:
     return NULL;
 }
 
-/* Python's text helpers accept LF and CRLF. Normalize only line endings;
+/* Python's text helpers accept LF, CRLF and CR. Normalize only line endings;
  * spaces and Unicode inside each token remain part of the exact word map.
  */
 static char **text_lines(const char *text, gsize length, gsize *count, GError **error)
@@ -74,15 +74,23 @@ static char **text_lines(const char *text, gsize length, gsize *count, GError **
         invalid(error, "Text contains invalid UTF-8 or a NUL byte.");
         return NULL;
     }
-    char **lines = g_strsplit(text, "\n", -1);
+    char *normalized = g_malloc(length + 1);
+    gsize written = 0;
+    for (gsize i = 0; i < length; i++) {
+        if (text[i] == '\r') {
+            normalized[written++] = '\n';
+            if (i + 1 < length && text[i + 1] == '\n') i++;
+        } else normalized[written++] = text[i];
+    }
+    normalized[written] = '\0';
+    char **lines = g_strsplit(normalized, "\n", -1);
+    g_free(normalized);
     *count = g_strv_length(lines);
     if (*count && !*lines[*count - 1]) (*count)--;
     for (gsize i = 0; i < *count; i++) {
-        gsize size = strlen(lines[i]);
-        if (size && lines[i][size - 1] == '\r') lines[i][--size] = '\0';
-        if (!size || strchr(lines[i], '\r')) {
+        if (!*lines[i]) {
             g_strfreev(lines);
-            invalid(error, "Text contains a blank line or invalid line ending.");
+            invalid(error, "Text contains a blank line.");
             return NULL;
         }
     }
@@ -97,9 +105,9 @@ static char **load_cipher(const char *path, GHashTable *lookup, GError **error)
     char **lines = text_lines(data, length, &count, error);
     g_free(data);
     if (!lines) return NULL;
-    if (count < 66) {
+    if (count < sizeof(alphabet) - 1) {
         g_strfreev(lines);
-        invalid(error, "A cipher requires at least 66 unique, nonempty lines.");
+        invalid(error, "A cipher requires at least 65 unique, nonempty lines.");
         return NULL;
     }
     for (gsize i = 0; i < count; i++) {

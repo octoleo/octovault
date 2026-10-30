@@ -80,14 +80,20 @@ start_client() {
     exec {output}<>"$work/$user/output"
     inputs[$user]=$input; outputs[$user]=$output
     units[$user]=octovault-authorization-$user.service
+    # systemd 255's PAM child retains the Type=exec notification pipe, leaving
+    # a working agent in "activating" until its startup timeout kills it.
+    # Use simple with the real agent's bounded JSON readiness handshake below;
+    # give the whole fixture its own runtime limit, separate from startup.
     systemd-run --quiet --wait --collect --pipe --unit="${units[$user]}" \
-        --uid="$user" "${session_options[@]}" --property=Type=exec --property=TimeoutStartSec=30s \
+        --uid="$user" "${session_options[@]}" --property=Type=simple \
+        --property=TimeoutStartSec=30s --property=RuntimeMaxSec=10min --property=TimeoutStopSec=30s \
         --setenv=OCTOVAULT_DISPOSABLE_TEST=1 --setenv=G_DEBUG=fatal-criticals \
         "$work/agent" "$administrator" "$work/$user/credentials.json" \
         <"$work/$user/input" >"$work/$user/output" 2>"$work/$user/client.err" &
     drivers[$user]=$!
     IFS= read -r -t 40 last <&"$output"
     check '.response.ready == true'
+    systemctl is-active --quiet "${units[$user]}"
     session=$(jq -r .response.session <<< "$last")
     sessions[$user]=$session
     if [[ $mode == headless ]]; then [[ -z $session ]]; return; fi

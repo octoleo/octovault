@@ -49,8 +49,29 @@ cmp "$work/binary" "$work/unicode.key"
 sed 's/$/\r/' "$work/unicode-cipher" >"$work/crlf-cipher"
 "$carrier" decode "$work/crlf.txt" "$work/crlf-cipher" "$work/crlf.key"
 cmp "$work/binary" "$work/crlf.key"
+tr '\n' '\r' <"$work/unicode-cipher" >"$work/cr-cipher"
+tr '\n' '\r' <"$work/unicode.txt" >"$work/cr.txt"
+"$carrier" decode "$work/cr.txt" "$work/cr-cipher" "$work/cr.key"
+cmp "$work/binary" "$work/cr.key"
 
-head -n 65 "$cipher" >"$work/short-cipher"
+# Tomb's alphabet has 65 symbols, although its sample maps contain 66.
+# Preserve valid existing maps and carriers with no final line ending.
+head -n 65 "$cipher" >"$work/complete-cipher"
+"$carrier" encode "$work/binary" "$work/complete-cipher" "$work/complete.txt"
+"$carrier" decode "$work/complete.txt" "$work/complete-cipher" "$work/complete.key"
+cmp "$work/binary" "$work/complete.key"
+cp "$cipher" "$work/no-newline-cipher"
+truncate -s -1 "$work/no-newline-cipher"
+cp "$work/binary.txt" "$work/no-newline.txt"
+truncate -s -1 "$work/no-newline.txt"
+"$carrier" decode "$work/no-newline.txt" "$work/no-newline-cipher" "$work/no-newline.key"
+cmp "$work/binary" "$work/no-newline.key"
+sed 's/^/  /;s/$/  /' "$cipher" >"$work/padded-cipher"
+"$carrier" encode "$work/binary" "$work/padded-cipher" "$work/padded.txt"
+"$carrier" decode "$work/padded.txt" "$work/padded-cipher" "$work/padded.key"
+cmp "$work/binary" "$work/padded.key"
+
+head -n 64 "$cipher" >"$work/short-cipher"
 reject encode "$work/binary" "$work/short-cipher"
 sed '2s/.*/amber/' "$cipher" >"$work/duplicate-cipher"
 reject encode "$work/binary" "$work/duplicate-cipher"
@@ -80,6 +101,14 @@ if [[ -x /usr/libexec/tomb/cloakify && -x /usr/libexec/tomb/decloakify ]]; then
     cmp "$work/binary" "$work/from-tomb.key"
     /usr/libexec/tomb/decloakify -i "$work/binary.txt" -c "$cipher" -o "$work/from-native.key"
     cmp "$work/binary" "$work/from-native.key"
+    for map in complete padded no-newline cr; do
+        /usr/libexec/tomb/cloakify -i "$work/binary" -c "$work/$map-cipher" -o "$work/$map-tomb.txt"
+        "$carrier" decode "$work/$map-tomb.txt" "$work/$map-cipher" "$work/$map-from-tomb.key"
+        cmp "$work/binary" "$work/$map-from-tomb.key"
+        "$carrier" encode "$work/binary" "$work/$map-cipher" "$work/$map-native.txt"
+        /usr/libexec/tomb/decloakify -i "$work/$map-native.txt" -c "$work/$map-cipher" -o "$work/$map-from-native.key"
+        cmp "$work/binary" "$work/$map-from-native.key"
+    done
     printf 'ok - real distribution Tomb text-carrier interoperability\n'
 fi
 printf 'ok - Tomb-compatible binary text carriers, Unicode, strict validation and atomic output\n'
