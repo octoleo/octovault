@@ -13,15 +13,16 @@ aptrepo_main() (
     export -n signing_key passphrase
     unset APT_SIGNING_KEY APT_SIGNING_PASSPHRASE
     local fingerprint=${APT_SIGNING_KEY_FINGERPRINT:-} url=${APT_REPOSITORY_URL:-}
-    local input='' output='' work='' keyhome='' signed=false root version file name actual tool mode
-    local -a packages=() primary_keys=() public_keys=()
+    local input='' output='' work='' keyhome='' signed=false root version file name actual tool mode ubuntu suite
+    local -a packages=() primary_keys=() public_keys=() ubuntu_versions=(24.04 26.04)
+    local -A suites=([24.04]=noble [26.04]=resolute)
     while (($#)); do
         case $1 in
             --input) [[ $# -ge 2 && -z $input ]] || return 2; input=$2; shift 2 ;;
             --output) [[ $# -ge 2 && -z $output ]] || return 2; output=$2; shift 2 ;;
             --help)
                 printf '%s\n' 'Usage: bash scripts/apt-repository.sh --input PACKAGES_DIR --output NEW_DIR' \
-                    'Input: octovault_VERSION_ubuntu26.04_amd64.deb and SHA256SUMS-ubuntu26.04.' \
+                    'Input: octovault_VERSION_ubuntu{24.04,26.04}_amd64.deb and each matching SHA256SUMS-ubuntuVERSION.' \
                     'Without credentials, output is explicitly UNSIGNED-TEST-ONLY.' \
                     'Signing: APT_SIGNING_KEY (armored secret), APT_SIGNING_PASSPHRASE (optional secret),' \
                     'APT_SIGNING_KEY_FINGERPRINT (full uppercase primary fingerprint), APT_REPOSITORY_URL (HTTPS).'
@@ -65,21 +66,26 @@ aptrepo_main() (
     shopt -s nullglob
     packages=("$input"/*.deb)
     shopt -u nullglob
-    ((${#packages[@]} == 1)) || { aptrepo_error 'Exactly one Ubuntu 26.04 amd64 release package is required.'; return 1; }
-    file=${packages[0]} name="octovault_${version}_ubuntu26.04_amd64.deb"
-    [[ ${file##*/} == "$name" && -f $file && ! -L $file &&
-        -f $input/SHA256SUMS-ubuntu26.04 && ! -L $input/SHA256SUMS-ubuntu26.04 ]] || {
-        aptrepo_error 'A matching regular package and checksum manifest are required.'; return 1;
+    ((${#packages[@]} == ${#ubuntu_versions[@]})) || {
+        aptrepo_error 'Exactly one amd64 release package for each of Ubuntu 24.04 and 26.04 is required.'; return 1;
     }
-    [[ $(dpkg-deb -f "$file" Package) == octovault && $(dpkg-deb -f "$file" Version) == "$version" &&
-        $(dpkg-deb -f "$file" Architecture) == amd64 ]] || {
-        aptrepo_error 'Package control fields do not match the release filename.'; return 1;
-    }
-    actual=$(sha256sum "$file")
-    # Compare the complete expected manifest; do not follow paths from a supplied manifest.
-    printf '%s  %s\n' "${actual%% *}" "$name" | cmp -s - "$input/SHA256SUMS-ubuntu26.04" || {
-        aptrepo_error 'The package checksum manifest does not match.'; return 1;
-    }
+    for ubuntu in "${ubuntu_versions[@]}"; do
+        name="octovault_${version}_ubuntu${ubuntu}_amd64.deb"
+        file="$input/$name"
+        [[ -f $file && ! -L $file &&
+            -f $input/SHA256SUMS-ubuntu$ubuntu && ! -L $input/SHA256SUMS-ubuntu$ubuntu ]] || {
+            aptrepo_error "A matching regular package and checksum manifest are required for Ubuntu $ubuntu."; return 1;
+        }
+        [[ $(dpkg-deb -f "$file" Package) == octovault && $(dpkg-deb -f "$file" Version) == "$version" &&
+            $(dpkg-deb -f "$file" Architecture) == amd64 ]] || {
+            aptrepo_error "Package control fields do not match the Ubuntu $ubuntu release filename."; return 1;
+        }
+        actual=$(sha256sum "$file")
+        # Compare the complete expected manifest; do not follow paths from a supplied manifest.
+        printf '%s  %s\n' "${actual%% *}" "$name" | cmp -s - "$input/SHA256SUMS-ubuntu$ubuntu" || {
+            aptrepo_error "The Ubuntu $ubuntu package checksum manifest does not match."; return 1;
+        }
+    done
     work=$(mktemp -d "${output%/*}/.octovault-apt.XXXXXXXX")
     # shellcheck disable=SC2317,SC2329
     aptrepo_cleanup() {
@@ -94,33 +100,39 @@ aptrepo_main() (
     mkdir "$work/repository"
     (
         cd "$work/repository"
-        install -D -m 0644 "$file" "pool/resolute/main/o/octovault/$name"
-        mkdir -p dists/resolute/main/binary-amd64 dists/resolute/main/dep11
-        apt-ftparchive --md5=false --sha1=false packages pool/resolute >dists/resolute/main/binary-amd64/Packages
-        gzip -n -9 -c dists/resolute/main/binary-amd64/Packages >dists/resolute/main/binary-amd64/Packages.gz
         # Parse the checked-in XML using the distribution XML parser. The package
         # mapping and repository icon are catalog fields, not upstream metainfo.
         [[ $(xmllint --xpath 'string(/component/id)' "$root/data/io.vdm.OctoVault.metainfo.xml") == io.vdm.OctoVault ]]
-        {
-            printf '<?xml version="1.0" encoding="UTF-8"?>\n<components version="1.0" origin="octovault-resolute-main" architecture="amd64">\n<component type="desktop-application">\n'
-            xmllint --xpath '/component/node()[not(self::pkgname or self::source_pkgname or self::bundle or self::icon)]' "$root/data/io.vdm.OctoVault.metainfo.xml"
-            printf '<pkgname>octovault</pkgname><icon type="remote" width="512" height="512">%s/media/v%s/io.vdm.OctoVault.png</icon>\n</component></components>\n' "$url" "$version"
-        } >dists/resolute/main/dep11/Components-amd64.xml
-        appstreamcli validate --no-net dists/resolute/main/dep11/Components-amd64.xml >&2
-        appstreamcli convert dists/resolute/main/dep11/Components-amd64.xml dists/resolute/main/dep11/Components-amd64.yml >&2
-        gzip -n -9 -c dists/resolute/main/dep11/Components-amd64.yml >dists/resolute/main/dep11/Components-amd64.yml.gz
         install -D -m 0644 "$root/data/icons/hicolor/512x512/apps/io.vdm.OctoVault.png" "media/v$version/io.vdm.OctoVault.png"
-        apt-ftparchive --md5=false --sha1=false \
-            -o APT::FTPArchive::Release::Origin=OctoVault \
-            -o 'APT::FTPArchive::Release::Label=Vast Development Method' \
-            -o APT::FTPArchive::Release::Suite=resolute \
-            -o APT::FTPArchive::Release::Codename=resolute \
-            -o APT::FTPArchive::Release::Architectures=amd64 \
-            -o APT::FTPArchive::Release::Components=main \
-            -o 'APT::FTPArchive::Release::Description=OctoVault native packages and application metadata' \
-            release dists/resolute >Release.tmp
-        mv Release.tmp dists/resolute/Release
-        grep -Fq main/dep11/Components-amd64.yml.gz dists/resolute/Release
+        for ubuntu in "${ubuntu_versions[@]}"; do
+            suite=${suites[$ubuntu]}
+            name="octovault_${version}_ubuntu${ubuntu}_amd64.deb"
+            install -D -m 0644 "$input/$name" "pool/$suite/main/o/octovault/$name"
+            mkdir -p "dists/$suite/main/binary-amd64" "dists/$suite/main/dep11"
+            # Index only this suite's pool: equal app versions have different
+            # distribution library dependencies and must never be interchanged.
+            apt-ftparchive --md5=false --sha1=false packages "pool/$suite" >"dists/$suite/main/binary-amd64/Packages"
+            gzip -n -9 -c "dists/$suite/main/binary-amd64/Packages" >"dists/$suite/main/binary-amd64/Packages.gz"
+            {
+                printf '<?xml version="1.0" encoding="UTF-8"?>\n<components version="1.0" origin="octovault-%s-main" architecture="amd64">\n<component type="desktop-application">\n' "$suite"
+                xmllint --xpath '/component/node()[not(self::pkgname or self::source_pkgname or self::bundle or self::icon)]' "$root/data/io.vdm.OctoVault.metainfo.xml"
+                printf '<pkgname>octovault</pkgname><icon type="remote" width="512" height="512">%s/media/v%s/io.vdm.OctoVault.png</icon>\n</component></components>\n' "$url" "$version"
+            } >"dists/$suite/main/dep11/Components-amd64.xml"
+            appstreamcli validate --no-net "dists/$suite/main/dep11/Components-amd64.xml" >&2
+            appstreamcli convert "dists/$suite/main/dep11/Components-amd64.xml" "dists/$suite/main/dep11/Components-amd64.yml" >&2
+            gzip -n -9 -c "dists/$suite/main/dep11/Components-amd64.yml" >"dists/$suite/main/dep11/Components-amd64.yml.gz"
+            apt-ftparchive --md5=false --sha1=false \
+                -o APT::FTPArchive::Release::Origin=OctoVault \
+                -o 'APT::FTPArchive::Release::Label=Vast Development Method' \
+                -o "APT::FTPArchive::Release::Suite=$suite" \
+                -o "APT::FTPArchive::Release::Codename=$suite" \
+                -o APT::FTPArchive::Release::Architectures=amd64 \
+                -o APT::FTPArchive::Release::Components=main \
+                -o 'APT::FTPArchive::Release::Description=OctoVault native packages and application metadata' \
+                release "dists/$suite" >Release.tmp
+            mv Release.tmp "dists/$suite/Release"
+            grep -Fq main/dep11/Components-amd64.yml.gz "dists/$suite/Release"
+        done
     )
     if [[ $signed == true ]]; then
         for tool in gpg gpgv gpgconf; do command -v "$tool" >/dev/null || { aptrepo_error "Missing signing tool: $tool"; return 1; }; done
@@ -140,36 +152,51 @@ aptrepo_main() (
         gpg --no-options --batch --homedir "$keyhome" --export "$fingerprint" >"$work/repository/octovault-archive-keyring.gpg"
         gpg --no-options --batch --homedir "$keyhome" --armor --export "$fingerprint" >"$work/repository/octovault-archive-keyring.asc"
         printf '%s\n' "$fingerprint" >"$work/repository/octovault-archive-keyring.fingerprint"
-        for mode in clearsign detach-sign; do
-            actual="$work/repository/dists/resolute/InRelease"
-            [[ $mode != detach-sign ]] || actual="$work/repository/dists/resolute/Release.gpg"
-            if ! printf '%s\n' "$passphrase" | gpg --no-options --batch --no-tty --homedir "$keyhome" \
-                --pinentry-mode loopback --passphrase-fd 0 --local-user "$fingerprint" --armor --digest-algo SHA256 \
-                --output "$actual" "--$mode" "$work/repository/dists/resolute/Release" 2>"$keyhome/sign.log"; then
-                aptrepo_error 'Signing failed; check key validity, capability, and passphrase.'; return 1;
-            fi
+        for ubuntu in "${ubuntu_versions[@]}"; do
+            suite=${suites[$ubuntu]}
+            for mode in clearsign detach-sign; do
+                actual="$work/repository/dists/$suite/InRelease"
+                [[ $mode != detach-sign ]] || actual="$work/repository/dists/$suite/Release.gpg"
+                if ! printf '%s\n' "$passphrase" | gpg --no-options --batch --no-tty --homedir "$keyhome" \
+                    --pinentry-mode loopback --passphrase-fd 0 --local-user "$fingerprint" --armor --digest-algo SHA256 \
+                    --output "$actual" "--$mode" "$work/repository/dists/$suite/Release" 2>"$keyhome/sign.log"; then
+                    aptrepo_error "Signing $suite failed; check key validity, capability, and passphrase."; return 1;
+                fi
+            done
+            gpgv --homedir "$keyhome" --keyring "$work/repository/octovault-archive-keyring.gpg" \
+                "$work/repository/dists/$suite/InRelease" >/dev/null 2>"$keyhome/verify.log"
+            gpgv --homedir "$keyhome" --keyring "$work/repository/octovault-archive-keyring.gpg" \
+                "$work/repository/dists/$suite/Release.gpg" "$work/repository/dists/$suite/Release" >/dev/null 2>"$keyhome/verify.log"
+            printf 'Types: deb\nURIs: %s\nSuites: %s\nComponents: main\nArchitectures: amd64\nSigned-By: /etc/apt/keyrings/octovault-archive-keyring.gpg\n' \
+                "$url" "$suite" >"$work/repository/octovault-$suite.sources"
         done
         passphrase=''
-        gpgv --homedir "$keyhome" --keyring "$work/repository/octovault-archive-keyring.gpg" \
-            "$work/repository/dists/resolute/InRelease" >/dev/null 2>"$keyhome/verify.log"
-        gpgv --homedir "$keyhome" --keyring "$work/repository/octovault-archive-keyring.gpg" \
-            "$work/repository/dists/resolute/Release.gpg" "$work/repository/dists/resolute/Release" >/dev/null 2>"$keyhome/verify.log"
-        printf 'Types: deb\nURIs: %s\nSuites: resolute\nComponents: main\nArchitectures: amd64\nSigned-By: /etc/apt/keyrings/octovault-archive-keyring.gpg\n' "$url" >"$work/repository/octovault-resolute.sources"
     else
         printf 'UNSIGNED TEST ARTIFACT. Do not publish or configure APT to trust this repository.\n' >"$work/repository/UNSIGNED-TEST-ONLY"
     fi
-    printf 'OctoVault %s native APT repository\nPublisher: Vast Development Method (https://www.vdm.io)\nSuite: resolute (Ubuntu 26.04); architecture: amd64\nSigned: %s\nRepository URL: %s\n\nVerify the signing fingerprint independently before installing the public key and Signed-By source.\nSee https://github.com/octoleo/octovault/blob/main/docs/packaging.md for enrollment instructions.\nNever use trusted=yes or disable signature checks.\n' \
+    printf 'OctoVault %s native APT repository\nPublisher: Vast Development Method (https://www.vdm.io)\nSuites: noble (Ubuntu 24.04), resolute (Ubuntu 26.04); architecture: amd64\nSigned: %s\nRepository URL: %s\n\nUse only the suite matching your Ubuntu release.\nVerify the signing fingerprint independently before installing the public key and Signed-By source.\nSee https://github.com/octoleo/octovault/blob/main/docs/packaging.md for enrollment instructions.\nNever use trusted=yes or disable signature checks.\n' \
         "$version" "$signed" "$url" >"$work/repository/README.txt"
     cat >"$work/repository/index.html" <<HTML
 <!doctype html>
 <html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>OctoVault APT repository</title><style>body{font:18px/1.6 system-ui,sans-serif;max-width:48rem;margin:3rem auto;padding:0 1rem}code{overflow-wrap:anywhere}</style>
 <main><h1>OctoVault $version</h1><p>Encrypted vaults and independent backups for GNOME, by <a href="https://www.vdm.io">Vast Development Method</a>.</p>
-<p>Ubuntu 26.04 (resolute), amd64. Repository signed: $signed.</p>
-<ul><li><a href="pool/resolute/main/o/octovault/$name">Debian package</a></li><li><a href="https://github.com/octoleo/octovault/blob/main/docs/packaging.md">Installation and updates</a></li><li><a href="README.txt">Repository details</a></li></ul>
+<p>Ubuntu 24.04 (noble) and 26.04 (resolute), amd64. Repository signed: $signed.</p>
+<ul>
 HTML
+    for ubuntu in "${ubuntu_versions[@]}"; do
+        suite=${suites[$ubuntu]}
+        name="octovault_${version}_ubuntu${ubuntu}_amd64.deb"
+        printf '<li><a href="pool/%s/main/o/octovault/%s">Ubuntu %s Debian package</a></li>\n' "$suite" "$name" "$ubuntu" >>"$work/repository/index.html"
+    done
+    printf '<li><a href="https://github.com/octoleo/octovault/blob/main/docs/packaging.md">Installation and updates</a></li><li><a href="README.txt">Repository details</a></li></ul>\n' >>"$work/repository/index.html"
     if [[ $signed == true ]]; then
-        printf '<p>Independently verify the primary signing fingerprint: <code>%s</code></p>\n<p><a href="octovault-archive-keyring.asc">Public key</a> · <a href="octovault-resolute.sources">APT source configuration</a></p>\n' "$fingerprint" >>"$work/repository/index.html"
+        printf '<p>Independently verify the primary signing fingerprint: <code>%s</code></p>\n<p><a href="octovault-archive-keyring.asc">Public key</a></p>\n<p>Choose the APT source matching your Ubuntu release:</p><ul>\n' "$fingerprint" >>"$work/repository/index.html"
+        for ubuntu in "${ubuntu_versions[@]}"; do
+            suite=${suites[$ubuntu]}
+            printf '<li><a href="octovault-%s.sources">Ubuntu %s APT source configuration</a></li>\n' "$suite" "$ubuntu" >>"$work/repository/index.html"
+        done
+        printf '</ul>\n' >>"$work/repository/index.html"
     else
         printf '<p><strong>Unsigned test artifact: inspection only. Do not enroll this repository.</strong></p>\n' >>"$work/repository/index.html"
     fi

@@ -18,6 +18,7 @@
   <provides><binary>octovault</binary><binary>octovault-gtk</binary></provides>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.3.1" date="2026-10-30"><description><p>Build native Ubuntu 24.04 and 26.04 packages, retain text-key recovery with both distribution Tomb versions, and publish separate APT repositories for each release.</p></description></release>
     <release version="1.3.0" date="2026-10-28"><description><p>Prompt for vaults after login, screen unlock, and resume; support FIDO2 security keys with passphrase recovery; and simplify unlock dialogs and shared unlocking.</p></description></release>
     <release version="1.2.2" date="2026-10-28"><description><p>Clearly distinguish restored files from protected folders, reject resuming cancelled moves, and show and browse active protected locations.</p></description></release>
     <release version="1.2.1" date="2026-10-28"><description><p>Preserve originals during folder protection, recover interrupted moves, fix vault folder browsing, and simplify setup and recovery controls.</p></description></release>

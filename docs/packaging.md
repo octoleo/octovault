@@ -5,13 +5,23 @@ The Debian package contains a C/GTK4/libadwaita GUI, a C command-line client, th
 Install the packages named in `debian/control` under `Build-Depends`, then run:
 
 ```bash
-make check
-dpkg-buildpackage -us -uc -b
+make package
 ```
+
+Run this on Ubuntu 24.04 or 26.04 amd64. `make package` calls `scripts/build-package.sh`, detects the actual build system from `/etc/os-release`, runs Debian's build and test sequence, and writes the matching download and checksum manifest into `dist/`:
+
+| Build system | Package | Checksum manifest | APT suite |
+| --- | --- | --- | --- |
+| Ubuntu 24.04 amd64 | `octovault_VERSION_ubuntu24.04_amd64.deb` | `SHA256SUMS-ubuntu24.04` | `noble` |
+| Ubuntu 26.04 amd64 | `octovault_VERSION_ubuntu26.04_amd64.deb` | `SHA256SUMS-ubuntu26.04` | `resolute` |
+
+`VERSION` in this table is the value in the repository's `VERSION` file. Build each package on its matching distribution; changing a filename does not make a newer binary compatible with an older Ubuntu release. The plain `dpkg-buildpackage -us -uc -b` command remains available for standard Debian packaging without the release-download naming step.
 
 `make check` builds the actual binaries, checks shell and desktop/XML metadata, verifies version consistency, and runs every `tests/test-*.sh` test. The suite includes isolated backend/service tests; tests must use temporary state and must never access a developer's real vaults, credentials, or repositories.
 
-The CI workflow builds Ubuntu 26.04 amd64 packages, runs the native GTK smoke test as an ordinary user on a temporary display, and exercises install, upgrade, reinstall, remove, and purge in disposable containers. Its upgrade baseline is a locally constructed lower-version package, explicitly labeled `0.0.0~lifecycle`, so it tests Debian lifecycle behavior without claiming an earlier public release exists. User-state retention is checked across each transition.
+The CI workflow builds Ubuntu 24.04 and 26.04 amd64 packages in separate containers using each release's packaged libraries and dependencies. Both builds run the native GTK smoke test as an ordinary user on a temporary display and exercise install, upgrade, reinstall, remove, and purge. Its upgrade baseline is a locally constructed lower-version package, explicitly labeled `0.0.0~lifecycle`, so it tests Debian lifecycle behavior without claiming an earlier public release exists. User-state retention is checked across each transition. Real encrypted mounts and system authorization are also tested on both releases, and publication waits for every matrix job.
+
+Ubuntu 24.04 ships Tomb 2.9, while Ubuntu 26.04 ships a newer Tomb. OctoVault supports both packaged versions, including their different close/force-close interfaces. Its native text-carrier helper encodes the existing encrypted key using the same word map as Tomb's newer helpers; this keeps text-key recovery available on both releases without replacing the encryption engine. CI checks interoperability with the newer Tomb helpers when present.
 
 Do not run `scripts/test-package-lifecycle.sh` on a normal workstation. It installs and removes packages and is guarded by both an explicit argument and the `OCTOVAULT_DISPOSABLE_TEST=1` environment marker. This marker designates a disposable CI system; it does not make an existing workstation disposable.
 
@@ -27,11 +37,11 @@ Work on a review branch and open a pull request. The PR workflow creates downloa
 
 For an interrupted publication, use **Actions → Test and package → Run workflow**, choose `main`, and enable `publish`. It defaults to false, so ordinary manual runs are test-only. A draft can be resumed only for its recorded source commit. No personal access token or application-store account is needed for GitHub release assets.
 
-GitHub publication and optional APT publication are separate jobs. Missing APT credentials never prevent a versioned GitHub release. GitHub receives the `.deb` and its SHA-256 manifest using the workflow's temporary `GITHUB_TOKEN`; no publisher signing key, personal access token, or store account is required. Install a matching newer `.deb` through APT or the desktop package installer to upgrade. Tomb, Restic, and other declared dependencies are installed and updated through the normal Ubuntu package sources.
+GitHub publication and optional APT publication are separate jobs. Missing APT credentials never prevent a versioned GitHub release. GitHub receives both `.deb` packages and their separate SHA-256 manifests using the workflow's temporary `GITHUB_TOKEN`; publication rejects an incomplete pair of distribution builds. No publisher signing key, personal access token, or store account is required. Install a matching newer `.deb` through APT or the desktop package installer to upgrade. Tomb, Restic, and other declared dependencies are installed and updated through the normal Ubuntu package sources.
 
 ## Optional signed APT updates
 
-The workflow also builds an inspectable unsigned APT repository from the tested Ubuntu 26.04 amd64 package. It contains package indexes, AppStream metadata and the application icon, and is explicitly marked `UNSIGNED-TEST-ONLY`. This artifact is for inspection and tests, never client enrollment. Unit tests additionally use a fresh, passphrase-protected disposable GnuPG key to verify actual signatures, altered index and metadata rejection, fingerprint checks, and separation of private signing material from public files.
+The workflow also builds an inspectable unsigned APT repository from both tested amd64 packages. It contains separate `noble` and `resolute` package pools, indexes, and AppStream metadata, plus the application icon, and is explicitly marked `UNSIGNED-TEST-ONLY`. Each suite indexes only its own Ubuntu build. This artifact is for inspection and tests, never client enrollment. Unit tests additionally use a fresh, passphrase-protected disposable GnuPG key to verify actual signatures, altered index and metadata rejection, fingerprint checks, and separation of private signing material from public files.
 
 After the GitHub release is available, the optional APT job checks the publishing configuration. If the private key, fingerprint or URL is absent, it logs a clean skip. With all three configured, it downloads the published packages and checksum manifests, verifies them, builds signed `InRelease` and `Release.gpg` metadata, verifies both signatures, and deploys the public repository through GitHub Pages. A broken configured key or wrong passphrase fails that optional job rather than publishing an unsigned repository; the already published GitHub release remains available.
 
@@ -42,24 +52,28 @@ Configure these values under **Settings → Secrets and variables → Actions**:
 - Variable `APT_SIGNING_KEY_FINGERPRINT`: the full uppercase 40-character primary fingerprint, independently verified by the publisher.
 - Variable `APT_REPOSITORY_URL`: the HTTPS base URL where the repository is deployed, without credentials, query strings or fragments. For the default project Pages address this is `https://octoleo.github.io/octovault`; use the actual Pages URL if a custom domain is configured.
 
-In **Settings → Pages**, select **GitHub Actions** as the build and deployment source. The deployment uses the `github-pages` environment; align its branch and deployment policies with publishing from reviewed `main`. No extra enable flag is necessary: complete signing configuration enables this optional distribution job. The repository supports Ubuntu 26.04 (`resolute`) on `amd64` only. The workflow never generates a permanent publisher identity or adds a package source to users' computers.
+In **Settings → Pages**, select **GitHub Actions** as the build and deployment source. The deployment uses the `github-pages` environment; align its branch and deployment policies with publishing from reviewed `main`. No extra enable flag is necessary: complete signing configuration enables this optional distribution job. The repository supports Ubuntu 24.04 (`noble`) and 26.04 (`resolute`) on `amd64`. The workflow never generates a permanent publisher identity or adds a package source to users' computers.
 
 This is the same native Debian/APT distribution model as OctoShield. It supplies normal `apt update` and `apt upgrade` support and AppStream metadata for compatible software centers. It is **not** a Snap Store submission; Snap Store credentials are a different publishing mechanism and are not used by this Debian package workflow.
 
 ### Client enrollment
 
-The published repository provides `octovault-archive-keyring.gpg`, its armored equivalent and fingerprint, and an `octovault-resolute.sources` file with an explicit `Signed-By` keyring. Verify the fingerprint through an independently trusted publisher channel before installing either file. Installing a `.deb` does not silently enroll the repository or grant trust to its publisher.
+The published repository provides `octovault-archive-keyring.gpg`, its armored equivalent and fingerprint, and separate `octovault-noble.sources` and `octovault-resolute.sources` files with an explicit `Signed-By` keyring. Choose only the source matching your installed Ubuntu release. Verify the fingerprint through an independently trusted publisher channel before installing either file. Installing a `.deb` does not silently enroll the repository or grant trust to its publisher.
 
-These commands download and verify the public key before adding the Ubuntu 26.04 source. Enter the configured repository URL and the independently verified primary fingerprint at the prompts:
+These commands detect Ubuntu 24.04 or 26.04, download and verify the public key, and add the matching source. Enter the configured repository URL and the independently verified primary fingerprint at the prompts:
 
 ```bash
 bash <<'ENROLL'
 set -Eeuo pipefail
 . /etc/os-release
-[[ ${ID:-} == ubuntu && ${VERSION_ID:-} == 26.04 && $(dpkg --print-architecture) == amd64 ]] || {
-    printf 'This repository supports Ubuntu 26.04 amd64.\n' >&2
+[[ ${ID:-} == ubuntu && ( ${VERSION_ID:-} == 24.04 || ${VERSION_ID:-} == 26.04 ) && $(dpkg --print-architecture) == amd64 ]] || {
+    printf 'This repository supports Ubuntu 24.04 and 26.04 amd64.\n' >&2
     exit 1
 }
+case $VERSION_ID in
+    24.04) suite=noble ;;
+    26.04) suite=resolute ;;
+esac
 read -r -p 'Repository HTTPS URL: ' repository_url </dev/tty
 read -r -p 'Verified primary fingerprint: ' expected_fingerprint </dev/tty
 repository_url=${repository_url%/}
@@ -72,8 +86,8 @@ curl --fail --silent --show-error --location --proto '=https' --proto-redir '=ht
 actual_fingerprint=$(gpg --no-options --batch --homedir "$enrollment_dir" --show-keys --with-colons "$enrollment_dir/keyring.gpg" |
     awk -F: '$1=="pub" {primary=1; next} primary && $1=="fpr" {print $10; primary=0}')
 [[ $actual_fingerprint == "$expected_fingerprint" ]] || { printf 'Signing fingerprint mismatch.\n' >&2; exit 1; }
-printf 'Types: deb\nURIs: %s\nSuites: resolute\nComponents: main\nArchitectures: amd64\nSigned-By: /etc/apt/keyrings/octovault-archive-keyring.gpg\n' \
-    "$repository_url" >"$enrollment_dir/octovault.sources"
+printf 'Types: deb\nURIs: %s\nSuites: %s\nComponents: main\nArchitectures: amd64\nSigned-By: /etc/apt/keyrings/octovault-archive-keyring.gpg\n' \
+    "$repository_url" "$suite" >"$enrollment_dir/octovault.sources"
 sudo install -d -m 0755 /etc/apt/keyrings
 sudo install -m 0644 "$enrollment_dir/keyring.gpg" /etc/apt/keyrings/octovault-archive-keyring.gpg
 sudo install -m 0644 "$enrollment_dir/octovault.sources" /etc/apt/sources.list.d/octovault.sources
@@ -84,7 +98,7 @@ ENROLL
 
 Subsequent releases are available through normal system updates. Removing `/etc/apt/sources.list.d/octovault.sources` and `/etc/apt/keyrings/octovault-archive-keyring.gpg` unenrolls this source; it does not remove OctoVault or its data. Checksums detect changed bytes, while signed repository metadata authenticates the publisher. Never use `trusted=yes` or disable signature verification.
 
-To reproduce the repository artifact locally, install `apt-utils`, `gnupg`, `appstream`, and `libxml2-utils`, place the release `.deb` and its matching `SHA256SUMS-ubuntu26.04` in `packages/`, and run:
+To reproduce the repository artifact locally, install `apt-utils`, `gnupg`, `appstream`, and `libxml2-utils`, place both release `.deb` files and their matching `SHA256SUMS-ubuntu24.04` and `SHA256SUMS-ubuntu26.04` manifests in `packages/`, and run:
 
 ```bash
 bash scripts/apt-repository.sh --input packages --output apt-test

@@ -1021,8 +1021,22 @@ PROBE
     assert_equal "$(sha256sum "$replacement")" "$existing_hash"
     OV_PARAMS=$(jq -n --arg id "$reused_id" '{id:$id,password:"OctoVault-replacement-75%-pass"}')
     OV_OP=vault.open; ov_vault_dispatch >/dev/null
+    # Every pinned container is named vault.tomb internally. Keep two open
+    # together and close by verified mapper identity, never that shared label.
+    ov_resource_unlock
+    OV_PARAMS=$(jq -n --arg id "$id" '{id:$id,password:"OctoVault-replacement-75%-pass"}')
+    OV_OP=vault.open; ov_vault_dispatch >/dev/null
+    ov_resource_unlock
+    OV_PARAMS=$(jq -n --arg id "$reused_id" '{id:$id,force:true}')
     OV_OP=vault.close; ov_vault_dispatch >/dev/null
+    ov_load vaults "$reused_id"; ov_vault_require_closed "$OV_RECORD"
+    ov_load vaults "$id"; ov_vault_is_open "$OV_RECORD"
+    ov_resource_unlock
+    OV_PARAMS=$(jq -n --arg id "$id" '{id:$id}')
+    OV_OP=vault.close; ov_vault_dispatch >/dev/null
+    ov_load vaults "$id"; ov_vault_require_closed "$OV_RECORD"
     printf 'ok - real existing-key reuse creates another container without modifying the key\n'
+    printf 'ok - force and normal close target one mapper while an identically named vault remains open\n'
 
     local auth carrier_id carrier_key cover="$OV_HOME/guided-cover.bmp" cover_hash
     ov_as_user "$WORK/cover-generator" --make-cover "$cover"; cover_hash=$(sha256sum "$cover")
