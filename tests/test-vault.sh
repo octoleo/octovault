@@ -11,9 +11,20 @@ source "$PROJECT/lib/octovault/common.sh"
 source "$PROJECT/lib/octovault/vault.sh"
 WORK=$(mktemp -d)
 cleanup() {
-    local status=$? mountpoint loop mapper device container
+    local status=$? mountpoint loop mapper device container holder holder_file
     set +e
     if [[ ${INTEGRATION_RUNNING:-false} == true ]]; then
+        # Only signal the recorded sleep fixtures owned by this test user.
+        # Stop them before unmount cleanup if the force-close assertion fails.
+        for holder_file in "$WORK/holder-reused.pid" "$WORK/holder-original.pid"; do
+            [[ -f $holder_file ]] || continue
+            read -r holder < "$holder_file"
+            if [[ $holder =~ ^[0-9]+$ &&
+                  $(stat -c %u "/proc/$holder" 2>/dev/null) == "$OV_UID" &&
+                  $(cat "/proc/$holder/comm" 2>/dev/null) == sleep ]]; then
+                kill "$holder" 2>/dev/null || true
+            fi
+        done
         # Only tear down mounts/devices backed by this test's temporary file.
         while IFS= read -r loop; do
             [[ -n $loop ]] || continue
@@ -1026,17 +1037,47 @@ PROBE
     ov_resource_unlock
     OV_PARAMS=$(jq -n --arg id "$id" '{id:$id,password:"OctoVault-replacement-75%-pass"}')
     OV_OP=vault.open; ov_vault_dispatch >/dev/null
+    local reused_holder_job original_holder_job reused_holder original_holder
+    touch "$WORK/holder-reused.pid" "$WORK/holder-original.pid"
+    chown "$OV_UID:$(id -g "$OV_USER")" "$WORK/holder-reused.pid" "$WORK/holder-original.pid"
+    chmod 0600 "$WORK/holder-reused.pid" "$WORK/holder-original.pid"
+    ov_load vaults "$reused_id"
+    ov_as_user bash -c 'set -e; cd -- "$1"; printf "%s\n" "$$" > "$2"; exec sleep 120' fixture \
+        "$(ov_vault_field "$OV_RECORD" mountpoint)" "$WORK/holder-reused.pid" \
+        >"$WORK/holder-reused.log" 2>&1 &
+    reused_holder_job=$!
+    ov_load vaults "$id"
+    ov_as_user bash -c 'set -e; cd -- "$1"; printf "%s\n" "$$" > "$2"; exec sleep 120' fixture \
+        "$(ov_vault_field "$OV_RECORD" mountpoint)" "$WORK/holder-original.pid" \
+        >"$WORK/holder-original.log" 2>&1 &
+    original_holder_job=$!
+    for _ in {1..100}; do
+        [[ -s $WORK/holder-reused.pid && -s $WORK/holder-original.pid ]] && break
+        sleep 0.05
+    done
+    read -r reused_holder < "$WORK/holder-reused.pid"
+    read -r original_holder < "$WORK/holder-original.pid"
+    [[ $reused_holder =~ ^[0-9]+$ && $original_holder =~ ^[0-9]+$ ]]
+    kill -0 "$reused_holder" "$original_holder"
     ov_resource_unlock
     OV_PARAMS=$(jq -n --arg id "$reused_id" '{id:$id,force:true}')
     OV_OP=vault.close; ov_vault_dispatch >/dev/null
     ov_load vaults "$reused_id"; ov_vault_require_closed "$OV_RECORD"
     ov_load vaults "$id"; ov_vault_is_open "$OV_RECORD"
+    if kill -0 "$reused_holder" 2>/dev/null; then
+        printf 'Force close did not terminate its vault holder.\n' >&2; exit 1
+    fi
+    kill -0 "$original_holder"
+    kill "$original_holder"
+    wait "$reused_holder_job" 2>/dev/null || true
+    wait "$original_holder_job" 2>/dev/null || true
+    rm -- "$WORK/holder-reused.pid" "$WORK/holder-original.pid"
     ov_resource_unlock
     OV_PARAMS=$(jq -n --arg id "$id" '{id:$id}')
     OV_OP=vault.close; ov_vault_dispatch >/dev/null
     ov_load vaults "$id"; ov_vault_require_closed "$OV_RECORD"
     printf 'ok - real existing-key reuse creates another container without modifying the key\n'
-    printf 'ok - force and normal close target one mapper while an identically named vault remains open\n'
+    printf 'ok - force and normal close target one mapper while an identically named vault and its holder remain open\n'
 
     local auth carrier_id carrier_key cover="$OV_HOME/guided-cover.bmp" cover_hash
     ov_as_user "$WORK/cover-generator" --make-cover "$cover"; cover_hash=$(sha256sum "$cover")

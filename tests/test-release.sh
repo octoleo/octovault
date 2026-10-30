@@ -196,7 +196,10 @@ fixture_release true "$commit"
 printf 'interrupted upload\n' >"$MOCK_STATE/assets/$filename"
 run_success
 assert_available true
-! grep -q '^release create ' "$MOCK_STATE/calls"
+if grep -q '^release create ' "$MOCK_STATE/calls"; then
+    printf 'Resuming a draft unexpectedly created another release.\n' >&2
+    exit 1
+fi
 cmp "$task_tmp/original/$filename" "$MOCK_STATE/assets/$filename"
 
 for tag_style in lightweight annotated; do

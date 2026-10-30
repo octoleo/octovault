@@ -3,7 +3,8 @@
 # Build against the target Ubuntu release's libraries, then name its downloads.
 set -Eeuo pipefail
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
-cd "$root"+# shellcheck source=/dev/null
+cd "$root"
+# shellcheck source=/dev/null
 . /etc/os-release
 architecture=$(dpkg --print-architecture)
 [[ ${ID:-} == ubuntu && ( ${VERSION_ID:-} == 24.04 || ${VERSION_ID:-} == 26.04 ) && $architecture == amd64 ]] || {
