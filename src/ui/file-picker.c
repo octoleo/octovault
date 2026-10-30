@@ -114,6 +114,15 @@ static void picker_response(GtkDialog *dialog, int response, gpointer data) {
   gtk_window_destroy(GTK_WINDOW(dialog));
 }
 
+static void picker_unrealize(GtkWidget *dialog, gpointer data) {
+  picker_detach(data);
+  /* GTK 4.14 can retain a destroyed chooser while its form is finalized.
+   * Clear the transient relation while that parent is still alive so the
+   * chooser's eventual disposal never disconnects signals on a stale parent.
+   */
+  gtk_window_set_transient_for(GTK_WINDOW(dialog), NULL);
+}
+
 static void choose_file(GtkButton *button, gpointer data) {
   GtkWindow *existing = g_object_get_data(G_OBJECT(button), "octovault-file-chooser");
   if (existing) {
@@ -151,6 +160,7 @@ static void choose_file(GtkButton *button, gpointer data) {
   g_object_set_data_full(G_OBJECT(dialog), "octovault-picker", picker, picker_free);
   g_object_set_data(G_OBJECT(button), "octovault-file-chooser", dialog);
   g_signal_connect(dialog, "response", G_CALLBACK(picker_response), picker);
+  g_signal_connect(dialog, "unrealize", G_CALLBACK(picker_unrealize), picker);
 
   const char *current = GTK_IS_EDITABLE(field->widget) ? gtk_editable_get_text(GTK_EDITABLE(field->widget)) : "";
   char *initial = *current && g_path_is_absolute(current) ?

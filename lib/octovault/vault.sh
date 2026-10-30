@@ -688,7 +688,7 @@ ov_vault_tomb() {
                 [[ "$OV_TOMB_LEGACY_SOURCE" == /dev/mapper/tomb.*."$2".* ]] || exit 1
                 list_tomb_mounts() {
                     command findmnt -rn --mountpoint "$OV_TOMB_ENGINE" --output SOURCE,TARGET,FSTYPE,OPTIONS,LABEL |
-                        awk "{ print \$1 \";\" \$2 \";\" \$3 \";(\" \$4 \");[\" \$5 \"]\" }"
+                        awk -v expected="$OV_TOMB_LEGACY_SOURCE" "\$1 == expected { print \$1 \";\" \$2 \";\" \$3 \";(\" \$4 \");[\" \$5 \"]\" }"
                 }
                 # OctoVault unbinds its verified exposures itself; legacy
                 # Tomb discovers binds by label and could touch another vault.

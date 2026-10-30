@@ -387,6 +387,7 @@ static void test_parent_close(Fixture *f, gconstpointer unused)
     f->window = NULL;
     f->form = NULL;
     WAIT_FOR(!gtk_widget_get_mapped(GTK_WIDGET(dialog)));
+    g_assert_null(gtk_window_get_transient_for(GTK_WINDOW(dialog)));
     g_object_unref(dialog);
     WAIT_FOR(weak_dialog == NULL);
 }
